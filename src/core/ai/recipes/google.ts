@@ -16,6 +16,12 @@ export const google: Recipe = {
       dims_options: [768, 1536, 3072],
       cost_per_1m_tokens_usd: 0.15,
       price_last_verified: '2026-04-20',
+      // gemini-embedding-001 cap: 2048 input tokens × 100 texts per batch
+      // = 204_800. Round down to 200_000 for headroom; gateway safety_factor
+      // (0.8 default) drops effective budget to ~160K, which leaves room
+      // for tokenizer variance on dense payloads.
+      max_batch_tokens: 200_000,
+      chars_per_token: 4,
     },
     expansion: {
       models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite'],

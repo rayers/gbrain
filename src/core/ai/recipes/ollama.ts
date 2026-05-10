@@ -17,6 +17,12 @@ export const ollama: Recipe = {
       default_dims: 768, // nomic-embed-text native dim
       cost_per_1m_tokens_usd: 0,
       price_last_verified: '2026-04-20',
+      // Ollama runs locally; the cap is memory-bound, not API-side.
+      // nomic-embed-text + 8192-token context × small batches keep RAM
+      // pressure manageable on consumer hardware. 32_000 is a conservative
+      // budget that recursive halving will further trim if a host is tight.
+      max_batch_tokens: 32_000,
+      chars_per_token: 4,
     },
   },
   setup_hint: 'Install Ollama from https://ollama.ai, then `ollama pull nomic-embed-text` and `ollama serve`.',

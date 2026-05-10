@@ -26,6 +26,14 @@ export const litellmProxy: Recipe = {
       default_dims: 0, // user must declare --embedding-dimensions explicitly
       cost_per_1m_tokens_usd: undefined,
       price_last_verified: '2026-04-20',
+      // LiteLLM is a passthrough — the real cap depends on the upstream
+      // provider (OpenAI 300K, Voyage 120K, Bedrock varies). 100K is a
+      // conservative middle that won't blow most providers; recursive
+      // halving in the gateway handles the rest if a specific upstream
+      // rejects. Operators routing through LiteLLM to a single known
+      // backend may want to override to that backend's actual cap.
+      max_batch_tokens: 100_000,
+      chars_per_token: 4,
     },
   },
   setup_hint: 'Run LiteLLM (https://docs.litellm.ai) in front of any provider; set LITELLM_BASE_URL + pass --embedding-model litellm:<model> and --embedding-dimensions <N>.',
