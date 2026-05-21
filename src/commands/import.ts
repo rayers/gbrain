@@ -51,9 +51,19 @@ export async function runImport(
   const jsonOutput = args.includes('--json');
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named
-  // source. The CLI `gbrain import` deliberately has no --source flag per
-  // PR #707's design intent — only programmatic callers thread sourceId.
-  const sourceId = opts.sourceId;
+  // source.
+  //
+  // v0.37.7.0 #1167+#1222: the CLI surface now also accepts a
+  // `--source-id <id>` flag (named to avoid colliding with `--source`
+  // which other commands use for different axes). Pre-fix, users
+  // passing `gbrain import --source dept-x ...` silently fell back to
+  // default because the parser ignored the flag. Now an explicit
+  // `--source-id <id>` opt-in routes the import to that source.
+  // Programmatic callers continue passing `opts.sourceId` directly;
+  // CLI callers' flag wins over opts when both are set.
+  const sourceIdIdx = args.indexOf('--source-id');
+  const flagSourceId = sourceIdIdx !== -1 ? args[sourceIdIdx + 1] : null;
+  const sourceId = flagSourceId ?? opts.sourceId;
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // Issue #767 fix: --strategy <markdown|code|auto> selects which file types
@@ -101,12 +111,13 @@ export async function runImport(
   // skip-set.
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
+  if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
   const spaceStrategyIdx = args.indexOf('--strategy');
   if (spaceStrategyIdx !== -1) flagValues.add(spaceStrategyIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--json] [--strategy markdown|code|auto]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--json] [--strategy markdown|code|auto]');
     process.exit(1);
   }
   const dir: string = dirArg;  // narrowed; survives closure capture
