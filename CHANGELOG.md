@@ -2,6 +2,143 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.37.11.0] - 2026-05-21
+
+**Fresh `gbrain init --pglite` works out of the box now.**
+
+Before this release a brand-new install was broken: `gbrain init --pglite` made a brain whose schema didn't match what the embed pipeline actually used, so the first `gbrain embed --stale` failed every page with a vector dimension error. The default model the gateway shipped (ZeroEntropy at 1280 dimensions) and the default column the schema created (OpenAI's 1536) silently disagreed, and every documented escape hatch was also broken: `gbrain config set embedding_model X` wrote to a database table the embed pipeline doesn't read, the doctor remediation hint pointed at that no-op command, and the docs prescribed `ALTER COLUMN TYPE vector(N)` which fails on PGLite because pgvector ships as embedded WASM. The user spent an hour in source code to figure out you had to hand-edit `~/.gbrain/config.json` after init — completely undocumented. This release closes the bug class end-to-end.
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+# Already on a 1536-d brain that works? You don't have to do anything.
+# Starting fresh or wanting to switch models? Use the new one-liner:
+gbrain reinit-pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280
+```
+
+### What's new for everyone
+
+- **`gbrain init --pglite` produces a vector(1280) schema by default** that matches the embed model the gateway actually uses. Embedding succeeds on the first call. Init prints the resolved choice up front so you see what shipped: `Embedding: zeroentropyai:zembed-1 (1280d) [default]`.
+- **`gbrain reinit-pglite --embedding-model X --embedding-dimensions N`** — single-command wipe-and-reinit for switching providers on PGLite. Backs up the brain to `.bak`, runs init with the new flags, re-syncs the brain repo. `--no-sync` to defer the resync, `--yes` to skip the TTY confirmation, `--json` for scripts.
+- **`gbrain init` re-run no longer destroys your settings.** Existing `~/.gbrain/config.json` fields are merged on top of new init flags, so re-running with no args preserves `embedding_model`, `chat_model`, API keys, and every other field you set.
+- **`gbrain sync --help` actually documents `--no-embed` now.** The flag has existed for releases but was unreachable through `--help` because sync wasn't wired into the dispatcher's self-help set.
+- **`gbrain config set embedding_model X` refuses with the right recipe.** That command wrote to the DB plane while the embed pipeline read the file plane, so it silently lied for releases. It now exits 1 with a paste-ready wipe-and-reinit recipe pointing at the engine you're actually running on (`gbrain reinit-pglite` on PGLite, the `ALTER COLUMN` SQL recipe on Postgres). No `--force` escape — keeping the no-op write path was the original footgun.
+- **ZeroEntropy API key plumbing works.** Before this release the embed pipeline only mapped `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from your config into the gateway env, so `zeroentropy_api_key` in `~/.gbrain/config.json` was dead config. Now it propagates correctly. `ZEROENTROPY_API_KEY` env var also routes through.
+- **`gbrain embed --stale` fails fast with a paste-ready recipe** when the schema column and the gateway disagree. Pre-fix the worker pool would fire 20 parallel API calls into dim-rejected inserts and surface only the raw Postgres error. Now you see the wipe-and-reinit recipe before any embed call goes out.
+- **`gbrain sync` surfaces the recipe + `--no-embed` tip** when its inline embed step hits a dim mismatch. Previously the sync step silently swallowed embed errors at two different catch sites. Both sites now print the recipe.
+- **`gbrain doctor` reads the embed checks from the gateway, not the DB plane.** The width-consistency and ZE-key checks were stale on fresh installs whose DB rows hadn't been written yet. They now see what the embed pipeline sees. Provider-aware key detection too: a ZE brain no longer looks "healthy" because `OPENAI_API_KEY` happens to be set.
+
+### What's new for contributors
+
+- **New `src/core/ai/defaults.ts` leaf module** is the canonical source for `DEFAULT_EMBEDDING_MODEL` and `DEFAULT_EMBEDDING_DIMENSIONS`. Eight other places used to hardcode `'text-embedding-3-large'` / `1536` independently — those are all migrated to import from defaults.ts. Changing the default in one place now propagates correctly. Includes the PGLite + Postgres engine fallbacks, both `getPGLiteSchema()` / `getPostgresSchema()` default args, the embedding-column registry's builtin row, the chunk-row INSERT default, and the schema seed (which previously stripped the provider prefix and stored bare `zembed-1` instead of `zeroentropyai:zembed-1`).
+- **New `loadConfigFileOnly()` in `src/core/config.ts`** is the safe write-back source for `gbrain init` 's config merge. Pre-fix init called `loadConfig()` (which merges env vars + infers engine from `DATABASE_URL`) to read existing config before saving — so any transient env value would get baked into `~/.gbrain/config.json`. The new helper reads the JSON file only.
+- **`embeddingMismatchMessage()` takes an `engineKind` argument now.** PGLite branch emits the new `gbrain reinit-pglite` recipe; Postgres branch keeps the SQL ALTER. The `databasePath` arg lets the recipe use the brain's actual path instead of `~/.gbrain/brain.pglite` (honors `GBRAIN_HOME`, `--path` overrides).
+- **`EmbeddingDimMismatchError` is a tagged class exported from `src/commands/embed.ts`.** `runEmbedCore` pre-flights via the existing `readContentChunksEmbeddingDim` helper and throws this error before the worker pool starts. Sync catches it specifically for the recipe + `--no-embed` tip.
+- **CDX2-5+6 from codex review:** the ZE key fix v1 landed in the wrong file (`gateway.ts:configureGateway` instead of `cli.ts:buildGatewayConfig`). Round 2 caught + fixed it. Pinning regression at `test/v0_37_fix_wave.test.ts`'s Lane C.3 describe.
+- **30+ unit tests + 1 in-process E2E** cover every lane. Highlights: `test/v0_37_fix_wave.test.ts` (structural lane assertions), `test/v0_37_gap_fill.test.ts` (end-to-end behavior + reinit-pglite contracts), `test/e2e/fresh-install-pglite.test.ts` (headline scenario via `__setEmbedTransportForTests` mock). The legacy `test/embedding-dim-check.test.ts` and `test/doctor-ze-checks.test.ts` and `test/search/embedding-column.test.ts` are also updated for the new behaviors.
+- **`bunfig.toml` preload** at `test/helpers/legacy-embedding-preload.ts` configures the gateway to OpenAI/1536 once per shard process, so the 20+ test files that hardcode `new Float32Array(1536)` fixtures keep working without per-file edits.
+- 26 codex outside-voice findings across two review rounds folded into the plan before code landed. Plan file: `~/.claude/plans/system-instruction-you-are-working-piped-mitten.md`.
+
+### Deferred to follow-up
+
+Filed in TODOS.md:
+- `gbrain embed --try-fallback` for provider quota/auth failures (silent provider switching would corrupt retrieval; needs explicit consent design).
+- Full plane unification for non-schema-sizing fields (`chat_model`, `expansion_model`, `reranker_model` could become DB-live-mutable — audit pending).
+- Worker-pool shared `AbortController` in `embedAll()` as defense-in-depth on top of the entry-point pre-flight.
+- Cleanup of back-compat constants in `src/core/embedding.ts` (legacy `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` exports for old tests).
+
+### To take advantage of v0.37.11.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a dim mismatch:
+
+1. **Confirm everything's in order:**
+   ```bash
+   gbrain doctor
+   # Expect: embedding_width_consistency ok, ze_embedding_health ok
+   ```
+2. **If you want to switch embedding models on PGLite (now or in the future):**
+   ```bash
+   gbrain reinit-pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280
+   ```
+3. **If `gbrain doctor` flags a width mismatch,** the message now includes a paste-ready recipe for your specific engine kind (PGLite or Postgres). Run it.
+4. **If any step fails,** please file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`.
+
+## [0.37.10.0] - 2026-05-21
+
+**Fresh installs of gbrain now auto-detect your embedding provider from API keys in your environment. If you have `OPENAI_API_KEY` set, you get OpenAI. If you have multiple keys, gbrain asks. If you have no keys in a CI build, it fails loud at init with a paste-ready setup hint, not silently four minutes later at first import.**
+
+A user on WSL ran `bun install && gbrain init --pglite && gbrain import …`, hit a wall ("expected 1536 dimensions, not 1280"), and recovered with five commands including `rm -rf ~/.gbrain` and three config keys that gbrain silently ignored (`embedding.provider`, `embedding.model`, `embedding.dimensions`). The root cause was a multi-defect bug class: init didn't peek at env vars, didn't persist the resolved provider unless you passed a flag, didn't validate the schema/dim invariant before creating the schema, and `gbrain config set` accepted unknown keys without complaining. This release closes every one of those.
+
+How to use it (already on after upgrade):
+
+```
+gbrain init --pglite                                    # auto-pick from env (one key → that provider)
+gbrain init --pglite                                    # picker fires when multiple keys are set
+gbrain init --pglite --no-embedding                     # opt-in deferred setup mode
+gbrain config set embedding.provider openai             # now exits 1 with "did you mean embedding_model?"
+gbrain config set foo.unknown bar --force               # escape hatch with loud stderr WARN
+```
+
+What you'd see in concrete scenarios:
+
+| Scenario | Before v0.37.10.0 | After |
+|---|---|---|
+| `OPENAI_API_KEY` set, run `init --pglite` | Silent ZE 1280d default, schema becomes `vector(1536)`, first import explodes | Auto-picks `openai:text-embedding-3-large` (1536d), config persisted, import succeeds |
+| `OPENAI_API_KEY` + `VOYAGE_API_KEY` both set | Same silent ZE default | Interactive picker fires, user chooses |
+| No keys, non-TTY (Docker `RUN`) | Silent broken state | Exit 1 with paste-ready `export OPENAI_API_KEY=...` hint |
+| `OPENAPI_API_KEY=sk-…` (typo) | Silent broken state | Exit 1 + "did you mean OPENAI_API_KEY?" suggestion |
+| `--embedding-dimensions 9999` (invalid) | Silently created broken schema, exploded at first embed | Preflight rejects BEFORE any disk write |
+| `gbrain config set embedding.provider openai` | Silently accepted, no-op | Exit 1, suggests `embedding_model`. `--force` overrides with stderr WARN |
+
+If you upgrade and `gbrain doctor` warns about a silent-default v0.36 install (vector(1536) column + empty config), it now prints the exact repair command. For an empty brain, that's `gbrain init --force --embedding-model <id>`. For a populated brain, `gbrain retrieval-upgrade --to <id> --reindex`. You should never need `rm -rf ~/.gbrain` again.
+
+Things to watch:
+
+- **Behavior change for CI/Docker.** Bare `gbrain init --pglite` in a non-TTY context with no provider key now exits 1. If your image build runs init before the runtime env is populated, set the key at build time OR pass `--no-embedding` and configure at runtime. See [`docs/operations/headless-install.md`](docs/operations/headless-install.md) for both patterns.
+- **Behavior change for `config set`.** Unknown keys now exit 1 by default. Downstream tooling that legitimately writes new keys must pass `--force`. The full list of recognized keys is `KNOWN_CONFIG_KEYS` in `src/core/config.ts`.
+- **Local providers (Ollama, llama-server) are no longer auto-picked.** They have no required API key, which previously made them count as "always env-ready" and silently win when the user clearly intended a hosted provider. They stay accessible via explicit `--embedding-model ollama:<model>`.
+
+### Itemized changes
+
+- **`src/core/levenshtein.ts`** (NEW) — small ~50-line `editDistance(a, b)` + `suggestNearest(input, candidates, maxDistance)` helper. Used by `gbrain config set` for "did you mean?" suggestions and by init for env-var typo detection.
+- **`src/core/embedding-dim-check.ts`** — three new pure functions: `resolveSchemaEmbeddingDim(opts)` and `resolveSchemaMultimodalDim(opts)` validate the resolved dim against recipe's `default_dims` plus per-provider Matryoshka allow-lists (OpenAI text-3, Voyage flexible-dim models, ZeroEntropy zembed-1) BEFORE any DB write; `EmbeddingDisabledError` + `assertEmbeddingEnabled(cfg)` guard the deferred-setup runtime path. New `PGVECTOR_COLUMN_MAX_DIMS = 16000` exported constant.
+- **`src/commands/init-provider-picker.ts`** (NEW) — interactive picker mirroring `init-mode-picker.ts`. Filters candidate recipes to env-ready ones, prompts via `readLineSafe`, surfaces the subagent-Anthropic caveat when picking a non-Anthropic chat-capable recipe without `ANTHROPIC_API_KEY` set. Exports `printSubagentAnthropicCaveat(write)` for reuse from `initPGLite` and `initPostgres` so the post-init auto-pick path also surfaces it.
+- **`src/commands/init.ts:resolveAIOptions`** — rewritten with a per-touchpoint env-detection tier. Precedence: explicit flag → shorthand → env auto-pick (group by provider id, codex finding #2) → picker (TTY) or fail-loud (non-TTY). Each touchpoint (embedding / expansion / chat) resolves independently. New `--no-embedding` opt-in flag for D9 deferred-setup mode. Exported `groupReadyByProvider(touchpoint, env)` + `findEnvKeyTypos(env)` for unit testing.
+- **`src/commands/init.ts:initPGLite` + `initPostgres`** — drop the conditional `configureGateway` gate so the schema substitution and runtime gateway use one resolved dim. Preflight `resolveSchemaEmbeddingDim` BEFORE `engine.initSchema()` — invalid dim refuses with paste-ready hint, no disk write. Atomic config persist (either resolved tuple or `embedding_disabled: true` sentinel, never partial). Post-init invariant assertion stays as regression guardrail. Subagent caveat fires post-init for both auto-pick + picker paths when chat_model is non-Anthropic AND `ANTHROPIC_API_KEY` is missing.
+- **`src/commands/providers.ts`** — extract `formatRecipeTable(recipes, env)` helper from `runList` so the picker and `gbrain providers list` can't drift. Add a stderr warn line to `providers test` when the tested model differs from the configured default ("Note: tested X in isolation; gbrain's configured embedding is Y — this test does NOT verify your brain's active path.") — codex finding #10.
+- **`src/commands/config.ts`** — strict unknown-key rejection with `--force` escape hatch. Levenshtein suggestion against `KNOWN_CONFIG_KEYS` + `KNOWN_CONFIG_KEY_PREFIXES` (well-known prefixes like `search.`, `models.`, `dream.` accept sub-keys without `--force`). Bug-reporter's three no-op config keys now all exit 1 with the right suggestion.
+- **`src/core/config.ts`** — adds `embedding_disabled?: boolean` to `GBrainConfig` (D9 sentinel). Exports `KNOWN_CONFIG_KEYS` (60+ canonical config keys, both file-plane and DB-plane) + `KNOWN_CONFIG_KEY_PREFIXES` (well-known prefixes for namespaced keys).
+- **`src/commands/embed.ts`** + **`src/commands/import.ts`** — `runEmbedCore` and `runImport` consult `assertEmbeddingEnabled(loadConfig())` and refuse cleanly with a `gbrain config set embedding_model <id>` hint when `embedding_disabled: true` is set. `gbrain import --no-embed` flag still works (chunks land without vectors).
+- **`src/commands/doctor.ts`** — `embedding_provider` check extended for the v0.36 silent-default repair case. Empty-brain vs non-empty-brain repair branching (drop-and-re-init vs `gbrain retrieval-upgrade`). `subagent_provider` check (v0.31.12) extended per D7 to warn when `chat_model` is non-Anthropic AND `ANTHROPIC_API_KEY` is missing.
+- **`src/commands/reindex-multimodal.ts`** — preflight `resolveSchemaMultimodalDim` BEFORE the reindex sweep, mirroring the text-side contract from `initPGLite`.
+- **`src/core/pglite-engine.ts` + `src/core/postgres-engine.ts`** — empty brain (`pageCount === 0`) now scores **100/100**, not 0/100. Vacuous truth: an empty brain has no coverage problem to penalize. Pre-fix, fresh `gbrain init --pglite` users saw `Brain score 0/100` on first `gbrain doctor` run, which was structurally surprising. Same fix on both engines, breakdown components unchanged for non-empty brains.
+- **`test/levenshtein.test.ts`** (18 cases), **`test/embedding-dim-check.test.ts`** (23 cases, extended), **`test/providers.test.ts`** (10 cases), **`test/init-provider-picker.test.ts`** (7 cases), **`test/init-env-detection.test.ts`** (21 cases), **`test/config-set.test.ts`** (19 cases) — 98 new unit cases pinning the env-detection grouping, Matryoshka validation, picker caveat behavior, Levenshtein suggestions, and bug-reporter regression for the three no-op keys.
+- **`test/e2e/init-fresh-pglite.test.ts`** (NEW, 14 E2E cases) — subprocess-driven verification of the full happy path, D3 non-TTY fail-loud (with and without env-key typos), D6 regression for the bug-reporter's three no-op config keys, D9 deferred-setup mode + import refusal, D11 preflight refusal without disk writes, and explicit-flag-wins-over-env precedence.
+- **`docs/integrations/embedding-providers.md`** — TL;DR table refreshed; added "Init resolves your provider from env keys" section and "If first import fails" troubleshooting block.
+- **`docs/operations/headless-install.md`** (NEW) — Docker/CI sequencing guide covering both build-time-key and runtime-key (`--no-embedding`) patterns.
+- **`README.md`** — added Troubleshooting section with one-paragraph repair hint and links to the headless-install + provider docs.
+- **`TODOS.md`** — closed the deferred v0.32.x "interactive provider chooser" entry as SUPERSEDED. Added four follow-up entries: dedicated migration script for v0.36 broken installs (telemetry-gated), namespaced extension fields for `config set --force` polish, runtime config-key inventory audit, and value-level Levenshtein on `config set`.
+
+### For contributors
+
+- The full eng-review decision trail (D1-D14) is at `~/.claude/plans/system-instruction-you-are-working-enumerated-mccarthy.md`.
+- 79 new unit tests + 14 new E2E tests. Total suite at 8200+ passing.
+
+## To take advantage of v0.37.10.0
+
+`gbrain upgrade` should pick this up automatically. If `gbrain doctor` warns about a v0.36 silent-default install:
+
+1. **Run the suggested repair from the doctor output.** Empty brain → `gbrain init --force --pglite --embedding-model <id>`. Non-empty brain → `gbrain retrieval-upgrade --to <id> --reindex`.
+2. **For CI/Docker:** review whether your image-build path runs `gbrain init --pglite` without an API key present. If so, switch to either Pattern 1 (key at build) or Pattern 2 (`--no-embedding` opt-in + runtime config) from `docs/operations/headless-install.md`.
+3. **For downstream tooling writing config keys:** if you have scripts that `gbrain config set` an unknown key (e.g. a custom plugin), pass `--force` to keep them working. Or migrate to a known prefix (`search.X`, `dream.X`, `models.X`).
+4. **Verify:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="embedding_provider")'
+   # Expect status=ok
+   ```
+5. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output. The new doctor surface should give a paste-ready repair; if not, that's a bug we want to know about.
+
 ## [0.37.9.0] - 2026-05-20
 
 **Tags get written the same way everywhere now.**

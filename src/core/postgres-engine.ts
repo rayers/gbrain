@@ -52,12 +52,16 @@ import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql } from './search/sql-ranking.ts';
+import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
-export function getPostgresSchema(dims: number = 1536, model: string = 'text-embedding-3-large'): string {
+export function getPostgresSchema(
+  dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
+  model: string = DEFAULT_EMBEDDING_MODEL,
+): string {
   const parsedDims = Number(dims);
   if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
     throw new Error(`Invalid embedding dimensions: ${dims}`);
@@ -211,14 +215,17 @@ export class PostgresEngine implements BrainEngine {
       ? await this.connectionManager.ddl()
       : this.sql;
 
-    // Resolve the embedding dim/model from the gateway (v0.14+).
-    // Falls back to v0.13 defaults (1536d + text-embedding-3-large) when gateway isn't configured yet.
-    let dims = 1536;
-    let model = 'text-embedding-3-large';
+    // Resolve the embedding dim/model from the gateway. v0.37 fix wave:
+    // fallbacks track the canonical defaults in `ai/defaults.ts` instead of
+    // stale v0.13 OpenAI literals, AND we store the full `provider:model`
+    // string in the DB config table — consumers like ze-switch and doctor
+    // expect the provider prefix. (Round-1 CDX-4 + A.8.)
+    let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
+    let model: string = DEFAULT_EMBEDDING_MODEL;
     try {
       const gw = await import('./ai/gateway.ts');
       dims = gw.getEmbeddingDimensions();
-      model = gw.getEmbeddingModel().split(':').slice(1).join(':') || model;
+      model = gw.getEmbeddingModel() || model;
     } catch { /* gateway not yet configured — use defaults */ }
 
     const sqlText = getPostgresSchema(dims, model);
@@ -1637,7 +1644,7 @@ export class PostgresEngine implements BrainEngine {
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || 'text-embedding-3-large', chunk.token_count || null,
+        chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
@@ -3715,11 +3722,18 @@ export class PostgresEngine implements BrainEngine {
     const noOrphans = pageCount > 0 ? 1 - (orphanPages / pageCount) : 1;
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Per-component points. Sum equals brainScore by construction.
-    const embedCoverageScore = pageCount === 0 ? 0 : Math.round(embedCoverage * 35);
-    const linkDensityScore = pageCount === 0 ? 0 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 0 : Math.round(timelineCoverageWhole * 15);
-    const noOrphansScore = pageCount === 0 ? 0 : Math.round(noOrphans * 15);
-    const noDeadLinksScore = pageCount === 0 ? 0 : Math.round(noDeadLinks * 10);
+    //
+    // v0.37.10.0: empty brains (pageCount === 0) get FULL marks (100/100),
+    // not 0. Semantically an empty brain has no coverage problem to penalize
+    // — there's nothing to embed, nothing to link, nothing to orphan. The
+    // pre-fix "empty = 0" caused fresh-init brains to score as critically
+    // unhealthy on `gbrain doctor`, which was a structural surprise to users
+    // who'd just successfully run init. PGLite path has the same fix.
+    const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
+    const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageWhole * 15);
+    const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
+    const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
 
     return {
