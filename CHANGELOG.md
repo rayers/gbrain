@@ -2,6 +2,279 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.39.0.0] - 2026-05-21
+
+**You can finally cap the cost of `gbrain brainstorm` and `gbrain lsd`, AND if the cap fires mid-run, you can resume right where you left off without losing the ideas you already paid for.**
+
+The 13K-page brain incident that started this wave is real and was expensive. A `gbrain lsd` run estimated $0.96, actually billed $50.71, generated zero usable ideas. The fix wave already merged (PR #1234) capped the prefix sampling that caused the explosion. This release goes one cathedral further: every LLM call that any `gbrain` command makes is now accounted at the gateway layer, so the same cap that protects brainstorm also protects `doctor --remediate`, `eval suspected-contradictions`, the dream cycle, and any future LLM-calling command. The plumbing is shared.
+
+What that means in the hand: pass `--max-cost N` to brainstorm or lsd or `doctor --remediate`, and the first overflow throws a typed error before any extra dollars are spent. The throw fires from inside the gateway's reserve check, so a budget exhaustion never even acquires a rate-lease slot or makes a provider HTTP call. The cap is a real ceiling, not a suggestion.
+
+When brainstorm IS exhausted mid-run, the orchestrator persists what's been done to `~/.gbrain/brainstorm/<run_id>.json` with the FULL idea bodies (not just counts), then re-throws. The user paste-runs the suggested `gbrain brainstorm --resume <run_id>` and the second run skips the already-completed crosses, runs only the missing ones, then merges everything before the judge runs. The final BrainstormResult contains the pre-crash ideas AND the post-resume ideas. (Codex's outside-voice review was the one that caught this — a resume that produces only the second-run's ideas would be silent partial output, which is worse than no resume at all.)
+
+### How to turn it on
+
+```bash
+# Cap brainstorm cost at $2 (default $5). Throws BudgetExhausted if exceeded.
+gbrain brainstorm "what story should I write next" --max-cost 2
+
+# Crash recovery — list saved runs, resume the one you want.
+gbrain brainstorm --list-runs
+gbrain brainstorm --resume 1a2b3c4d5e6f7890
+
+# Bypass the 7-day staleness gate if you really mean it.
+gbrain brainstorm --resume 1a2b3c4d5e6f7890 --force-resume
+
+# Same cap, different command — doctor's autonomous remediation now resumes too.
+gbrain doctor --remediate --max-cost 5
+# (on BudgetExhausted, the run persists a checkpoint at
+#  ~/.gbrain/remediation/<plan_hash>.json and tells you the --resume command)
+gbrain doctor --remediate --resume
+```
+
+### What's safe to know about
+
+A4 amended is a semantic shift: `gbrain doctor --remediate --max-usd` used to be a pre-flight estimate check ("refuse if est > cap"); it's now ALSO a mid-run hard ceiling backed by BudgetTracker via the gateway's AsyncLocalStorage scope. If you cron-schedule `--remediate`, the worst case used to be "the run starts despite the under-estimate"; now the worst case is "the run aborts mid-step and writes a resumable checkpoint." The first failure-mode is gone; the second is recoverable via `--resume`. `--max-cost` is a new alias for `--max-usd` for symmetry with brainstorm.
+
+The brainstorm checkpoint identity intentionally uses NO embedding bits: `run_id = sha256(question + profile + sort(close_slugs) + sort(far_slugs)).slice(0,16)`. Swap your embedding model between runs and the resume still finds the checkpoint. Conversely, change the question by even one word and you get a different run_id (the previous checkpoint is left alone; the cycle purge phase GCs anything older than 7 days).
+
+The dream cycle's `~/.gbrain/audit/dream-budget-YYYY-Www.jsonl` grew one new field on every line: `schema_version: 1`. Reorderings are tolerated (downstream consumers should index by field name, not position); renames or removals are breaking. The same schema-stable contract holds for the new `~/.gbrain/audit/budget-YYYY-Www.jsonl` produced by the unified `BudgetTracker`.
+
+If you wrote integration code against `BudgetExhausted` in the brainstorm orchestrator before this release: that class moved to `src/core/budget/budget-tracker.ts`. The orchestrator re-exports the old name for back-compat, so existing imports keep working.
+
+### Itemized changes
+
+- **`BudgetTracker` is the new canonical primitive** at `src/core/budget/budget-tracker.ts`. One class, one typed error (`BudgetExhausted` with `reason: 'cost' | 'runtime' | 'no_pricing'`), one schema-stable audit JSONL. Pinned by 18 unit cases covering TX1 (record throws when cumulative exceeds cap), TX2 (no_pricing hard-fails when cap is set + pricing missing), A3 amended (pessimistic fallback when `err.usage` is absent), the onExhausted-fires-once-before-throw contract, and the schema-stable audit schema.
+- **`withBudgetTracker(tracker, fn)` at the gateway layer (TX5)** installs the tracker on a module-internal `AsyncLocalStorage<BudgetTracker>`. Every `gateway.chat / embed / rerank` call inside the scope auto-composes. Outside-scope calls are budget no-ops (existing behavior preserved). Nested scopes restore the outer on exit. Parallel `Promise.all` scopes do not bleed trackers across each other.
+- **Subagent rate-lease ordering pinned (A1)**: the gateway's `reserve()` runs BEFORE `acquireLease()` in `src/core/minions/handlers/subagent.ts`. A budget throw must NOT consume a rate-lease slot. The handler body itself no longer needs explicit budget threading; the AsyncLocalStorage composition handles it.
+- **`payload-fitter.ts` (P6)** lands at `src/core/diarize/payload-fitter.ts` with two strategies. `'batch'` is deterministic token-budgeted chunking, no LLM calls. `'summarize'` embed-clusters then Haiku-summarizes each cluster in parallel via `Promise.allSettled` at parallelism=4. The quality gate flags `degraded: true` when success ratio drops below the configured `min_success_ratio` (default 0.75) — caller decides whether to surface or abort.
+- **Brainstorm checkpoint (P7)** at `src/core/brainstorm/checkpoint.ts`. Atomic .tmp+rename writes. Full idea bodies persisted (TX3). One-flag resume (TX4). 7-day mtime-based GC wired into the cycle purge phase.
+- **`doctor --remediate --resume`** loads `~/.gbrain/remediation/<plan_hash>.json` and continues from the next un-completed step. Refuses on mismatched plan_hash with a paste-ready message.
+- **`gbrain brainstorm --list-runs`** prints saved run_ids + iso dates + question stems so the user can pick which to resume.
+- **ISO-week audit filenames consolidated** into `src/core/audit-week-file.ts`. Four call sites migrated (shell-jobs, phantoms, slug-fallback, dream-budget). Year-boundary cases (2020-W53, 2024-12-30 belongs to 2025-W01) pinned by tests.
+- **eval-contradictions** routes through `withBudgetTracker` for telemetry without changing the CLI surface. `--budget-usd` semantics + `PreFlightBudgetError` shape are byte-identical.
+
+### For contributors
+
+- `bun test` adds 73 new tests across 9 new files (`test/core/budget/`, `test/core/audit-week-file.test.ts`, `test/core/diarize/`, `test/brainstorm/checkpoint.test.ts`, `test/e2e/brainstorm-resume.test.ts`, `test/core/remediation-checkpoint.test.ts`). Plus F1 closes the pre-existing PGLite `page_links` schema gap (the brainstorm domain-bank queries `page_links` but the embedded schema only defined `links`). Brainstorm now works against PGLite brains in production via the new `page_links` view alias shipped in both the embedded schema bundle and migration v86 (renumbered from v81 during merge with master's v0.38 cathedrals which claimed v81-v85). F2 adds an E2E pinning the user-facing `--max-cost` pre-flight refusal path. F3 adds `--max-cost` to `gbrain reindex --code`. All previous brainstorm + doctor + eval-contradictions tests still pass.
+
+## To take advantage of v0.39.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+   This applies migration v86 (`page_links_view_alias`) on PGLite + Postgres brains. The alias is required for `gbrain brainstorm` and `gbrain lsd` to work against the domain-bank tiebreaker; without it, the brainstorm domain-bank queries fail with `relation "page_links" does not exist`.
+2. **Set a cost cap on the commands you care about:**
+   ```bash
+   # Sets a per-run dollar ceiling. Throws BudgetExhausted before any LLM call
+   # if the pre-run estimate exceeds the cap, AND mid-run if cumulative spend
+   # blows past it.
+   gbrain brainstorm "test" --max-cost 1
+   gbrain doctor --remediate --max-cost 5
+   gbrain reindex --code --max-cost 10
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor             # schema_version should be 86
+   gbrain brainstorm --list-runs   # confirms the new checkpoint directory exists
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+## [0.38.2.0] - 2026-05-22
+
+**`gbrain doctor` no longer hangs on big brains, and gives you real signal when it has to give up.**
+
+If you've got a sizeable brain (tens of thousands of pages and up, especially in a repo that doubles as a code workspace), `gbrain doctor` used to feel like it locked up. The frontmatter check would sit there for a minute or more, and any cron monitor wrapping it would time out and report the whole health report as failed. The actual problem turned out to be embarrassing: the scanner was crawling into `node_modules/`, `.git/`, `.obsidian/`, and other vendor directories on every doctor run, paying the cost of touching hundreds of thousands of files it was always going to throw away. This release stops doing that, AND adds a real wall-clock budget so even pathologically large sources get a useful answer instead of a hang.
+
+When the budget does run out, doctor now tells you exactly which sources finished, which one got partway, and which ones never got checked, with a paste-ready remediation command per source. No more black-box "scan timed out."
+
+### How to upgrade
+
+```bash
+gbrain upgrade
+# That's it. No manual steps. Doctor is faster on the next run.
+```
+
+### What you'd see in a concrete example
+
+A brain with 3 federated sources where source-b is huge:
+
+```
+$ gbrain doctor
+...
+frontmatter_integrity: warn
+  216 frontmatter issue(s) (PARTIAL SCAN — timeout after 30s).
+  src-a: 14 (NESTED_QUOTES=14);
+  src-b: PARTIAL — scanned ~42000 files (source has ~200000 pages in DB), 202 issue(s) so far, NESTED_QUOTES=202;
+  src-c: NOT SCANNED (timeout — run `gbrain frontmatter validate src-c`).
+  Raise GBRAIN_DOCTOR_FM_TIMEOUT_MS or run `gbrain frontmatter validate <source>` directly.
+```
+
+You get the breakdown per source instead of a single opaque warn. If you want a bigger budget for that one cron, `export GBRAIN_DOCTOR_FM_TIMEOUT_MS=60000` (default is 30 seconds).
+
+### The numbers that matter
+
+| Brain shape | Pre-v0.38.2.0 | Post-v0.38.2.0 |
+|---|---|---|
+| 10K real pages, no vendor dirs | seconds | seconds (no regression) |
+| 10K real pages + node_modules with 50K files | hangs past 30s | seconds (descent prunes vendor trees) |
+| 200K+ real pages, single source | hangs forever | partial result inside budget, per-source breakdown |
+| Cron wrapped in `timeout 60s` | exit 124, full health report fails | exit 0, `frontmatter_integrity: warn` with actionable detail |
+
+### Things to watch
+
+- **`gbrain frontmatter validate <source>` is also faster.** The same fix applies to that command's walker (there were two walkers with the same bug; one PR closed both).
+- **`AbortSignal.timeout` is the lesser bound, not the load-bearing one.** The hard wall-clock guarantee comes from a deadline check inside the file-by-file scan loop. (Pre-merge a Codex review caught that the timer-based abort can't interrupt synchronous filesystem calls; the deadline check is what actually fires mid-walk.)
+- **Steady-state cost is still O(N) in real pages.** This release delivers bounded wall-clock and honest partial-state signal, NOT sub-second steady-state doctor. Driving the steady state to constant-cost needs DB-backed scan state — designed in `docs/architecture/frontmatter-scan-incremental.md`, deferred to a follow-up PR because schema migrations carry their own contract surface.
+
+### Supersedes PR #1287
+
+Community PR #1287 (by @garrytan-agents) diagnosed the hang correctly and proposed a 10-line `AbortSignal.timeout` band-aid. We took the bug seriously enough to find a deeper root cause: the walker was descending into vendor directories on every tick. PR #1287 closes after this release lands. Thanks to the agent for the diagnosis — the timeout plumbing it added is part of the safety net that ships here.
+
+### Itemized changes
+
+- `src/core/brain-writer.ts`: `walkDir` now consults `pruneDir(name, parentDir)` at descent time, the canonical pruner used by sync/extract/transcript-discovery since v0.35.5.0. Skips `node_modules`, `.git`, `.obsidian`, `*.raw`, `ops`, all dot-prefix dirs, and git submodule dirs (`.git` as FILE per v0.37.7.0 #1169). `ScanOpts` gains `deadline?: number` (epoch ms) checked per file inside `scanOneSource` — the load-bearing wall-clock bound. `PerSourceReport` gains `status: 'scanned' | 'partial' | 'skipped'`, `files_scanned: number` (numerator), and `db_page_count?: number | null` (denominator from the doctor-supplied SQL hook). `AuditReport` gains `partial: boolean` and `aborted_at_source: string | null`. `ok` is now `grandTotal === 0 && !partial` — a clean prefix from a timed-out scan no longer falsely reports clean. `walkDir` exported with an optional `visitDir` test callback for the regression suite (production callers don't pass it).
+- `src/commands/frontmatter.ts`: `collectFiles` (the second walker — drives `gbrain frontmatter validate`) gets the same `pruneDir` wiring + optional `visitDir` callback. Now `export`ed. Without this fix, doctor's own remediation hint pointed users at a command that hung the same way.
+- `src/commands/doctor.ts`: `frontmatter_integrity` adopts the deadline + AbortSignal.timeout pair (configurable via `GBRAIN_DOCTOR_FM_TIMEOUT_MS`, default 30000ms). Per-source DB denominator via `SELECT COUNT(*) FROM pages WHERE source_id = $1 AND deleted_at IS NULL`. Partial render distinguishes `'scanned' | 'partial' | 'skipped'` with honest "scanned ~N files (source has ~M pages in DB)" wording — the DB COUNT and the on-disk scan are overlapping but not identical sets, and the message reflects that. Catch block simplified to "unexpected error only" (no AbortError special case; the abort path returns cleanly via partial state, not via throw).
+- Tests: `test/brain-writer-walk-prune.test.ts` (12 cases, REGRESSION suite for both walkers — uses the new `visitDir` callback for direct descent-time observability, not leaf-output assertions which would pass under the original bug). `test/brain-writer-partial-scan.test.ts` (5 cases for deadline + partial state + ok-after-abort + numerator/denominator). `test/doctor-frontmatter-partial.test.ts` (11 structural source-grep cases pinning the load-bearing render strings).
+- `tests/heavy/frontmatter_scan_wallclock.sh` (new, manual / nightly per `tests/heavy/README.md`): seeds a synthetic 60K-file brain (10K real + 50K under node_modules) and asserts `gbrain doctor` completes in <15s with `frontmatter_integrity: ok`. Catches the regression at a scale where the original bug actually shows.
+- `docs/architecture/frontmatter-scan-incremental.md`: Phase 2 design sketch for DB-backed scan state — schema migration, sync-side writes, autopilot cycle phase, doctor reader. Captured so the follow-up PR has a starting point.
+
+### For contributors
+
+- The walker test surface changes shape: `walkDir` (brain-writer.ts) and `collectFiles` (frontmatter.ts) are now exported with an optional `visitDir` callback. Tests should use this for descent-time pruning assertions; leaf-output tests can pass under the original bug since `isSyncable` filters at the leaf.
+- `scanBrainSources` now returns `partial` + `aborted_at_source` on `AuditReport` and `status` + `files_scanned` (+ optional `db_page_count`) per `PerSourceReport`. Any test that constructs `AuditReport` literals needs to include the new required fields. (One pre-existing test was updated as part of this PR.)
+- `runDoctor` still calls `process.exit` at the end — behavioral tests against it can't run via the unit-test runner. That refactor stays a TODO; the unit-test layer covers `scanBrainSources` + doctor's render shape via source-grep, and the heavy script covers end-to-end against a subprocess.
+
+## [0.38.1.0] - 2026-05-21
+
+**Your `gbrain agent run` loop can now run on any provider with native tool calling — not just Anthropic.** OpenAI, Google Gemini, OpenRouter, openai-compatible servers (Ollama, LiteLLM, vLLM, llama-server) all work. Pick the cheapest model that does the job for your agent, or stay on Anthropic if you want the prompt-cache cost savings on long loops.
+
+The pre-v0.38 subagent loop was Anthropic-direct: `new Anthropic()` instantiated inside the worker, the loop hard-pinned three layers deep because crash-replay reconciliation needed Anthropic's stable `tool_use_id`s. That pin is gone. The replay key is now gbrain-owned (uuid v7 + per-turn ordinal, persisted at first observation of each tool call) — the provider can return whatever id shape it wants and crash-replay still reconciles.
+
+How to turn it on:
+
+```bash
+gbrain config set agent.use_gateway_loop true
+gbrain config set models.tier.subagent openai:gpt-5.2     # or anthropic:claude-sonnet-4-6, google:gemini-1.5-pro, etc.
+gbrain agent run "research acme corp" --tools search,query --follow
+```
+
+The legacy Anthropic-direct path stays the default for one patch release so existing brains ship the same behavior on upgrade. Dogfood the new path locally, then flip the flag in the next release.
+
+What you'd see when picking providers:
+
+| Provider | Tool calls | Prompt caching | Notes |
+|---|---|---|---|
+| anthropic:claude-* | Yes | Yes | Cheapest on long loops thanks to cache; default |
+| openai:gpt-5.2 | Yes | No (implicit only) | Runs hot — cost scales linearly with conversation length |
+| google:gemini-1.5-pro | Yes | No | 1M-token context; good for big-context agents |
+| openrouter:* | Yes | Depends on underlying | The cost-arbitrage path |
+| openai-compatible (Ollama, LiteLLM, vLLM, llama-server) | If the model supports tools | No | Refused-at-submit when the model lacks tool calling |
+| voyage, zeroentropy | No chat touchpoint | n/a | Embeddings only — refused with a clear hint |
+
+`gbrain doctor` warns when your subagent tier resolves to a degraded provider (no prompt caching = higher cost) and refuses to dispatch when the provider doesn't support tool calling at all. The check is `subagent_capability` (was `subagent_provider`).
+
+**The remote MCP boundary also opens up — Cursor, Claude Code, ChatGPT can now launch gbrain agents over MCP**, not just observe them. The new op is `submit_agent`. Trust is bounded at OAuth client registration time: which tools the agent can call, which source/brain it can touch, which slug-prefixes it can write under, max concurrent jobs, and a per-client daily USD cap that uses a reserve-then-settle budget meter (the rate-leases.ts pattern over `pg_advisory_xact_lock`) so two concurrent agents from the same client can't both pre-flight at the cap boundary and bust it.
+
+To register a remote agent client (requires server-side gbrain v0.38+):
+
+```bash
+gbrain auth register-client cursor-agent \
+  --scopes read,agent \
+  --bound-tools search,get_page,put_page \
+  --bound-source default \
+  --bound-slug-prefixes wiki/ \
+  --bound-max-concurrent 3 \
+  --budget-usd-per-day 5.00
+```
+
+`gbrain` writes a JSONL audit row at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl` per submission with (client, model, tools, slug_prefixes, max_concurrent, budget_remaining_cents, outcome). Prompt text itself never lands in the audit — only its byte count.
+
+Things to watch after upgrading:
+
+- `gbrain doctor` may warn `subagent_capability` if your `chat_model` is non-Anthropic and `ANTHROPIC_API_KEY` is unset and you haven't flipped `agent.use_gateway_loop=true` yet. The default still falls through the Anthropic-direct path; the warn surfaces this drift.
+- Existing `admin` OAuth clients do NOT automatically get the new `agent` scope. The two scopes are siblings (D13). Re-register with `--scopes admin,agent` and explicit bindings to opt in.
+- Mid-flight binary upgrade: jobs that were running with v0.37-shaped content_blocks reconcile via a read-time shim that recomputes the stable key from `(job_id, message_idx, content_blocks index, tool_name)`. No data migration; legacy rows replay correctly under the new key.
+- Migrations v82-v85 land on first `gbrain doctor` post-upgrade. (v81 was claimed by v0.38.0.0's `pages_provenance_columns`; v0.38.1.0's stable-ID + reservation + binding migrations renumbered up by one.)
+
+### What we built and how it slots together
+
+Four atomic slices behind feature flags, each shipping independently before the next:
+
+- **Slice 1** — gateway-native tool loop + stable IDs + v1→v2 shim. Pin removal at queue.ts, model-config rename, doctor check rename. Behind `agent.use_gateway_loop` (default off in this patch).
+- **Slice 2** — budget meter (reserve-then-settle via `pg_advisory_xact_lock`), `mcp_spend_reservations` table, `oauth_clients.budget_usd_per_day`.
+- **Slice 3** — `submit_agent` MCP op + `agent` OAuth scope + `oauth_clients.bound_*` columns + JSONL audit at `~/.gbrain/audit/agent-jobs-*.jsonl`.
+- **Slice 4** — admin `/admin/api/agents/spend` endpoint. Frontend wire-up follows in a near-term patch.
+
+### To take advantage of v0.38.1.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Try the new loop** (optional; off by default):
+   ```bash
+   gbrain config set agent.use_gateway_loop true
+   gbrain config set models.tier.subagent openai:gpt-5.2   # or your preferred provider
+   gbrain agent run "test the new loop" --tools search --follow
+   ```
+3. **Verify the schema** is at v85:
+   ```bash
+   gbrain doctor --json | grep schema_version
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with:
+   - output of `gbrain doctor`
+   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
+   - which step broke
+
+### Itemized changes
+
+**Added:**
+- `src/core/ai/capabilities.ts` — recipe-driven `getProviderCapabilities()` + `classifyCapabilities()` (5-state verdict: `ok` / `degraded:no_caching` / `degraded:no_parallel` / `unusable:no_tools` / `unknown`).
+- `src/core/ai/gateway.ts:toolLoop()` — provider-agnostic loop control wrapping `gateway.chat()`. Stateless beyond optional replay state; testable via existing `__setChatTransportForTests` seam.
+- `src/core/minions/budget-meter.ts` — reserve/settle/sweep + FNV-1a `clientLockKey` for `pg_advisory_xact_lock`.
+- `src/core/minions/agent-audit.ts` — ISO-week-rotated JSONL audit at `~/.gbrain/audit/agent-jobs-YYYY-Www.jsonl`. Never logs prompt text.
+- New MCP op `submit_agent` (scope `agent`, mutating, remote-callable) with per-dispatch binding enforcement.
+- `agent` OAuth scope (sibling to admin, NOT implied) + `oauth_clients.bound_tools` / `.bound_source_id` / `.bound_brain_id` / `.bound_slug_prefixes` / `.bound_max_concurrent` / `.budget_usd_per_day` columns.
+- `submit_agent` handler-time gateway-loop path inside `src/core/minions/handlers/subagent.ts`: builds `ChatToolDef[]` + `ToolHandler` Map from existing brain-tool registry, persists to v0.38 stable-ID columns at first observation, settles complete/failed on tool exit. D5 read-time shim adapts v1 Anthropic content blocks into v2 ChatBlock-shaped on read so crash-replay reconciles across the upgrade boundary.
+- Admin endpoint `GET /admin/api/agents/spend` returning per-client today's spend + pending reservations + inflight count.
+
+**Changed:**
+- `src/core/minions/queue.ts:87-106` — dropped `isAnthropicProvider` hard-reject; now refuses only on `unusable:no_tools` / `unknown` verdicts. Degraded providers pass with cost warn at first dispatch.
+- `src/core/model-config.ts:enforceSubagentAnthropic` → `enforceSubagentCapable`. Preserves once-per-(source,model) warn seam from v0.31.12. Legacy name kept as a thin back-compat wrapper.
+- `src/commands/doctor.ts:checkSubagentProvider` → `checkSubagentCapability`. Three verdict states: unusable, unknown, degraded:no_caching (cost regression warn).
+- `src/core/scope.ts` — `agent` added to allowed scopes (size 5 → 6). `IMPLIES` map keeps `agent` as a sibling, NOT implied by admin.
+- `src/core/operations.ts:operations` — `submit_agent` registered as a remote-safe mutating op alongside the existing Minions ops.
+
+**Migrations:**
+- v82 (`subagent_tool_executions_stable_id`) — adds `ordinal INTEGER`, `gbrain_tool_use_id UUID`, `UNIQUE(job_id, message_idx, ordinal)`. NULL-tolerant for legacy rows.
+- v83 (`mcp_spend_reservations`) — new table for reserve-then-settle pattern. Partial index on `(status, expires_at) WHERE status='pending'`.
+- v84 (`oauth_clients_budget_usd_per_day`) — `NUMERIC(10,2) NULL`.
+- v85 (`oauth_clients_agent_binding`) — bound_tools / bound_source_id (FK sources) / bound_brain_id / bound_slug_prefixes TEXT[] / bound_max_concurrent INTEGER DEFAULT 1.
+
+**Tests:**
+- `test/ai/capabilities.test.ts` (12 cases) — recipe-driven capability matrix across Anthropic / OpenAI / Google / Voyage (chat-touchpoint missing) / malformed input / unknown provider.
+- `test/ai/gateway-tool-loop.test.ts` (7 cases) — end stop_reason, single tool dispatch, callback ordering (write-ordering invariant), replay short-circuit on complete, non-idempotent pending replay throws unrecoverable, max_turns cap, refusal short-circuit.
+- `test/minions/budget-meter.test.ts` (15 cases) — FNV-1a determinism, reserve under/over cap, settle idempotency, sweep, getClientDailyCapCents.
+- `test/minions/agent-audit.test.ts` (7 cases) — ISO-week filename + year-boundary edge, JSONL append, NEVER logs prompt content.
+- `test/agent-cli.test.ts` updates — Layer 1/2/3 cases flipped: any tool-supporting provider passes; unknown / embedding-only provider refused.
+- `test/scope.test.ts` + `test/oauth.test.ts` + `test/model-config.serial.test.ts` updated for v0.38 semantics.
+
+**Plan:** `~/.claude/plans/system-instruction-you-are-working-shimmying-breeze.md`. Wave went through `/plan-ceo-review` (Option B locked), `/plan-eng-review` (7 decisions D3-D9), and two codex outside-voice rounds (D11-D13 absorbed; round 2 caught blocker on missing Slice 1 stable-ID migration + 4 non-blockers).
+
 ## [0.38.0.0] - 2026-05-21
 
 **One command to capture anything into your brain. Local OR hosted, doesn't matter.**
@@ -140,6 +413,7 @@ These do not block the v0.38 release: the substrate is shipped and queryable; so
 
 `gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
 warns about a partial migration:
+
 ## [0.37.11.0] - 2026-05-21
 
 **Fresh `gbrain init --pglite` works out of the box now.**
@@ -496,29 +770,6 @@ Credited contributors per the CHANGELOG attribution convention; closing comments
    ```bash
    gbrain apply-migrations --yes
    ```
-2. **Try the capture verb:**
-   ```bash
-   gbrain capture "first thought into v0.38"
-   gbrain query "first thought"
-   ```
-   The receipt block should show the slug + file path; the query should
-   return the page within a second.
-3. **For webhook ingestion** (only if you run `gbrain serve --http`):
-   ```bash
-   curl -X POST https://your-brain/ingest \
-     -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: text/markdown" \
-     -d "# webhook test"
-   ```
-   You should see HTTP 202 + a `job_id`. Run `gbrain query "webhook test"`
-   to confirm the page landed.
-4. **If any step fails or the numbers look wrong,** please file an issue:
-   https://github.com/garrytan/gbrain/issues with:
-   - output of `gbrain doctor`
-   - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
-   - which step broke
-
-   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
 2. **Verify the source-routing fix on your federated brains:**
    ```bash
    gbrain sources current
