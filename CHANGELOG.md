@@ -224,6 +224,20 @@ Four atomic slices behind feature flags, each shipping independently before the 
    ```bash
    gbrain apply-migrations --yes
    ```
+   This applies migration v81 (`page_links_view_alias`) on PGLite + Postgres brains. The alias is required for `gbrain brainstorm` and `gbrain lsd` to work against the domain-bank tiebreaker; without it, the brainstorm domain-bank queries fail with `relation "page_links" does not exist`.
+2. **Set a cost cap on the commands you care about:**
+   ```bash
+   # Sets a per-run dollar ceiling. Throws BudgetExhausted before any LLM call
+   # if the pre-run estimate exceeds the cap, AND mid-run if cumulative spend
+   # blows past it.
+   gbrain brainstorm "test" --max-cost 1
+   gbrain doctor --remediate --max-cost 5
+   gbrain reindex --code --max-cost 10
+   ```
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor             # schema_version should be 81
+   gbrain brainstorm --list-runs   # confirms the new checkpoint directory exists
 2. **Try the new loop** (optional; off by default):
    ```bash
    gbrain config set agent.use_gateway_loop true
@@ -240,6 +254,86 @@ Four atomic slices behind feature flags, each shipping independently before the 
    - contents of `~/.gbrain/upgrade-errors.jsonl` if it exists
    - which step broke
 
+   This feedback loop is how the gbrain maintainers find fragile upgrade paths. Thank you.
+## [0.38.0.0] - 2026-05-20
+
+**Your brain is now yours.**
+
+GBrain used to assume one shape: VC investor brain. People, companies, deals, meetings — those were the four corners. Everything else lived as `as PageType` casts the engine never enforced. Your real brain has 180+ types — `therapy-session`, `tweet-bundle`, `adversary-profile`, `book-analysis`, `apple-note`, plus 175 more. They worked through a polite fiction. The engine pretended you wrote VC software; you pretended back. v0.38 ends the pretense.
+
+PageType is now `string`. The closed 23-element union is gone. Schema packs declare your domain — types, link verbs, expert routing, facts eligibility, enrichment rubrics — and the engine consults the active pack instead of hardcoded literals. Five primitives compose: entity, media, temporal, annotation, concept. A research brain declares `paper`, `claim`, `method`, `researcher` and gets working search, expert routing, and facts extraction without forking the engine. A legal brain declares `case`, `statute`, `brief`. Your brain at `~/git/brain` keeps working unchanged because gbrain-base — the universal starter pack — reproduces today's behavior byte-for-byte.
+
+The path from "I have a brain" to "I have a schema matching my brain" is `gbrain schema use <pack>`. Five inspection + activation commands ship in v0.38: `active`, `list`, `show`, `validate`, `use`. The detect/suggest/init/fork/diff/graph/lint/explain surface follows in v0.39 — primitives are already in place.
+
+**Architecture decisions that survived three rounds of codex review:**
+
+- **Open type surface (D12).** PageType opens to `string`. ~30 `as PageType` casts widen to `as string` at engine SQL row boundaries. Compile-time exhaustiveness moves to the 5-element closed `PackPrimitive` enum where it's actually load-bearing.
+- **Explicit alias graph closure (E8 refinement of D12).** Pack types declare `aliases: []` explicitly. Closure walks the alias graph (BFS, depth cap 4, symmetric per declaration), not the primitive sibling set. This prevents `adversary-profile` from surfacing in `whoknows expert` just because it shares the `entity` primitive with `person` — codex finding #15 caught the silent bug in a prior model.
+- **Per-source closure CTE (D13).** Federated reads across sources `[A, B, C]` filter via a per-source CTE — each row classified by ITS source's pack rules, not the write-source pack's. Builder ships; engine wiring follows.
+- **Trust gate on per-call schema_pack (D13 + codex F4).** Per-call `schema_pack` opt is rejected for remote/MCP callers (`ctx.remote !== false`). CLI overrides freely. Same posture as v0.26.9 + v0.34.1.0 source-scope hardening.
+- **ReDoS guard via vm.runInContext (E6 + E9 + T24 spike).** Community pack regexes run with a 50ms per-regex timeout and a 500ms per-page cumulative budget. Catastrophic backtracking (`^(a+)+$` against 1MB) interrupts cleanly under Bun. One bad regex burns the page budget; remaining verbs degrade to `mentions` deterministically.
+- **Inline canonical closure snapshot for eval replay (E10 + E11).** `eval_candidates.schema_pack_per_source` JSONB stores `{source_id → {pack_name, pack_version, manifest_sha8, alias_closure_resolved}}`. Replay is self-contained; a year-old eval reproduces exactly even if the pack file evolved or was deleted.
+
+**How to turn it on**
+
+The migration is invisible:
+
+```bash
+gbrain upgrade
+gbrain schema active     # → gbrain-base (default, reproduces pre-v0.38)
+gbrain stats             # → identical to pre-upgrade
+```
+
+When you want your own shape:
+
+```bash
+gbrain schema list                       # see available packs
+gbrain schema show gbrain-base           # see what the default declares
+gbrain schema validate my-pack           # validate a pack manifest
+gbrain schema use my-pack                # activate (writes ~/.gbrain/config.json)
+```
+
+Author packs as YAML or JSON at `~/.gbrain/schema-packs/<name>/pack.yaml`:
+
+```yaml
+api_version: gbrain-schema-pack-v1
+name: research-state
+version: 0.1.0
+extends: gbrain-base
+page_types:
+  - name: paper
+    primitive: media
+    path_prefixes: [papers/]
+    aliases: []
+    extractable: true
+    expert_routing: false
+  - name: researcher
+    primitive: entity
+    path_prefixes: [researchers/]
+    aliases: [person]    # E8: surfaces person rows in researcher queries
+    extractable: true
+    expert_routing: true
+```
+
+**What's safe to know about**
+
+- **Existing brains see zero change.** gbrain-base is the default pack; every type/path/regex/rubric matches pre-v0.38 byte-for-byte. The migration is data-mutation-free: pages keep their `type` value; the engine consults the active pack at read time.
+- **180+ organic types now legal.** Pre-v0.38 your `apple-note` and `therapy-session` rows worked because the closed PageType union was already a fiction. v0.38 formalizes the open shape — no more `as PageType` ceremony, no compile-time barrier to writing your own types.
+- **takes.kind CHECK constraint dropped (migration v80).** Runtime validation against the active pack's `annotation` primitive `takes_kinds:` field replaces the hardcoded `IN ('fact','take','bet','hunch')`. gbrain-base preserves the 4 legacy kinds; research packs add `finding`, `hypothesis`; legal packs add `verdict`, `motion`.
+
+**What's NOT done yet (Phase B/C/D follow-up waves)**
+
+This ship lands the foundation. The primitives are in place; per-call-site wiring follows mechanically:
+
+- Per-call-site wiring of pack-aware variants in: postgres-engine.ts/pglite-engine.ts find_experts SQL, whoknows.ts DEFAULT_TYPES, link-extraction.ts inferLinkType + FRONTMATTER_FIELD_OVERRIDES callers, markdown.ts inferType callers, facts/eligibility.ts ELIGIBLE_TYPES, enrichment-service.ts entityType, enrichment/completeness.ts RUBRICS_BY_TYPE, cycle/synthesize+patterns subagent prompts.
+- Phase C CLI follow-ups: `detect`, `suggest`, `init`, `fork`, `edit`, `diff`, `graph`, `lint`, `explain`, `review-candidates`, `review-orphans`.
+- Phase D: 7 example packs (minimal-brain, person-first, media-archive, temporal-archive, research-notebook, founder-ops, personal-archive), schema-pack distribution as `.gbrain-schema` tarballs via the v0.37 skillpack pipeline (rename `.tgz` → `.gbrain-skillpack` for symmetry), full e2e test, author guide + cookbook.
+
+The full plan estimated 12-14 weeks across all four phases. v0.38.0.0 lands Phase A (engine flex foundation) + Phase B foundational primitives + Phase C minimal CLI surface as 16 atomic commits.
+
+## To take advantage of v0.38
+
+`gbrain upgrade` handles everything automatically — migrations v80 + v81 run via `gbrain apply-migrations`. If `gbrain doctor` warns about a partial migration:
 ### Itemized changes
 
 **Added:**

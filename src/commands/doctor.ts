@@ -572,6 +572,14 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
 
+  // v0.39 T7 + T9 — schema-pack health checks (3 checks per v0.38 plan):
+  //   schema_pack_active        — active pack resolves cleanly
+  //   schema_pack_consistency   — % of pages typed against active pack
+  //   schema_pack_source_drift  — per-source pack divergence
+  checks.push(await checkSchemaPackActive(engine));
+  checks.push(await checkSchemaPackConsistency(engine));
+  checks.push(await checkSchemaPackSourceDrift(engine));
+
   // 7. v0.32.3 search-lite mode + per-key drift surface.
   checks.push(await checkSearchMode(engine));
 
@@ -4702,4 +4710,116 @@ function parseFloatFlag(args: string[], flag: string): number | null {
   if (i === -1 || i === args.length - 1) return null;
   const v = parseFloat(args[i + 1] ?? '');
   return isNaN(v) ? null : v;
+}
+
+// =================================================================
+// v0.39 T7 + T9 — schema-pack doctor checks
+// =================================================================
+// Three checks per v0.38 CEO plan that never shipped at v0.38 time:
+//   schema_pack_active       — does the active pack resolve cleanly?
+//   schema_pack_consistency  — what % of pages match the active pack?
+//   schema_pack_source_drift — do per-source packs disagree?
+// All three are warn-only; never fail-block.
+
+async function checkSchemaPackActive(engine: BrainEngine): Promise<Check> {
+  try {
+    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
+    const { loadConfig } = await import('../core/config.ts');
+    const pack = await loadActivePack({ cfg: loadConfig(), remote: false });
+    return {
+      name: 'schema_pack_active',
+      status: 'ok',
+      message: `Active pack: ${pack.manifest.name} v${pack.manifest.version} (${pack.manifest.page_types.length} types, ${pack.manifest.link_types?.length ?? 0} link verbs)`,
+    };
+  } catch (e) {
+    return {
+      name: 'schema_pack_active',
+      status: 'warn',
+      message: `Active pack failed to resolve: ${(e as Error).message}. Run \`gbrain schema active\` to debug.`,
+    };
+  }
+}
+
+async function checkSchemaPackConsistency(engine: BrainEngine): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{ src: string; total: string | number; untyped: string | number }>(
+      `SELECT
+         source_id AS src,
+         COUNT(*)::text AS total,
+         COUNT(*) FILTER (WHERE type IS NULL OR type = '')::text AS untyped
+       FROM pages
+       WHERE deleted_at IS NULL
+       GROUP BY source_id
+       ORDER BY source_id`,
+    );
+    if (rows.length === 0) {
+      return { name: 'schema_pack_consistency', status: 'ok', message: 'No pages in any source — schema consistency N/A.' };
+    }
+    let worstPct = 0;
+    let worstSrc = '';
+    let worstUntyped = 0;
+    let worstTotal = 0;
+    for (const r of rows) {
+      const total = Number(r.total);
+      const untyped = Number(r.untyped);
+      if (total === 0) continue;
+      const pct = untyped / total;
+      if (pct > worstPct) {
+        worstPct = pct;
+        worstSrc = r.src;
+        worstUntyped = untyped;
+        worstTotal = total;
+      }
+    }
+    if (worstPct === 0) {
+      return { name: 'schema_pack_consistency', status: 'ok', message: 'All pages match the active schema pack across every source.' };
+    }
+    const pctStr = (worstPct * 100).toFixed(1);
+    if (worstPct >= 0.1) {
+      return {
+        name: 'schema_pack_consistency',
+        status: 'warn',
+        message: `Source \`${worstSrc}\`: ${worstUntyped} of ${worstTotal} pages (${pctStr}%) have no type matching the active pack. Run \`gbrain schema detect --source ${worstSrc}\` to propose a pack matching your content shape.`,
+      };
+    }
+    return {
+      name: 'schema_pack_consistency',
+      status: 'ok',
+      message: `${pctStr}% untyped at worst (source \`${worstSrc}\`) — under the 10% warn threshold.`,
+    };
+  } catch (e) {
+    return {
+      name: 'schema_pack_consistency',
+      status: 'ok',
+      message: `Skipped: ${(e as Error).message}`,
+    };
+  }
+}
+
+async function checkSchemaPackSourceDrift(engine: BrainEngine): Promise<Check> {
+  try {
+    // Compare per-source schema_pack overrides (tier 3 DB config) to detect
+    // multi-source brains where different sources point at conflicting packs.
+    const rows = await engine.executeRaw<{ key: string; value: string }>(
+      `SELECT key, value FROM config WHERE key LIKE 'schema_pack.source.%'`,
+    );
+    if (rows.length === 0) {
+      return { name: 'schema_pack_source_drift', status: 'ok', message: 'No per-source pack overrides — drift N/A.' };
+    }
+    const distinctPacks = new Set(rows.map((r) => r.value).filter(Boolean));
+    if (distinctPacks.size <= 1) {
+      return { name: 'schema_pack_source_drift', status: 'ok', message: `${rows.length} per-source overrides; all point at the same pack.` };
+    }
+    return {
+      name: 'schema_pack_source_drift',
+      status: 'warn',
+      message: `Per-source pack divergence detected: ${distinctPacks.size} distinct packs across ${rows.length} sources. Run \`gbrain sources list\` then \`gbrain schema active --source <id>\` per source to audit.`,
+    };
+  } catch (e) {
+    return {
+      name: 'schema_pack_source_drift',
+      status: 'ok',
+      message: `Skipped: ${(e as Error).message}`,
+    };
+  }
 }

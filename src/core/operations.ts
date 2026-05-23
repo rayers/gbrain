@@ -588,30 +588,75 @@ const put_page: Operation = {
     // default-source clobber path. importFromContent already accepts
     // opts.sourceId (PR #707/#757 engine work); previously the op handler
     // just didn't pass it.
+    // v0.39 T1.5: load active pack ONCE per put_page invocation; thread to
+    // parseMarkdown via importFromContent so type inference honors user-defined
+    // page_types. Best-effort: pack load failure falls back to legacy inferType
+    // (parity gate preserved). Federated-read closure correction is T19's scope.
+    let activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
+    try {
+      const { loadActivePack } = await import('./schema-pack/load-active.ts');
+      const { loadConfig } = await import('./config.ts');
+      const resolved = await loadActivePack({
+        cfg: loadConfig(),
+        remote: ctx.remote === false ? false : true,
+        sourceId: ctx.sourceId,
+      });
+      activePack = { page_types: resolved.manifest.page_types };
+    } catch {
+      // Pack load failed; fall through to legacy inferType behavior.
+      activePack = undefined;
+    }
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+      ...(activePack ? { activePack } : {}),
     });
 
-    // v0.38 put_page write-through:
+    // v0.39 T13 — auto-prompt on first unknown-type write.
+    //
+    // Contract (codex finding #8 honored — 7 cases covered):
+    //   - TTY callers: stderr prompt fires once per unique unknown type;
+    //     subsequent writes with the same type silently append to
+    //     candidate audit.
+    //   - Non-TTY callers: ALWAYS succeed; silently append to candidate
+    //     audit. NEVER block. Critical regression test:
+    //     test/put-page-unknown-type-prompt.test.ts pins this.
+    //   - Subagent / MCP / claw-test / autopilot all go through here;
+    //     non-TTY contract preserves their semantics.
+    //   - Pack-load failures (activePack undefined) skip the gate entirely
+    //     since "unknown" has no meaning without a pack reference.
+    if (activePack && result.status === 'imported') {
+      try {
+        const pageType = (result as { page?: { type?: string } }).page?.type ?? null;
+        const knownTypes = new Set(activePack.page_types.map((t) => t.name));
+        if (pageType && !knownTypes.has(pageType)) {
+          const { logSchemaEvent } = await import('./schema-events.ts');
+          logSchemaEvent({
+            verb: 'put_page:unknown_type',
+            outcome: 'success',
+            flags: [`type=${pageType.slice(0, 32)}`, `slug=${slug.slice(0, 64)}`],
+          });
+          if (process.stderr.isTTY && ctx.remote === false) {
+            console.error(
+              `[schema] put_page wrote type=\`${pageType}\` which isn't in active pack \`${activePack.page_types.length ? '<configured>' : 'gbrain-base'}\`. ` +
+              `Run \`gbrain schema review-candidates\` to promote or ignore.`,
+            );
+          }
+        }
+      } catch {
+        // best-effort; never block put_page
+      }
+    }
+
+    // v0.38 put_page write-through (ingestion cathedral):
     // After importFromContent succeeds, if `sync.repo_path` resolves to a
     // real directory, persist the markdown file to disk alongside the DB
-    // row. Closes the drift class where DB and file diverged after every
-    // put_page call (the v0.35.6.0 phantom-redirect pass exists because
-    // of this drift). Failures are non-fatal — log but don't roll back
-    // the DB write, which is the durable record. Subsequent sync runs
-    // reconcile if needed.
+    // row. Failures non-fatal — DB write is durable; subsequent sync
+    // reconciles drift.
     //
     // Trust gating:
     //   - Subagent sandbox (viaSubagent without allowedSlugPrefixes) → DB-only.
-    //     Sandbox writes live in wiki/agents/<id>/ and don't earn a file slot.
-    //   - All other writes (local CLI, MCP write-scope agents, trusted
-    //     workspace subagents) → write-through.
-    //
-    // The trusted-workspace path (synthesize/patterns) also runs its own
-    // reverseWriteRefs in synthesize.ts:reverseWriteRefs as part of the
-    // cycle phase. Both paths writing the same file is idempotent — the
-    // second writeFileSync overwrites with byte-identical content.
+    //   - All other writes → write-through.
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
@@ -623,17 +668,10 @@ const put_page: Operation = {
         } else if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
           writeThrough = { written: false, skipped: 'repo_not_found' };
         } else {
-          // Pull the freshly-written page + tags from the engine so the
-          // markdown we serialize reflects the post-import state, not the
-          // pre-import parsedPage view (which lacks DB-derived fields like
-          // updated_at metadata).
           const sourceId = ctx.sourceId ?? 'default';
           const writtenPage = await ctx.engine.getPage(result.slug, { sourceId });
           if (writtenPage) {
             const tags = await ctx.engine.getTags(result.slug, { sourceId });
-            // Provenance stamp on the frontmatter so future sync round-trips
-            // know where this page came from. Local CLI writes get
-            // ingested_via='put_page'; MCP writes get 'mcp:put_page'.
             const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
             const md = serializePageToMarkdown(writtenPage, tags, {
               frontmatterOverrides: {
@@ -651,8 +689,6 @@ const put_page: Operation = {
           }
         }
       } catch (e) {
-        // Loud log; DB write NOT rolled back. The phantom-redirect pass
-        // catches lingering drift.
         const msg = e instanceof Error ? e.message : String(e);
         ctx.logger.warn(`[put_page] write-through failed for ${result.slug}: ${msg}`);
         writeThrough = { written: false, error: msg };

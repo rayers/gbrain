@@ -65,7 +65,10 @@ export type CyclePhase =
   //  - calibration_profile: aggregates the resolved subset into 2-4
   //    narrative pattern statements + active bias tags. Voice-gated.
   | 'propose_takes' | 'grade_takes' | 'calibration_profile'
-  | 'embed' | 'orphans' | 'purge';
+  | 'embed' | 'orphans' | 'purge'
+  // v0.39 T12: schema-suggest passive trigger (D3 + D4 plan-eng-review).
+  // Wraps runSuggest() — same library the CLI verb + EIIRP call.
+  | 'schema-suggest';
 
 export const ALL_PHASES: CyclePhase[] = [
   'lint',
@@ -112,6 +115,10 @@ export const ALL_PHASES: CyclePhase[] = [
   'calibration_profile',
   'embed',
   'orphans',
+  // v0.39 T12: passive schema-suggest. Runs LATE so post-sync brain state
+  // is settled; thin wrapper around runSuggest() library. Cheap (heuristic
+  // by default; LLM only when chat provider configured).
+  'schema-suggest',
   // v0.26.5: hard-deletes soft-deleted pages and expired archived sources past
   // the 72h recovery window. Runs last so the rest of the cycle sees the
   // recoverable set; the purge then drops what's expired.
@@ -1513,6 +1520,52 @@ export async function runCycle(
         const { result, duration_ms } = await timePhase(() => runPhaseOrphans(engine));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── v0.39 T12: schema-suggest ───────────────────────────────
+    // Passive trigger of the runSuggest() library (D3 + D4 plan-eng-review).
+    // Best-effort: phase failure does not abort the cycle. Writes nothing
+    // to user data — output goes to ~/.gbrain/audit/schema-events-*.jsonl
+    // (T15) and the disk-derived candidate set surfaced by `gbrain schema
+    // review-candidates`.
+    if (phases.includes('schema-suggest')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'schema-suggest',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.schema_suggest');
+        try {
+          const { runSchemaSuggestPhase } = await import('./cycle/schema-suggest.ts');
+          const { result, duration_ms } = await timePhase(async () => {
+            const r = await runSchemaSuggestPhase(engine, { dryRun: !!opts.dryRun });
+            return {
+              phase: 'schema-suggest' as const,
+              status: (r.skipped ? 'skipped' : 'ok') as PhaseStatus,
+              duration_ms: 0,
+              summary: r.skipped ? `skipped: ${r.reason ?? 'unknown'}` : `${r.suggestions_emitted} suggestions emitted`,
+              details: { ...r },
+            };
+          });
+          result.duration_ms = duration_ms;
+          phaseResults.push(result);
+        } catch (e) {
+          phaseResults.push({
+            phase: 'schema-suggest',
+            status: 'fail',
+            duration_ms: 0,
+            summary: `error: ${(e as Error).message}`,
+            details: { error: (e as Error).message },
+          });
+        }
         progress.finish();
       }
       await safeYield(opts.yieldBetweenPhases);
