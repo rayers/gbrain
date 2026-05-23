@@ -13,6 +13,7 @@ import type {
   TakesScorecard, TakesScorecardOpts, CalibrationBucket, CalibrationCurveOpts,
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
+  SourceRow,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { runMigrations } from './migrate.ts';
@@ -670,7 +671,8 @@ export class PGLiteEngine implements BrainEngine {
       where.push('deleted_at IS NULL');
     }
     const { rows } = await this.db.query(
-      `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at
+      `SELECT id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, deleted_at,
+              source_kind, source_uri, ingested_via, ingested_at
        FROM pages WHERE ${where.join(' AND ')} LIMIT 1`,
       params
     );
@@ -701,9 +703,17 @@ export class PGLiteEngine implements BrainEngine {
     // v0.32.7 CJK wave: chunker_version + source_path columns.
     const chunkerVersion = page.chunker_version ?? null;
     const sourcePath = page.source_path ?? null;
+    // v0.39.3.0 provenance write-through (WARN-8 + CV12). Mirrors postgres-engine.ts.
+    // Server stamps `ingested_at = now()` ONLY when any provenance field is being
+    // written this call. COALESCE-preserve UPDATE keeps the prior first-write
+    // timestamp intact so the audit trail survives routine edits.
+    const sourceKind = page.source_kind ?? null;
+    const sourceUri = page.source_uri ?? null;
+    const ingestedVia = page.ingested_via ?? null;
+    const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
     const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, 1), $14)
+      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, 1), $14, $15, $16, $17, $18::timestamptz)
        ON CONFLICT (source_id, slug) DO UPDATE SET
          type = EXCLUDED.type,
          page_kind = EXCLUDED.page_kind,
@@ -717,9 +727,13 @@ export class PGLiteEngine implements BrainEngine {
          effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
          import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
          chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
-         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath]
+         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
+         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
+         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
+         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
+         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
+       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
+      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
     );
     return rowToPage(rows[0] as Record<string, unknown>);
   }
@@ -910,6 +924,55 @@ export class PGLiteEngine implements BrainEngine {
        ORDER BY source_id, slug`
     );
     return (rows as { slug: string; source_id: string }[]).map(r => ({ slug: r.slug, source_id: r.source_id }));
+  }
+
+  async listAllSources(opts?: {
+    includeArchived?: boolean;
+    localPathOnly?: boolean;
+  }): Promise<SourceRow[]> {
+    // v0.38: parity with postgres-engine.listAllSources. Defaults match
+    // sources-ops.listSources (archived rows filtered out by default).
+    // localPathOnly skips pure-DB sources so autopilot fan-out doesn't
+    // dispatch jobs that would fall back to the global sync.repo_path.
+    const includeArchived = opts?.includeArchived === true;
+    const localPathOnly = opts?.localPathOnly === true;
+    const { rows } = await this.db.query<{
+      id: string;
+      name: string | null;
+      local_path: string | null;
+      last_sync_at: string | null;
+      config: unknown;
+    }>(
+      `SELECT id, name, local_path, last_sync_at, config
+         FROM sources
+        WHERE ($1::boolean OR archived IS NOT TRUE)
+          AND ($2::boolean OR local_path IS NOT NULL)
+        ORDER BY (id = 'default') DESC, id`,
+      [includeArchived, !localPathOnly],
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      local_path: r.local_path,
+      last_sync_at: r.last_sync_at ? new Date(r.last_sync_at) : null,
+      config: typeof r.config === 'string'
+        ? JSON.parse(r.config) as Record<string, unknown>
+        : ((r.config as Record<string, unknown> | null) ?? {}),
+    }));
+  }
+
+  async updateSourceConfig(sourceId: string, patch: Record<string, unknown>): Promise<boolean> {
+    // v0.38: parity with postgres-engine.updateSourceConfig. JSONB `||`
+    // concat operator (overrides same-key, no deep merge). PGLite passes
+    // `JSON.stringify(patch)` as the param; cast to jsonb on the SQL side.
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE sources
+          SET config = COALESCE(config, '{}'::jsonb) || $1::jsonb
+        WHERE id = $2
+        RETURNING id`,
+      [JSON.stringify(patch), sourceId],
+    );
+    return result.rows.length > 0;
   }
 
   // v0.37.0 — domain-bank engine methods (D14 + D5 + D10).
@@ -2719,11 +2782,13 @@ export class PGLiteEngine implements BrainEngine {
         const claimValue  = input.claim_value  ?? null;
         const claimUnit   = input.claim_unit   ?? null;
         const claimPeriod = input.claim_period ?? null;
+        // v0.40.2.0 — event_type column (Commit 1 migration v89).
+        const eventType   = input.event_type   ?? null;
 
         // Param-positional dispatch: embedStr presence shifts the trailing
         // slots by one. Order of named slots stays stable across both
         // branches: embedded_at, row_num, source_markdown_slug,
-        // claim_metric, claim_value, claim_unit, claim_period.
+        // claim_metric, claim_value, claim_unit, claim_period, event_type.
         const ins = await tx.query<{ id: number }>(
           embedStr === null
             ? `INSERT INTO facts (
@@ -2731,28 +2796,32 @@ export class PGLiteEngine implements BrainEngine {
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
                  row_num, source_markdown_slug,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period,
+                 event_type
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  NULL, $13,
                  $14, $15,
-                 $16, $17, $18, $19
+                 $16, $17, $18, $19,
+                 $20
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
                  embedding, embedded_at,
                  row_num, source_markdown_slug,
-                 claim_metric, claim_value, claim_unit, claim_period
+                 claim_metric, claim_value, claim_unit, claim_period,
+                 event_type
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                  $13::vector, $14,
                  $15, $16,
-                 $17, $18, $19, $20
+                 $17, $18, $19, $20,
+                 $21
                ) RETURNING id`,
           embedStr === null
-            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod],
+            ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
         );
         out.push(ins.rows[0].id);
       }
@@ -2882,6 +2951,7 @@ export class PGLiteEngine implements BrainEngine {
     const sinceDate = opts.since ? new Date(opts.since) : null;
     const untilDate = opts.until ? new Date(opts.until) : null;
     const metric = opts.metric ?? null;
+    const kind = opts.kind ?? 'all';
     const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
     const sourceIds = useArray ? opts.sourceIds! : null;
     const sourceId = opts.sourceId ?? 'default';
@@ -2905,6 +2975,13 @@ export class PGLiteEngine implements BrainEngine {
       params.push(metric);
       p += 1;
     }
+    // v0.40.2.0 — kind filter. 'all' (default) no-ops. 'metric' restricts
+    // to typed-claim rows; 'event' restricts to event-shaped rows.
+    if (kind === 'metric') {
+      where.push(`claim_metric IS NOT NULL`);
+    } else if (kind === 'event') {
+      where.push(`event_type IS NOT NULL`);
+    }
     if (sinceDate) {
       where.push(`valid_from >= $${p}`);
       params.push(sinceDate);
@@ -2921,6 +2998,7 @@ export class PGLiteEngine implements BrainEngine {
     const sqlText = `
       SELECT id, valid_from,
              claim_metric, claim_value, claim_unit, claim_period,
+             event_type,
              fact, source_session, source_markdown_slug,
              embedding
       FROM facts
@@ -2935,6 +3013,7 @@ export class PGLiteEngine implements BrainEngine {
       claim_value: number | null;
       claim_unit: string | null;
       claim_period: string | null;
+      event_type: string | null;
       fact: string;
       source_session: string | null;
       source_markdown_slug: string | null;
@@ -2961,6 +3040,7 @@ export class PGLiteEngine implements BrainEngine {
         value: r.claim_value === null ? null : Number(r.claim_value),
         unit: r.claim_unit,
         period: r.claim_period,
+        event_type: r.event_type,
         text: r.fact,
         source_session: r.source_session,
         source_markdown_slug: r.source_markdown_slug,

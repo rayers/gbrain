@@ -42,6 +42,20 @@ import type {
  * truncation can compare `result.length` against expected fanout bounds
  * as a coarse-but-honest signal in the interim.
  */
+/**
+ * v0.38: bare row shape returned by `BrainEngine.listAllSources()`.
+ * Kept lean (no per-source page_count) so the autopilot tick stays O(1)
+ * SQL queries regardless of source count. `sources-ops.SourceListEntry`
+ * is the enriched application-layer shape.
+ */
+export interface SourceRow {
+  id: string;
+  name: string | null;
+  local_path: string | null;
+  last_sync_at: Date | null;
+  config: Record<string, unknown>;
+}
+
 export interface TraverseGraphOpts {
   sourceId?: string;
   sourceIds?: string[];
@@ -448,6 +462,14 @@ export interface NewFact {
   claim_value?: number | null;
   claim_unit?: string | null;
   claim_period?: string | null;
+  /**
+   * v0.40.2.0 — event-shaped row marker ('meeting', 'job_change',
+   * 'location_change', etc). Mutually informational with `claim_metric`:
+   * a row can have either, both, or neither. Persisted into
+   * `facts.event_type` (migration v89). Existing callers don't need to
+   * set this — leaving it undefined preserves pre-v0.40 behavior.
+   */
+  event_type?: string | null;
 }
 
 /** Options shared by list-facts methods. */
@@ -504,6 +526,19 @@ export interface TrajectoryOpts {
   remote?: boolean;
   /** Metric filter. When set, only facts with this canonical metric label participate. */
   metric?: string;
+  /**
+   * v0.40.2.0 — kind filter. Default 'all'. Defensive opt that future-proofs
+   * the API now that event_type rows live alongside metric rows in the same
+   * table. Existing callers (founder-scorecard, eval-trajectory) pass
+   * 'metric' explicitly for clarity (no behavior change since their
+   * downstream math already skips NULL-metric rows). Richer event-shape
+   * filtering (job_change vs meeting vs location) is a v0.40.3+ TODO once
+   * the event schema gets structured fields.
+   *   - 'metric': only rows with claim_metric IS NOT NULL
+   *   - 'event':  only rows with event_type IS NOT NULL
+   *   - 'all':    both (default)
+   */
+  kind?: 'metric' | 'event' | 'all';
   /** Lower bound on valid_from (inclusive). YYYY-MM-DD or full ISO. */
   since?: string | Date;
   /** Upper bound on valid_from (inclusive). YYYY-MM-DD or full ISO. */
@@ -526,6 +561,17 @@ export interface TrajectoryPoint {
   value: number | null;
   unit: string | null;
   period: string | null;
+  /**
+   * v0.40.2.0 — event-shaped row marker (e.g. 'meeting', 'job_change',
+   * 'location_change'). Mutually informational with metric: a row can have
+   * (a) metric set + event_type null (typed claim like MRR=$50K),
+   * (b) metric null + event_type set (event like "last met Marco"), or
+   * (c) both null (legacy free-text fact row from pre-v0.35.4 brains).
+   * Both founder-scorecard's per-metric math and eval-trajectory's
+   * regression analysis already skip null-metric rows, so event-only
+   * rows ride through invisibly to those callers.
+   */
+  event_type: string | null;
   text: string;
   source_session: string | null;
   source_markdown_slug: string | null;
@@ -642,6 +688,44 @@ export interface BrainEngine {
    * `forEachPage` from src/core/engine-iter.ts instead.
    */
   listAllPageRefs(): Promise<Array<{ slug: string; source_id: string }>>;
+
+  /**
+   * v0.38 — lean per-source enumeration for hot-loop callers (autopilot
+   * dispatch, doctor freshness check). Returns the bare row shape sources-ops
+   * needs without the N+1 per-source page_count enrichment in
+   * `sources-ops.listSources`.
+   *
+   * Defaults filter out archived sources. When `localPathOnly` is true,
+   * also filters `local_path IS NOT NULL` so the autopilot fan-out doesn't
+   * dispatch jobs for pure-DB sources whose handler would fall back to
+   * the global sync.repo_path (codex r1 P1-4).
+   *
+   * `config` is returned as `Record<string, unknown>` — both engines
+   * already parse the JSONB at the boundary (Postgres-js returns
+   * parsed objects; PGLite returns objects via its built-in JSONB
+   * codec). Callers reading `config['last_full_cycle_at']` get a string.
+   */
+  listAllSources(opts?: {
+    includeArchived?: boolean;
+    localPathOnly?: boolean;
+  }): Promise<SourceRow[]>;
+
+  /**
+   * v0.38 — atomic JSONB merge into sources.config. Uses Postgres's
+   * `config || $patch::jsonb` operator so concurrent writers don't
+   * stomp each other (last write wins, but no read-modify-write race).
+   *
+   * Primary caller: runCycle's exit hook writes
+   *   { last_full_cycle_at: '<ISO>' }
+   * after a successful per-source cycle so autopilot's freshness gate
+   * can read it next tick. Resolves codex round-1 P0-5 (write site for
+   * last_full_cycle_at was unspecified pre-PR).
+   *
+   * Returns true if a row was updated (source exists), false otherwise
+   * (silently no-ops on unknown sourceId — caller decides whether that's
+   * a problem).
+   */
+  updateSourceConfig(sourceId: string, patch: Record<string, unknown>): Promise<boolean>;
 
   /**
    * v0.37.0 — prefix-stratified page sampling for `gbrain brainstorm` / `gbrain lsd`
