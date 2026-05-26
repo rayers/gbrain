@@ -578,6 +578,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   const authRouter = mcpAuthRouter(authRouterOptions);
 
+  // LOCAL DEBUG ONLY (do not push upstream): per-request access logger so we
+  // can trace exactly which endpoints claude.ai hits and where it gives up.
+  // Toggle with GBRAIN_ACCESS_LOG=1. Routes to stderr (serve-http.log captures
+  // it). Logs method + path + statusCode + duration + user-agent prefix.
+  if (process.env.GBRAIN_ACCESS_LOG === '1') {
+    app.use((req, res, next) => {
+      const t0 = Date.now();
+      const ua = (req.get('user-agent') || '').slice(0, 60);
+      res.on('finish', () => {
+        const dur = Date.now() - t0;
+        process.stderr.write(`[access] ${req.method} ${req.path} ${res.statusCode} ${dur}ms ua="${ua}"\n`);
+      });
+      next();
+    });
+  }
+
   // Patch the SDK's OAuth metadata to include client_credentials grant type.
   // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
   // the response and add client_credentials before it reaches the client.
