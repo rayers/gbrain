@@ -37,6 +37,12 @@ export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
   // budget. Only trusted local callers (the mode-switch hook in
   // commands/config.ts, reindex sweep, doctor --remediate) can submit.
   'contextual_reindex_per_chunk',
+  // v0.41.18.0 (A12, T9) — takes-bootstrap. Per-page Haiku classifier
+  // call over concept/atom/lore/briefing/writing/originals. Two-gate
+  // consent (takes.bootstrap_enabled + --yes) AND PROTECTED ensures
+  // no remote / MCP / autopilot path can bulk-extract takes without
+  // explicit operator intent.
+  'extract-takes-from-pages',
 ]);
 
 /** Check a job name against the protected set. Normalizes whitespace first. */

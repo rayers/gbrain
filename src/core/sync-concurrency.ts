@@ -161,3 +161,117 @@ export function parseDurationSeconds(s: string | undefined, flagName: string): n
   // Defensive: regex already rejects other units; this line is unreachable.
   throw new Error(`${flagName}: unsupported unit "${unit}"`);
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// v0.41.16.0 — D9 wrapper for bulk-command --workers.
+// ────────────────────────────────────────────────────────────────────────
+
+/**
+ * Stable, machine-readable result of `resolveWorkersWithClamp`. CLI
+ * callers can branch on `wasClamped` to decide whether to print a
+ * follow-up hint; tests pin every field for regression coverage.
+ */
+export interface WorkersWithClampResult {
+  /** Effective worker count after clamp + auto rules. Always >= 1. */
+  workers: number;
+  /** True when override was set AND clamped down (PGLite case). */
+  wasClamped: boolean;
+  /** The original override the caller asked for. undefined if none. */
+  requested: number | undefined;
+  /**
+   * Reason the wrapper picked `workers`. Used by tests + stderr-line
+   * shape; one of: 'pglite_clamp' | 'override' | 'auto' | 'default'.
+   */
+  reason: 'pglite_clamp' | 'override' | 'auto' | 'default';
+}
+
+/**
+ * Module-scoped memo so `resolveWorkersWithClamp` emits the PGLite
+ * clamp warning at most once per (command, requested) pair within a
+ * single CLI process. Without it, every per-source loop iteration
+ * inside a fan-out command (`gbrain sync --all` + per-source workers)
+ * would print the same warning N times. Pure module-state — tests can
+ * reset via `_resetWorkersClampWarningsForTest()`.
+ */
+const _warnedClampKeys = new Set<string>();
+
+/** Test seam: clear the warned-once set so re-runs emit again. */
+export function _resetWorkersClampWarningsForTest(): void {
+  _warnedClampKeys.clear();
+}
+
+/**
+ * Resolve a bulk command's effective worker count, applying the PGLite
+ * single-writer clamp and emitting one stderr warning per (command,
+ * requested) pair when the clamp fires.
+ *
+ * Wraps `autoConcurrency` rather than mutating it (codex finding #14 —
+ * `autoConcurrency` is silent today and shared by sync/import callers
+ * that should NOT inherit per-command stderr lines). The wrapper is the
+ * single source of truth for bulk-command CLI flag resolution; embed.ts
+ * is the lone legacy caller that bypasses it (`GBRAIN_EMBED_CONCURRENCY
+ * || 20` semantics preserved per codex finding #13).
+ *
+ * Rules (in order):
+ *   1. PGLite engine + override > 1 → return 1, set wasClamped=true,
+ *      emit stderr line ONCE per (commandName, requested) pair.
+ *   2. PGLite engine + no override → return 1 (silent — that's just
+ *      the default for the engine).
+ *   3. Postgres + explicit override → return override clamped to >= 1.
+ *   4. Postgres + no override + fileCount > AUTO_CONCURRENCY_FILE_THRESHOLD →
+ *      return DEFAULT_PARALLEL_WORKERS.
+ *   5. Postgres + no override + small fileCount → return 1.
+ *
+ * The PGLite warning text matches CLAUDE.md house style:
+ *   [extract-conversation-facts] workers=20 requested, clamped to 1
+ *     on PGLite (single-writer engine; use Postgres for parallel writes)
+ *
+ * @param engine     The active brain engine (PGLite vs Postgres branch).
+ * @param override   Caller's explicit --workers N value; undefined when
+ *                   no flag was passed.
+ * @param commandName Identifying string for the stderr line and dedup
+ *                   key. Use the user-facing CLI command name (e.g.
+ *                   'extract-conversation-facts', 'reindex-code').
+ * @param fileCount  Total work count, used by auto-concurrency branch.
+ *                   Pass 0 when unknown; auto path will return 1.
+ */
+export function resolveWorkersWithClamp(
+  engine: BrainEngine,
+  override: number | undefined,
+  commandName: string,
+  fileCount: number,
+): WorkersWithClampResult {
+  if (engine.kind === 'pglite') {
+    if (override !== undefined && override > 1) {
+      const key = `${commandName}:${override}`;
+      if (!_warnedClampKeys.has(key)) {
+        _warnedClampKeys.add(key);
+        // eslint-disable-next-line no-console
+        console.error(
+          `[${commandName}] workers=${override} requested, clamped to 1 on PGLite ` +
+            '(single-writer engine; use Postgres for parallel writes)',
+        );
+      }
+      return {
+        workers: 1,
+        wasClamped: true,
+        requested: override,
+        reason: 'pglite_clamp',
+      };
+    }
+    return {
+      workers: 1,
+      wasClamped: false,
+      requested: override,
+      reason: override !== undefined ? 'override' : 'default',
+    };
+  }
+
+  // Postgres path: defer to existing autoConcurrency for the rule set.
+  const workers = autoConcurrency(engine, fileCount, override);
+  let reason: WorkersWithClampResult['reason'];
+  if (override !== undefined) reason = 'override';
+  else if (fileCount > AUTO_CONCURRENCY_FILE_THRESHOLD) reason = 'auto';
+  else reason = 'default';
+  return { workers, wasClamped: false, requested: override, reason };
+}

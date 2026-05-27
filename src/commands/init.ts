@@ -973,6 +973,11 @@ async function initPGLite(opts: {
       const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
       const { VERSION } = await import('../version.ts');
       printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
+
+      // v0.41.18.0 (A4 + A18 + A20, T14): post-initSchema onboard nudge.
+      // Fail-open; 3s wallclock cap. Skipped silently in non-TTY contexts.
+      const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
+      await runInitNudge(engine);
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
@@ -1191,6 +1196,11 @@ async function initPostgres(opts: {
       const { printAdvisoryIfRecommended } = await import('../core/skillpack/post-install-advisory.ts');
       const { VERSION } = await import('../version.ts');
       printAdvisoryIfRecommended({ version: VERSION, context: 'init' });
+
+      // v0.41.18.0 (A4 + A18 + A20, T14): post-initSchema onboard nudge.
+      // Fail-open; 3s wallclock cap. Skipped silently in non-TTY contexts.
+      const { runInitNudge } = await import('../core/onboard/init-nudge.ts');
+      await runInitNudge(engine);
     }
   } finally {
     try { await engine.disconnect(); } catch { /* best-effort */ }
