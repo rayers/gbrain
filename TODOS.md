@@ -1,5 +1,44 @@
 # TODOS
 
+## v0.41.15.0 sync-reliability follow-ups (v0.42+)
+
+- [ ] **v0.42+: subprocess fan-out for `sync --all` (`--independent` mode
+  revisit).** v0.41.15.0 deliberately rejected `--independent` (Minion
+  job-queue fan-out) in plan review and shipped the shell-level
+  `timeout(1)` per-source loop instead — that gives real OS process
+  isolation with zero new gbrain code. Revisit if shell `timeout` proves
+  insufficient for any operator workflow (e.g. someone wants structured
+  per-source JSON output that `jq | xargs` can't easily produce). If we
+  revisit, pivot to subprocess-per-source (gbrain CLI spawning gbrain
+  CLI) rather than reuse the Minion handler, because codex's pass-2
+  review caught that Minion is in-process worker pool — not OS-process-
+  per-source — and `waitForCompletion` throws on timeout but doesn't
+  cancel the underlying job (leaving a hot lock for the next cron).
+  Priority: P3 (operator-comfort improvement; no correctness gap).
+
+- [ ] **v0.42+: full-sync `--timeout` coverage via AbortSignal in
+  `runImport`.** v0.41.15.0's `--timeout` covers the incremental sync
+  path (pull + delete + rename + import). It does NOT cover full-sync
+  triggers: first sync, `--full` flag, missing-anchor recovery,
+  chunker-version rewalk. `performFullSync` delegates to `runImport` as
+  one large operation that doesn't accept an AbortSignal today.
+  Operators hitting full-sync today already need extended wall-clocks
+  (the CHANGELOG documents the workaround); a v0.42+ wave would thread
+  `AbortSignal` through `runImport` so every sync path has the timeout
+  safety net. Touches 4-5 more files (`src/commands/import.ts`,
+  `src/core/import-file.ts`, batch loops). Priority: P3 unless a user
+  reports cron-killing full-sync triggers in production.
+
+- [ ] **v0.42+: `runFactsBackstop(mode:'queue')` in-process microtask
+  queue can keep the CLI alive briefly after sync returns.** Documented
+  as a known caveat in the v0.41.15.0 CHANGELOG. The queue uses an
+  in-process microtask drain (not Minions) to fire-and-forget LLM
+  enrichment for synced pages. After `gbrain sync` returns, the CLI
+  process may stay alive for a few seconds while queued work drains.
+  Bounded by per-call timeouts inside the LLM client but operator-
+  visible. A v0.42+ fix could either (a) route through Minions (more
+  durable; needs job-queue dependency for plain sync), or (b) drop the
+  in-process queue on sync exit. Priority: P3.
 ## v0.41.14.0 #1451 drift-fix follow-ups (v0.42+)
 
 - [ ] **v0.42+: refactor `runRoutingEval` to take `ResolverEntry[]` directly** instead of `resolverContent: string`. Cleaner shape than synthesizing markdown then re-parsing it. Cascades through 9+ test files that depend on the string-content API. Defer until the next big refactor of the routing-eval module so the test-file churn lands with that wave.

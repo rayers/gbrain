@@ -2,6 +2,181 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.15.0] - 2026-05-26
+
+**Your hourly cron can stop killing every sync mid-flight. Each source now
+gets its own clock, partial progress is real, and stale locks self-heal
+between runs.**
+
+Before this release, when `gbrain sync --all` hit the cron wall-clock, the
+whole process died — including sources it had not even started on. The
+next cron found stale locks left behind by the killed sync and refused to
+acquire them, so those sources fell further behind. On a 4-source brain
+where one source naturally takes a long time to sync, 8 of every 12
+hourly runs would time out. The slowest sources went 50+ hours without a
+fresh sync. Recovery meant running a `--break-lock` command per source by
+hand.
+
+v0.41.15.0 closes the cascade with two new flags and a documented cron
+pattern that actually works.
+
+### How to turn it on
+
+After upgrading, switch your sync cron to a per-source loop with shell
+`timeout(1)` doing the OS-level kill and gbrain doing the graceful
+self-termination half-a-minute before that:
+
+```bash
+# Self-healing, per-source. --max-age 1800 only steals locks whose
+# holder has stopped refreshing for >30 min (a real wedge signal).
+gbrain sync --break-lock --all --max-age 1800
+for src in $(gbrain sources list --json | jq -r '.[].id'); do
+  timeout 600 gbrain sync --source "$src" --timeout 540 || true
+done
+```
+
+The `--timeout 540` gives gbrain 9 minutes to graceful-exit; the shell
+`timeout 600` hard-kills if gbrain ignores it. `|| true` lets one slow
+source's exit not break the loop for siblings.
+
+### What you'd see in a concrete example
+
+If you have a brain that looked like the table on the left before, it
+looks like the right after the upgrade and the new cron:
+
+| Brain shape | Before v0.41.15.0 | After v0.41.15.0 |
+|---|---|---|
+| `default` (~50 files diff/hour) | Synced in ~5 min | Synced in ~5 min |
+| `straylight-brain` (~200 files) | Often killed mid-import; 50+ hrs stale | Imports in waves; partial each time, fully current by wave 3 |
+| `zion-brain` (~500 files) | Killed before reached on slow waves | Each cron gets its own per-source budget |
+| `media-corpus` (250K chunks) | Cron stops here every time | Wedged-lock recovery via `--max-age`; no manual `--break-lock` |
+| Cron success rate | ~33% (4/12 runs/24h) | Expected ~95%+ |
+
+When `--timeout` fires mid-import, `gbrain sync` exits 0 with status
+`partial` and `last_commit` UNCHANGED. The next sync re-walks the same
+diff; `content_hash` skips already-imported files at ~10ms each. Nothing
+re-embeds for free.
+
+### What's safe to know about
+
+Three things are deliberately out of scope and worth knowing:
+
+1. **`--timeout` only protects pull + delete + rename + import.** Extract
+   and embed phases run to completion after the import bookmark write.
+   This is honest-by-design: the bookmark advances when imports complete,
+   so abort-checks past that point would silently keep the bookmark
+   moving while abandoning work. Extract is cheap CPU; embed is gated to
+   ≤100 pages with its own network retry.
+2. **First 30 min after upgrade, `--max-age` cannot identify
+   wedged pre-upgrade holders.** Migration v98 adds a
+   `last_refreshed_at` column and backfills every existing lock row to
+   `NOW()` so healthy pre-upgrade syncs (still on the old binary) get a
+   30-min protection window. After that window all pre-upgrade syncs
+   have either completed (lock released) or genuinely wedged
+   (`--max-age` does the right thing). If you hit a wedged holder in
+   the rollout window, use `--force-break-lock` instead.
+3. **Full-sync triggers** (first sync, `--full` flag, missing-anchor
+   recovery, chunker-version rewalk) don't respect `--timeout` yet.
+   Filed for v0.42+. If you hit one of those triggers, run it manually
+   with an extended wall-clock.
+
+### Credit
+
+This release was driven by the RFC in
+[PR #1472](https://github.com/garrytan/gbrain/pull/1472) from
+[@garrytan-agents](https://github.com/garrytan-agents), which surfaced
+the production cron-failure data that motivated the fix. The shipped
+plan reduced scope from the RFC's 4 surfaces to 2 surfaces + a
+documented shell-level cron pattern after iteration with codex (3
+review passes) on cascade-resilience and lock-stealing invariants.
+
+### Itemized changes
+
+#### Added
+
+- `gbrain sync [--source <id>] [--all] --timeout <seconds>` — graceful
+  self-termination flag. `--source X --timeout N` runs a single source
+  with a per-source N-second budget. `--all --timeout N` gives each
+  source its OWN N-second AbortController inside `runOne`. Returns
+  `SyncResult { status: 'partial', filesImported, reason: 'timeout' |
+  'pull_timeout' }` and exits 0 so cron doesn't classify the run as
+  failure.
+- `gbrain sync --break-lock --all` — drops the previous refusal to
+  combine `--break-lock` with `--all`. Loops every registered source's
+  lock, prints per-source verdict (`broken | refused | absent`), and
+  exits 0 iff every source reaches a clean state.
+- `gbrain sync --break-lock --max-age <seconds>` — new modifier on the
+  existing safe-path. Breaks a lock whose `last_refreshed_at` is older
+  than the threshold (NOT `acquired_at` — see migration v98). Healthy
+  long-running holders that are actively refreshing their TTL are SAFE
+  by construction because their last refresh is always within the
+  refresh interval (~5 min for default 30-min TTL). Only wedged-but-
+  alive holders (JS interval stopped firing) get correctly identified
+  as stale.
+- `SyncResult.status: 'partial'` — additive variant carrying
+  `filesImported` and `reason: 'timeout' | 'pull_timeout'`. Existing
+  status values (`up_to_date | synced | first_sync | dry_run |
+  blocked_by_failures`) stay valid.
+
+#### Changed
+
+- `tryAcquireDbLock` writes `last_refreshed_at = NOW()` on initial
+  INSERT and on takeover. `withRefreshingLock`'s refresh callback bumps
+  both `ttl_expires_at` AND `last_refreshed_at` on every tick.
+  `inspectLock` widens `LockSnapshot` with `last_refreshed_at: Date |
+  null` and `ms_since_last_refresh: number | null`.
+- `printSyncResult` gains a `case 'partial':` arm that prints the
+  imported / remaining count and reason; tells the operator to re-run
+  to continue.
+- `manageGitignore` and the auto-embed-backfill enqueue inside `runOne`
+  now exclude `'partial'` from their gates (matches
+  `blocked_by_failures` posture — defer downstream work to the next
+  clean sync).
+- Pull-phase catch block at `src/commands/sync.ts:825-833` extends to
+  inspect `error.cause.code === 'ETIMEDOUT'` or `error.cause.signal ===
+  'SIGTERM'` (`pullRepo` wraps `execFileSync` errors in
+  `GitOperationError` so the timeout signature lives on `.cause`).
+  Non-timeout pull failures keep the existing warn-and-continue.
+
+#### Schema
+
+- Migration v98 (`gbrain_cycle_locks_last_refreshed_at`) — adds nullable
+  `last_refreshed_at TIMESTAMPTZ` and backfills `= NOW()` for every
+  existing row (the rollout-safety policy described above). PGLite +
+  Postgres parity. Idempotent — second run finds the column present and
+  the backfill predicate matches nothing.
+- `src/core/pglite-schema.ts`, `src/schema.sql`, and
+  `src/core/schema-embedded.ts` (regenerated via `bun run build:schema`)
+  all carry the new column so fresh installs initialize correctly
+  without depending on the migration runner.
+
+#### New helper
+
+- `deleteLockRowIfStale(engine, lockId, holderPid, maxAgeSeconds)` in
+  `src/core/db-lock.ts` — single atomic SQL DELETE keyed on `(id,
+  holder_pid, last_refreshed_at < NOW() - $N * INTERVAL '1 second')`
+  with `RETURNING id, last_refreshed_at`. No TOCTOU between inspect +
+  delete; the WHERE clause is the gate. The `$N * INTERVAL '1 second'`
+  cast is the correct shape on both Postgres and PGLite (`$N::interval`
+  does not cast integer→interval).
+
+#### For contributors
+
+- New `parseDurationSeconds(s, flagName)` helper in
+  `src/core/sync-concurrency.ts` accepts bare integers, `s`/`m`/`h`
+  suffixes (`60`, `60s`, `10m`, `1h`); rejects 0, negatives, decimals,
+  unrecognized units; names the failing flag in the error message.
+  Used by `--timeout` and `--max-age` parsing.
+- New `tests/heavy/sync_timeout_rescue.sh` reproduces the cron-cascade
+  scenario at small scale (4 in-memory sources × 200 pages × tight
+  `--timeout` × 3 waves) and asserts every source converges within 3
+  waves. Wire into your nightly heavy-test job if you maintain a
+  fork.
+- `SyncResult.status` widened from 5 to 6 members. Library consumers
+  outside this repo that exhaustively switch on `.status` will see a
+  TypeScript exhaustiveness check fail until they add a `'partial'`
+  arm.
+
 ## [0.41.14.0] - 2026-05-25
 
 **Your gbrain skills can declare their own routing triggers in their

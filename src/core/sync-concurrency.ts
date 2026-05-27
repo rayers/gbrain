@@ -120,3 +120,44 @@ export function parseWorkers(s: string | undefined): number | undefined {
   }
   return n;
 }
+
+/**
+ * v0.41.13.0 — parse a duration argument in seconds for `--timeout` and
+ * `--max-age`. Same shape as the existing duration parsers used elsewhere
+ * in gbrain (e.g. `gbrain eval prune --older-than`):
+ *
+ *   "60"   → 60      (bare integer, treated as seconds)
+ *   "60s"  → 60
+ *   "10m"  → 600
+ *   "1h"   → 3600
+ *
+ * Rejects (throws an Error with the flag name in the message):
+ *   - undefined: caller responsibility to detect missing flag
+ *   - "" / "abc" / "1.5s" / "60ms" / non-integer counts
+ *   - 0 / negative / NaN / Infinity
+ *
+ * The flag name is passed in so the error message names the actual CLI
+ * flag that failed validation, not a generic message.
+ */
+export function parseDurationSeconds(s: string | undefined, flagName: string): number | undefined {
+  if (s === undefined) return undefined;
+  const trimmed = s.trim();
+  const m = trimmed.match(/^(\d+)([smh]?)$/);
+  if (!m) {
+    throw new Error(
+      `${flagName} must be a positive integer with optional s/m/h suffix (e.g. 60, 60s, 10m, 1h), got: ${JSON.stringify(s)}`,
+    );
+  }
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n < 1) {
+    throw new Error(
+      `${flagName} must be a positive integer, got: ${JSON.stringify(s)}`,
+    );
+  }
+  const unit = m[2] || 's';
+  if (unit === 's') return n;
+  if (unit === 'm') return n * 60;
+  if (unit === 'h') return n * 3600;
+  // Defensive: regex already rejects other units; this line is unreachable.
+  throw new Error(`${flagName}: unsupported unit "${unit}"`);
+}

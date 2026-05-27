@@ -268,6 +268,29 @@ Data flowing into the brain. Each integration is a recipe — markdown + setup h
 
 **`gbrain import` fails with `expected N dimensions, not M`?** Run `gbrain doctor`. It will print the exact `gbrain config set ...` or `gbrain retrieval-upgrade` command to repair the mismatch. You should not need to delete `~/.gbrain`. Fresh `gbrain init --pglite` auto-detects your embedding provider from API keys in your environment: set `OPENAI_API_KEY` (or `ZEROENTROPY_API_KEY` / `VOYAGE_API_KEY`) before running init, or pass `--embedding-model <provider>:<model>` explicitly. With multiple keys set, init fires an interactive picker. In non-TTY contexts (CI, Docker) with no keys, init exits 1 with a paste-ready setup hint; pass `--no-embedding` to defer setup until runtime. See [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md) for the full provider matrix and [`docs/operations/headless-install.md`](docs/operations/headless-install.md) for Docker/CI sequencing.
 
+**Hourly cron sync keeps timing out on a federated brain?** v0.41.13.0 ships
+two flags + a recommended pattern. Switch your cron to a per-source loop
+with shell `timeout(1)` doing the OS-level kill and gbrain self-terminating
+gracefully half-a-minute earlier:
+
+```bash
+gbrain sync --break-lock --all --max-age 1800
+for src in $(gbrain sources list --json | jq -r '.[].id'); do
+  timeout 600 gbrain sync --source "$src" --timeout 540 || true
+done
+```
+
+When `--timeout` fires mid-import, `gbrain sync` exits 0 with status
+`partial` and `last_commit` UNCHANGED — the next run re-walks the same
+diff and `content_hash` short-circuits already-imported files. The
+`--max-age 1800` first command self-heals any wedged-but-alive locks
+left by a hung previous run, using the v98 `last_refreshed_at` semantic
+(NOT `acquired_at`) so healthy long-running holders are safe by
+construction. See the v0.41.13.0 entry in [`CHANGELOG.md`](CHANGELOG.md)
+for the honest scope notes (extract + embed phases run to completion;
+30-min rollout window for `--max-age` post-migration v98; full-sync
+triggers deferred to v0.42+).
+
 ## Docs
 
 - [`docs/INSTALL.md`](docs/INSTALL.md) — every install path, end to end
