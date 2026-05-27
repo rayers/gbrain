@@ -73,6 +73,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embedding_width_consistency',
   'embeddings',
   'eval_drift',
+  'extract_health',
   'facts_embedding_width_consistency',
   'facts_extraction_health',
   'facts_health',
@@ -140,6 +141,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'subagent_capability',
   'subagent_health',
   'supervisor',
+  'sync_consolidation',
   'ze_embedding_health',
 ]);
 

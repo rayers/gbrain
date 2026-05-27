@@ -22,6 +22,7 @@ import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatch
 import { runMigrations } from './migrate.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
@@ -40,7 +41,7 @@ import type {
   EmotionalWeightInputRow, EmotionalWeightWriteRow,
   DomainBankSampleOpts, CorpusSampleOpts, DomainBankRow,
 } from './types.ts';
-import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, takeRowToTake } from './utils.ts';
+import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { GBrainError, PAGE_SORT_SQL } from './types.ts';
@@ -898,6 +899,49 @@ export class PGLiteEngine implements BrainEngine {
       'DELETE FROM pages WHERE slug = $1 AND source_id = $2',
       [slug, sourceId]
     );
+  }
+
+  /**
+   * v0.41.19.0 — batch delete primitive. See BrainEngine.deletePages JSDoc.
+   * Parity implementation with PostgresEngine.deletePages. PGLite supports
+   * `slug = ANY($1)` array-param binding natively (addLinksBatch already
+   * proves this).
+   */
+  async deletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `deletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string }>(
+      'DELETE FROM pages WHERE slug = ANY($1::text[]) AND source_id = $2 RETURNING slug',
+      [slugs, opts.sourceId],
+    );
+    return rows.map(r => r.slug);
+  }
+
+  /**
+   * v0.41.19.0 — batch path → slug resolution. See BrainEngine.resolveSlugsByPaths
+   * JSDoc.
+   */
+  async resolveSlugsByPaths(
+    paths: string[],
+    opts: { sourceId: string },
+  ): Promise<Map<string, string>> {
+    if (paths.length === 0) return new Map();
+    if (paths.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `resolveSlugsByPaths: input size ${paths.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const { rows } = await this.db.query<{ slug: string; source_path: string }>(
+      'SELECT slug, source_path FROM pages WHERE source_path = ANY($1::text[]) AND source_id = $2',
+      [paths, opts.sourceId],
+    );
+    const m = new Map<string, string>();
+    for (const r of rows) m.set(r.source_path, r.slug);
+    return m;
   }
 
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {
@@ -4339,6 +4383,47 @@ export class PGLiteEngine implements BrainEngine {
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {
     // Stub: links use integer page_id FKs, already correct after updateSlug.
+  }
+
+  async resolveSlugWithAlias(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+  ): Promise<string> {
+    const sources = Array.isArray(sourceOrSources)
+      ? [...sourceOrSources]
+      : [sourceOrSources as string];
+    if (sources.length === 0) return slug;
+    try {
+      // PGLite supports `= ANY($N::text[])` per pgvector / postgres semantics.
+      // ORDER BY array_position pins the federated-read precedence so the
+      // multi-source ambiguity warning is deterministic.
+      const placeholders = sources.map((_, i) => `$${i + 2}`).join(',');
+      const { rows } = await this.db.query(
+        `SELECT canonical_slug, source_id
+         FROM slug_aliases
+         WHERE alias_slug = $1
+           AND source_id IN (${placeholders})
+         ORDER BY id`,
+        [slug, ...sources],
+      );
+      if (rows.length === 0) return slug;
+      if (rows.length > 1) {
+        warnOncePerProcess(
+          `resolveSlugWithAlias:multi_match:${slug}`,
+          `[resolveSlugWithAlias] multi_match: alias '${slug}' exists in ${rows.length} sources; returning first.`,
+        );
+      }
+      // Match Postgres engine: prefer rows in sourceOrSources order
+      const indexedRows = rows.map(r => ({
+        ...(r as { canonical_slug: string; source_id: string }),
+        order: sources.indexOf((r as { source_id: string }).source_id),
+      }));
+      indexedRows.sort((a, b) => a.order - b.order);
+      return indexedRows[0].canonical_slug ?? slug;
+    } catch (e) {
+      if (isUndefinedTableError(e)) return slug;
+      throw e;
+    }
   }
 
   // Config

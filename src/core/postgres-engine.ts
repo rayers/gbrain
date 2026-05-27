@@ -53,10 +53,11 @@ import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import * as db from './db.ts';
 import { ConnectionManager } from './connection-manager.ts';
 import { logConnectionEvent } from './connection-audit.ts';
-import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake } from './utils.ts';
+import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql } from './search/sql-ranking.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { DELETE_BATCH_SIZE } from './engine-constants.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -932,6 +933,53 @@ export class PostgresEngine implements BrainEngine {
     const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
     await sql`DELETE FROM pages WHERE slug = ${slug} AND source_id = ${sourceId}`;
+  }
+
+  /**
+   * v0.41.19.0 — batch delete primitive. See BrainEngine.deletePages JSDoc.
+   * Single SQL round-trip per call; caller is responsible for chunking input
+   * to <= DELETE_BATCH_SIZE. RETURNING slug projects the actually-deleted set
+   * so the caller can filter pagesAffected.
+   */
+  async deletePages(slugs: string[], opts: { sourceId: string }): Promise<string[]> {
+    if (slugs.length === 0) return [];
+    if (slugs.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `deletePages: input size ${slugs.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const sql = this.sql;
+    const rows = await sql<{ slug: string }[]>`
+      DELETE FROM pages
+       WHERE slug = ANY(${slugs}::text[]) AND source_id = ${opts.sourceId}
+      RETURNING slug
+    `;
+    return rows.map(r => r.slug);
+  }
+
+  /**
+   * v0.41.19.0 — batch path → slug resolution. See BrainEngine.resolveSlugsByPaths
+   * JSDoc. Single SQL round-trip; folds rows into a Map.
+   */
+  async resolveSlugsByPaths(
+    paths: string[],
+    opts: { sourceId: string },
+  ): Promise<Map<string, string>> {
+    if (paths.length === 0) return new Map();
+    if (paths.length > DELETE_BATCH_SIZE) {
+      throw new Error(
+        `resolveSlugsByPaths: input size ${paths.length} exceeds DELETE_BATCH_SIZE=${DELETE_BATCH_SIZE}. Caller must chunk.`,
+      );
+    }
+    const sql = this.sql;
+    const rows = await sql<{ slug: string; source_path: string }[]>`
+      SELECT slug, source_path
+        FROM pages
+       WHERE source_path = ANY(${paths}::text[]) AND source_id = ${opts.sourceId}
+    `;
+    const m = new Map<string, string>();
+    for (const r of rows) m.set(r.source_path, r.slug);
+    return m;
   }
 
   async softDeletePage(slug: string, opts?: { sourceId?: string }): Promise<{ slug: string } | null> {
@@ -4377,6 +4425,37 @@ export class PostgresEngine implements BrainEngine {
     // correct after updateSlug (page_id doesn't change, only slug does).
     // Textual [[wiki-links]] in compiled_truth are NOT rewritten here.
     // The maintain skill's dead link detector surfaces stale references.
+  }
+
+  async resolveSlugWithAlias(
+    slug: string,
+    sourceOrSources: string | readonly string[],
+  ): Promise<string> {
+    const sql = this.sql;
+    const sources = Array.isArray(sourceOrSources) ? sourceOrSources : [sourceOrSources];
+    if (sources.length === 0) return slug;
+    try {
+      const rows = await sql`
+        SELECT canonical_slug, source_id
+        FROM slug_aliases
+        WHERE alias_slug = ${slug}
+          AND source_id = ANY(${sources}::text[])
+        ORDER BY array_position(${sources}::text[], source_id), id
+      `;
+      if (rows.length === 0) return slug;
+      if (rows.length > 1) {
+        warnOncePerProcess(
+          `resolveSlugWithAlias:multi_match:${slug}`,
+          `[resolveSlugWithAlias] multi_match: alias '${slug}' exists in ${rows.length} sources; returning first by sourceOrSources order.`,
+        );
+      }
+      return (rows[0].canonical_slug as string) ?? slug;
+    } catch (e) {
+      // Pre-v105 brain: slug_aliases table doesn't exist yet. Defense-in-depth
+      // per the engine interface contract.
+      if (isUndefinedTableError(e)) return slug;
+      throw e;
+    }
   }
 
   // Config

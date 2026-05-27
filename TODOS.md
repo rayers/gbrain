@@ -1,6 +1,134 @@
 # TODOS
 
-## v0.41.19.0 status + doctor-categories wave follow-ups (v0.42+)
+## v0.41.20.x dream-source-ingest-titles follow-ups (v0.42+)
+
+- **TODO-V13-A (P2): `gbrain dream --max-pages <n>` plumbing.**
+  PR #1559 included a `--max-pages` flag for cost-bounded cycles on
+  large brains. v0.41.20 dropped it because `CycleOpts` has no `maxPages`
+  field and no cycle phase consults page-count limits — shipping the flag
+  would have been a lying flag.
+  - **What:** extend `CycleOpts` with `maxPages: number | undefined` and
+    thread it through extract phases (extract.ts, extract-facts.ts,
+    recompute-emotional-weight.ts) so per-source cost-bounded cycles
+    become real.
+  - **Why:** straylight-brain-class corpora (100K+ pages) benefit from
+    capping each cycle's work. Today operators have to wait full
+    extract sweeps regardless of cost.
+  - **Pros:** closes the lying-flag class; real cost brake.
+  - **Cons:** real refactor — extract phases iterate all pages today,
+    not page-count-bounded.
+  - **Context:** PR #1559 commit 67f98ca had the flag; the v0.41.20
+    plan dropped it under "Out of scope" with this TODO as the
+    forwarding pointer.
+  - **Depends on:** CycleOpts type extension + extract page-iteration
+    refactor + decision on per-phase vs per-cycle cap semantics.
+
+- **TODO-V13-B (P3): `--source` / `--source-id` flag-name unification.**
+  Current drift: `dream`, `recall`, `sync` accept `--source`;
+  `import`, `extract`, `graph-query`, `sources` accept `--source-id`.
+  v0.41.20 added `--source-id` as an alias for dream's `--source` so
+  both work, but the codebase still ships two surface names.
+  - **What:** pick one canonical flag name across all CLI commands;
+    deprecate the other with a stderr warning; update doctor.ts
+    hint to match.
+  - **Why:** ergonomic consistency. Users who learned `--source-id`
+    via import shouldn't trip on `--source` in dream.
+  - **Pros:** ends a real user-facing confusion.
+  - **Cons:** low-priority polish; both names work today via alias.
+  - **Context:** doctor.ts historically pinned `--source`; v0.37.7.0
+    #1167 standardized `--source-id` across new commands. Recommend
+    picking `--source-id` for v0.37.7.0+ consistency and deprecating
+    `--source` over one minor.
+  - **Depends on:** nothing technical.
+
+- **TODO-V13-C (P2): `gbrain pages audit-junk-titles` legacy cleanup.**
+  v0.41.20 widened the `error_page_title` matcher to catch Cloudflare /
+  WAF challenge titles ("Forbidden", "Access Denied", "Service
+  Unavailable", "Robot Check", "Just a moment...") at ingest. But the
+  200+ scraper pages already in production DBs (202+ from
+  straylight-brain) are NOT cleaned up by the matcher widening.
+  Dropped from v0.41.20 per codex outside-voice tension (T1) for
+  ship-and-validate-matchers-first discipline.
+  - **What:** new operator command for soft-deleting pre-existing
+    scraper-junk pages whose titles match the expanded
+    `BUILT_IN_JUNK_PATTERNS`. Full spec preserved:
+    - Signature: `gbrain pages audit-junk-titles [--source <id>]
+      [--dry-run|--apply] [--confirm-destructive] [--json]`
+    - Default `--dry-run`. Prints `{pattern_name: count, sample_slugs}`.
+    - `--apply` requires `--confirm-destructive` when match count
+      exceeds `DESTRUCTIVE_THRESHOLD` (reuse v0.26.5 constant).
+    - `--source <id>` scopes; without it, audits all non-archived
+      sources (filter via `listAllSources().filter(s => !s.archived)`).
+    - Soft-delete via existing `engine.softDeletePage(slug, sourceId)`.
+    - Audit JSONL via `logContentSanityEvent` with event kind
+      `junk_title_soft_deleted`.
+    - Idempotent.
+    - **Hybrid SQL+JS scanner**: pure
+      `buildJunkTitleSqlClause(patterns)` +
+      `scanForJunkTitles(rows, patterns)`. SQL pre-filter avoids
+      streaming all rows over the wire (perf rationale: even seq-scan
+      ILIKE beats JS regex per-row via the postgres driver).
+    - **`cleanup_safe: boolean` flag** per JunkPattern (codex C-13):
+      only patterns flagged `cleanup_safe: true` are eligible for
+      destructive cleanup. Stops future matcher widening from
+      automatically expanding destructive scope. Initial allowlist:
+      `cloudflare_attention_required`, `cloudflare_just_a_moment`,
+      `cloudflare_ray_id`, `access_denied`, `captcha_required`,
+      `error_page_title` (only the literal-numeric parts; the new
+      word-titles get `cleanup_safe: false` until the matcher proves
+      itself further), `cloudflare_challenge_title`.
+    - New doctor check `scraper_junk_pages_legacy` (separate from
+      `content_sanity_audit_recent` per codex C-5 — audit-log reader
+      vs live DB scan are different concerns).
+    - Tests: `test/pages-audit-junk-titles.test.ts` (hermetic PGLite),
+      `test/doctor.test.ts` extension.
+  - **Why:** ingest gate alone leaves 200+ existing junk pages
+    inflating page counts; this command closes the data-debt gap.
+  - **Pros:** finishes the cleanup story.
+  - **Cons:** destructive surface (soft-delete + audit JSONL).
+  - **Depends on:** ~1 week of production observation against
+    v0.41.20's new ingest matchers. If real-world reports surface
+    false-positive blocks, refine the matcher AND the `cleanup_safe`
+    allowlist before shipping the destructive command.
+
+## v0.41.22.1 brainstorm judge fix-wave follow-ups (v0.42+)
+
+Filed from the v0.41.22.1 plan-eng-review per cross-model-tension D13c.
+Step 0 of that plan explicitly deferred a "full pricing-system DRY"
+cleanup (Option C) to keep the brainstorm fix blast radius small.
+These three items are what was deferred. None are user-reported bugs;
+all are latent-debt cleanup.
+
+- [ ] **Config-write normalization.** Whenever a user writes `gbrain config set models.tier.deep anthropic/claude-opus-4-7` we silently store the slash form. v0.41.22.1 centralized the read-side via `splitProviderModelId`, but config writes still preserve whatever shape the user typed. Canonical form should be colon (`anthropic:claude-opus-4-7`). Fix: rewrite at config-write time in `src/core/config.ts`. Breaks existing config files that explicitly hold the slash form — defer to a v0.42+ config-migration wave that also handles the rewrite + once-per-process deprecation warn. Files: `src/core/config.ts`, `src/core/model-config.ts:saveConfig` path. Priority: P3 (latent, not user-visible).
+
+- [ ] **Non-Anthropic pricing tables.** `src/core/anthropic-pricing.ts` is the only pricing surface gbrain ships. Brainstorm + LSD users routing through OpenAI / Gemini / OpenRouter get `BUDGET_TRACKER_NO_PRICING` warn-once + bypass-gate (without `--max-cost`) OR `no_pricing` hard-fail (with `--max-cost`). The right shape: rename to `provider-pricing.ts`, add OpenAI / Gemini / OpenRouter tables, route `lookupPricing` through provider-routed table selection. OpenRouter is a special case (period-vs-dash key mismatch: their `claude-sonnet-4.6` won't match our `claude-sonnet-4-6` either way). Files: `src/core/anthropic-pricing.ts` (rename + extend), `src/core/budget/budget-tracker.ts`, `src/core/eval-contradictions/cost-tracker.ts`. Priority: P2 (real user pain when running brainstorm against non-Anthropic).
+
+- [ ] **Eval-contradictions duplicate ANTHROPIC_PRICING consolidation.** `src/core/eval-contradictions/cost-tracker.ts:28-38` ships its OWN copy of the Anthropic pricing table with different keys (both bare and `anthropic:`-prefixed forms) and a silent-Haiku fallback on unknown. v0.41.22.1 routed both tables' lookups through `splitProviderModelId` but left the duplication. Right fix: delete the local table, import from `src/core/anthropic-pricing.ts`. Either (a) preserve the silent-Haiku-fallback semantic with an explicit `?? canonicalPricing['claude-haiku-4-5']` at the call site, or (b) tighten to warn-once on unknown (which changes the eval-contradictions soft-ceiling `--budget-usd` contract — coordinate with that subsystem). Files: `src/core/eval-contradictions/cost-tracker.ts`, `src/core/anthropic-pricing.ts`, `test/eval-contradictions/cost-tracker-slash.test.ts` (the legacy-Haiku-fallback pin would need updating). Priority: P3 (DRY cleanup, no user-visible impact).
+
+## v0.41.21.0 ops-fix-wave follow-ups (v0.41.22+)
+
+- **TODO-OPS-1 (P2)**: `gbrain sync print-cron` subcommand. Print the canonical
+  cron line based on the active source set: `gbrain sync --all --parallel N
+  --workers N --skip-failed` where N defaults to `min(sourceCount, 4)`. Reads
+  `sources` table for active (non-archived, `local_path IS NOT NULL`) entries.
+  Ergonomic upgrade over the v0.41.19.0 `sync_consolidation` doctor message —
+  operator pipes directly into `crontab -e` instead of copy-paste-massage.
+  ~80 LOC. Mirrors `gbrain sync --break-lock` argv shape.
+
+- **TODO-OPS-2 (P2)**: Lock-loss detection — extend `DbLockHandle.refresh()`
+  to throw `LockLostError` on 0 rows affected. Codex caught during the
+  v0.41.19.0 plan review: `refresh()` runs `UPDATE ... WHERE holder_pid = pid`
+  with no rows-affected check (`db-lock.ts:108-114`, `:151-156`). If the
+  TTL expired and another worker took over, the original keeps writing
+  silently. v0.41.19.0 ships TTL=5min + active in-phase refresh via
+  `buildYieldDuringPhase` which makes the race window much narrower, but
+  an `await chat()` call that exceeds the 5min wallclock window can still
+  hit it. Fix: `RETURNING id` on the UPDATE + check `rows.length === 0` →
+  throw tagged `LockLostError`. Phases catch + abort cleanly (write partial
+  progress, return `status: 'fail'` with reason `'lock_lost'`). Behavioral
+  contract change with phase-abort fallout; needs its own design pass.
+
+## v0.41.20.0 status + doctor-categories wave follow-ups (v0.42+)
 
 - **TODO-V19-A (P3)**: Persistent `cycle_runs` table. v0.41.19.0 infers
   "last full cycle" by querying `minion_jobs WHERE name = 'autopilot-cycle'`
@@ -89,7 +217,7 @@
   takes_count). Today the MCP run_onboard op runs these server-side via
   runAllOnboardChecks; doctor-remote.ts would surface them on the thin-client
   dashboard for operators who only hit the brain via MCP.
-=======
+
 ## v0.41.17.0 `--workers N` cathedral follow-ups (v0.41.18+)
 
 These were filed during the ship of `garrytan/dar-es-salaam-v1`

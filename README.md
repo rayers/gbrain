@@ -182,11 +182,12 @@ voice, OCR) against the versioned `IngestionSource` contract at
 
 Most personal-knowledge tools force one fixed layout: their idea of "notes" + "people" + "tags." Drop a Notion export or your own years-old Obsidian vault on top, and the agent doesn't know what a `Projects/` folder means or whether `Reading/` is people or sources.
 
-**gbrain doesn't have a fixed layout.** It ships with two bundled schema packs and lets you author your own when neither fits:
+**gbrain doesn't have a fixed layout.** It ships with bundled schema packs and lets you author your own when none fit:
 
-- **`gbrain-base`** (default) — the layout my production brain uses: `people/`, `companies/`, `concepts/`, `meetings/`, `deal/`, `daily/`, `originals/`, `writing/`, etc. Zero config. Drop a brain that fits this shape and everything works.
+- **`gbrain-base-v2`** (default as of v0.41.22) — 15-type DRY/MECE canonical taxonomy (14 canonical + `note` catch-all): `person`, `company`, `media`, `tweet`, `social-digest`, `analysis`, `atom`, `concept`, `source`, `deal`, `email`, `slack`, `writing`, `project`, `note`. Subtypes/format/origin pushed to frontmatter. The taxonomy that responds to issue #1479.
+- **`gbrain-base`** (legacy, v0.41 and earlier brains) — the original 24-type layout. Stays bundled for back-compat; brains on it can upgrade via `gbrain onboard --check --explain` → `gbrain jobs submit unify-types --allow-protected --params '{"target_pack":"gbrain-base-v2"}'`.
 - **`gbrain-recommended`** — extends `gbrain-base` with the 13 additional directories from `docs/GBRAIN_RECOMMENDED_SCHEMA.md` (source, place, trip, conversation, personal, civic, project, etc.). Activate with `gbrain schema use gbrain-recommended`.
-- **Your own pack** — `gbrain schema detect` clusters your actual filesystem into proposed types, `gbrain schema suggest` runs an LLM pass over them, and `gbrain schema review-candidates --apply` promotes the ones you like. Three commands and the brain knows your shape.
+- **Your own pack** — `gbrain schema detect` clusters your actual filesystem into proposed types, `gbrain schema suggest` runs an LLM pass over them, and `gbrain schema review-candidates --apply` promotes the ones you like. Three commands and the brain knows your shape. Authoring a successor pack (declares `migration_from:` so existing brains can opt in): see [`docs/architecture/pack-upgrade-mechanism.md`](docs/architecture/pack-upgrade-mechanism.md).
 
 ```bash
 gbrain schema active                # which pack is running, which tier set it
@@ -312,6 +313,16 @@ Bad values surface at `gbrain doctor` startup with a paste-ready fix
 (not at first-retry mid-cycle). PGLite-only installs pay zero cost — the
 retry wrap is engine-level, but PGLite has no pooler so retries never
 fire in practice.
+
+**`gbrain brainstorm` returning `judge_failed: true` with 0 scored
+ideas?** v0.41.21.0 closes the two bugs that caused it. The judge
+hard-coded a 4K-token output cap; for any run past ~40 ideas the call
+truncated mid-JSON and the parser threw. Same release closes a slash-
+form pricing miss: `gbrain brainstorm --judge-model
+anthropic/claude-sonnet-4-6 --max-cost 5` failed with
+`BudgetExhausted reason=no_pricing` because every pricing site only
+matched the colon form. Both shapes work now. No config change, no
+schema migration — `gbrain upgrade` is the whole fix.
 
 ## Docs
 
