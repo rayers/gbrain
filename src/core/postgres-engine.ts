@@ -4683,11 +4683,34 @@ export class PostgresEngine implements BrainEngine {
   async reconnect(): Promise<void> {
     if (!this._savedConfig || this._reconnecting) return;
     this._reconnecting = true;
+    // Build-then-swap: snapshot the live pool, build a fresh one, and only tear
+    // down the old pool once the new one is proven live. If the rebuild fails
+    // (Postgres still unreachable during a transient outage), restore the old
+    // pool so the engine is NOT left permanently dead (`_sql === null`) for the
+    // rest of the process. A dead `_sql` falls through to the module singleton
+    // accessor, which the autopilot process never connects — every subsequent
+    // non-retry-wrapped call (getConfig, per-phase reads) then throws
+    // "No database connection", crashing the worker into a respawn loop.
+    // postgres.js pools self-heal on the next query once Postgres is back, so
+    // keeping the old pool in place is safe; batchRetry's backoff retries.
+    const oldSql = this._sql;
+    const oldManager = this.connectionManager;
     try {
-      // Tear down old pool (best-effort — it may already be dead)
-      try { await this.disconnect(); } catch { /* swallow */ }
-      // Create fresh pool
+      this._sql = null; // force connect() to build a fresh pool, not reuse
+      // connect() validates the new pool via `SELECT 1` before returning, so on
+      // success _sql + connectionManager point at a proven-live connection.
       await this.connect(this._savedConfig);
+      // New pool is live — discard the old one best-effort.
+      if (oldSql) { try { await oldSql.end({ timeout: 5 }); } catch { /* swallow */ } }
+    } catch (err) {
+      // Rebuild failed: tear down the half-built pool (if any) and restore the
+      // prior live pool + manager so the engine stays usable.
+      if (this._sql && this._sql !== oldSql) {
+        try { await this._sql.end({ timeout: 5 }); } catch { /* swallow */ }
+      }
+      this._sql = oldSql;
+      this.connectionManager = oldManager;
+      throw err; // let batchRetry's backoff handle the retry
     } finally {
       this._reconnecting = false;
     }
