@@ -311,7 +311,12 @@ describe('Eng-review D3 — executeRaw has no per-call retry wrapper', () => {
   it('PostgresEngine.reconnect() still exists for supervisor-driven recovery', () => {
     const src = readFileSync(resolve('src/core/postgres-engine.ts'), 'utf-8');
     expect(src).toContain('async reconnect()');
-    expect(src).toContain('await this.disconnect()');
+    // Build-then-swap: reconnect() rebuilds via connect() and tears down the
+    // PRIOR pool via .end() instead of disconnect()-first. Disconnect-first
+    // left _sql null permanently when the rebuild failed mid-outage, bricking
+    // the engine; the swap keeps the old pool until the new one is proven live.
+    expect(src).toContain('await this.connect(this._savedConfig)');
+    expect(src).toMatch(/oldSql[\s\S]*?\.end\(/);
   });
 
   it('Supervisor still has the 3-strikes-then-reconnect path', () => {
