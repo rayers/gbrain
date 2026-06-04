@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('bumped to 6 to invalidate caches across v0.42 boost stage addition', () => {
-    expect(KNOBS_HASH_VERSION).toBe(8);
+  it('bumped to 9 (autocut weak-top floor acmts= added to the hash)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 });

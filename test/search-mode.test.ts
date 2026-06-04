@@ -77,6 +77,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut OFF for conservative (no reranker).
       autocut: false,
       autocut_jump: 0.2,
+      autocut_min_top_score: 0.5,
     });
   });
 
@@ -106,6 +107,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut ON.
       autocut: true,
       autocut_jump: 0.2,
+      autocut_min_top_score: 0.5,
     });
   });
 
@@ -133,6 +135,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut ON.
       autocut: true,
       autocut_jump: 0.2,
+      autocut_min_top_score: 0.5,
     });
   });
 
@@ -388,10 +391,11 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // embedding spaces. Sequenced behind salem's v=4 graph-signals work.
     // v0.41.22.0 (type-unification): bumped 5→6 for the new alias_resolved
     // post-fusion boost stage. T2: bumped 6→7 for title_boost. v0.42.3.0:
-    // bumped 7→8 for autocut (ac=/acj=). A query against a brain with
-    // slug_aliases populated must not be served from a cache row written
-    // before the boost stage existed.
-    expect(KNOBS_HASH_VERSION).toBe(8);
+    // bumped 7→8 for autocut (ac=/acj=). v0.42.x: bumped 8→9 for the autocut
+    // weak-top floor (acmts=). A query against a brain with slug_aliases
+    // populated must not be served from a cache row written before the boost
+    // stage existed.
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -556,8 +560,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION bumped to 7', () => {
-    expect(KNOBS_HASH_VERSION).toBe(8);
+  test('KNOBS_HASH_VERSION bumped to 9', () => {
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
@@ -566,6 +570,8 @@ describe('v0.42.3.0 — autocut knobs', () => {
     expect(MODE_BUNDLES.tokenmax.autocut).toBe(true);
     for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
       expect(MODE_BUNDLES[m].autocut_jump).toBe(0.2);
+      // v0.42.x — weak-top floor default 0.5 across all bundles.
+      expect(MODE_BUNDLES[m].autocut_min_top_score).toBe(0.5);
     }
   });
 
@@ -595,9 +601,37 @@ describe('v0.42.3.0 — autocut knobs', () => {
     expect(ov.autocut_jump).toBe(0.35);
   });
 
+  test('resolveSearchMode threads autocut_min_top_score: per-call > config > bundle', () => {
+    expect(resolveSearchMode({ mode: 'balanced' }).autocut_min_top_score).toBe(0.5);
+    expect(
+      resolveSearchMode({ mode: 'balanced', overrides: { autocut_min_top_score: 0.7 } }).autocut_min_top_score,
+    ).toBe(0.7);
+    expect(
+      resolveSearchMode({
+        mode: 'balanced',
+        overrides: { autocut_min_top_score: 0.7 },
+        perCall: { autocut_min_top_score: 0.3 },
+      }).autocut_min_top_score,
+    ).toBe(0.3);
+  });
+
+  test('loadOverridesFromConfig reads search.autocut_min_top_score (clamped [0,1])', () => {
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '0.7' }).autocut_min_top_score).toBe(0.7);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '0' }).autocut_min_top_score).toBe(0);
+    // out of range → ignored (undefined, falls through to bundle)
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '1.5' }).autocut_min_top_score).toBeUndefined();
+  });
+
   test('SEARCH_MODE_CONFIG_KEYS includes the autocut keys', () => {
     expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut');
     expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_jump');
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_min_top_score');
+  });
+
+  test('knobsHash includes acmts= — different weak-top floors differ', () => {
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced' })); // floor 0.5
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut_min_top_score: 0.3 } }));
+    expect(a).not.toBe(b);
   });
 
   test('knobsHash includes ac= / acj= — autocut-on vs off differ', () => {
