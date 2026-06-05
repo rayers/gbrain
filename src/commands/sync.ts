@@ -1328,6 +1328,25 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       detachedWorkingTreeManifest.renamed.length > 0);
 
   if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+    // #1430: even on a pure no-op (no new commits, chunker matches, no
+    // working-tree changes), record the sync attempt timestamp. Without this,
+    // sources.last_sync_at only advances when sync actually imports new pages,
+    // so doctor's sync_freshness check misreads quiet sources (no upstream
+    // commits in N days) as "stale" even when every cron tick polls them. The
+    // metric users intuit from "last sync" is "last time we attempted a sync",
+    // not "last time we had new data". Suppress when the pull was attempted AND
+    // failed — we never observed remote state, so advancing freshness would
+    // mask the failure. Operator-skipped offline modes (--no-pull, detached
+    // HEAD, no origin) are not failures and DO advance. --dry-run must stay
+    // side-effect free. The legacy non-federated path (no opts.sourceId) writes
+    // config.sync.last_run elsewhere and isn't reached by sync_freshness's
+    // `WHERE local_path IS NOT NULL` filter, so leave it alone.
+    if (opts.sourceId && !pullAttemptedAndFailed && !opts.dryRun) {
+      await engine.executeRaw(
+        `UPDATE sources SET last_sync_at = now() WHERE id = $1`,
+        [opts.sourceId],
+      );
+    }
     return {
       status: 'up_to_date',
       fromCommit: lastCommit,
