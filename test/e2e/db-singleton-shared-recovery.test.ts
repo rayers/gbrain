@@ -49,43 +49,42 @@ describe.skipIf(skip)('v0.41.25.0 db-singleton shared-recovery regressions (#157
     tmpAuditDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-1570-e2e-'));
   });
 
-  test('CASE 1: refcount keeps the shared singleton alive when a non-last owner disconnects (#1570)', async () => {
-    // The dream-cycle row-loss bug: caller A is mid-batch on the module
-    // singleton when caller B (a transient module-style engine) disconnects.
-    // Pre-refcount, B's disconnect() called sql.end() and nulled the shared
-    // singleton, so A's next call threw "connect() has not been called"
-    // mid-cycle. With owner refcounting (#1754), B's disconnect only
-    // DECREMENTS; the pool survives until the LAST owner releases it, so A
-    // keeps working with NO reconnect needed. This is prevention, which is
-    // strictly better than the prior recover-after-the-fact contract.
-    await db.connect({ database_url: DATABASE_URL! }); // shares singleton (+1 owner)
+  test('CASE 1: a borrower disconnect leaves the shared singleton ALIVE — no reconnect needed (#1471 ownership fix)', async () => {
+    // The dream-cycle scenario: caller A is mid-batch, caller B (a probe engine
+    // that BORROWED the singleton) disconnects. Pre-#1471, B's disconnect
+    // cascaded to db.disconnect() and nulled the singleton for A, so A's next
+    // call threw "connect() has not been called" and only batchRetry's reconnect
+    // could recover (and sync/synthesize, which never enter batchRetry, stayed
+    // broken). Post-#1471, B is a borrower (it joined the singleton beforeAll
+    // created) and its disconnect is a no-op — the singleton survives WITHOUT
+    // any reconnect, which is what protects the non-batch phases.
+    await db.connect({ database_url: DATABASE_URL! }); // already up from beforeAll → no-op
 
     const engineA = new PostgresEngine();
-    await engineA.connect({ database_url: DATABASE_URL! }); // +1 owner
+    await engineA.connect({ database_url: DATABASE_URL! }); // borrows
     const engineB = new PostgresEngine();
-    await engineB.connect({ database_url: DATABASE_URL! }); // +1 owner
+    await engineB.connect({ database_url: DATABASE_URL! }); // borrows
 
     // Sanity: both engines share the live singleton.
     expect((await engineA.sql`SELECT 1 as ok`)[0].ok).toBe(1);
     expect((await engineB.sql`SELECT 1 as ok`)[0].ok).toBe(1);
 
-    // Engine B disconnects mid-operation (the "offending caller" scenario).
-    // Refcount drops but stays > 0, so the singleton is NOT torn down.
+    // Engine B (a borrower) disconnects mid-operation. The bug fix: this MUST
+    // NOT null the singleton engine A is still using.
     await engineB.disconnect();
 
-    // Engine A's call STILL succeeds — the #1570 fix PREVENTS the stray
-    // disconnect from nulling the shared pool. No reconnect required.
-    const afterB = await engineA.sql`SELECT 1 as ok`;
-    expect(afterB[0].ok).toBe(1);
+    // Engine A's direct call now SUCCEEDS (pre-fix it threw). This is the
+    // inverted assertion — the path that used to "prove the bug exists" now
+    // proves the bug is gone. No reconnect, no retry: just works.
+    const afterBorrowerDisconnect = await engineA.sql`SELECT 1 as ok`;
+    expect(afterBorrowerDisconnect[0].ok).toBe(1);
 
-    // reconnect() still works as a belt-and-suspenders recovery for genuine
-    // connection drops (network / pooler reap), and leaves A usable.
+    // Defense-in-depth: reconnect() still works on a borrower (re-borrows the
+    // still-live singleton) — the genuine-transient-drop recovery path is intact.
     await engineA.reconnect();
     expect((await engineA.sql`SELECT 1 as ok`)[0].ok).toBe(1);
 
-    // Cleanup: release the two owner refs this test added on top of beforeAll.
-    await engineA.disconnect();
-    await db.disconnect();
+    await engineA.disconnect(); // borrower no-op; singleton torn down by afterAll
   });
 
   test('CASE 2: diagnostic audit records every mid-process disconnect call', async () => {

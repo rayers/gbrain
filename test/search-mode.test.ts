@@ -391,11 +391,11 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // embedding spaces. Sequenced behind salem's v=4 graph-signals work.
     // v0.41.22.0 (type-unification): bumped 5→6 for the new alias_resolved
     // post-fusion boost stage. T2: bumped 6→7 for title_boost. v0.42.3.0:
-    // bumped 7→8 for autocut (ac=/acj=). v0.42.x: bumped 8→9 for the autocut
-    // weak-top floor (acmts=). A query against a brain with slug_aliases
-    // populated must not be served from a cache row written before the boost
-    // stage existed.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    // bumped 7→8 for autocut (ac=/acj=). issue #1777: bumped 8→9 for the
+    // archive/ demote (search-exclude policy change isn't in the hash, so the
+    // version bump is what invalidates archive-excluded cache rows). v0.42.x:
+    // bumped 9→10 for the autocut weak-top floor (acmts=).
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -560,8 +560,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION bumped to 9', () => {
-    expect(KNOBS_HASH_VERSION).toBe(9);
+  test('KNOBS_HASH_VERSION is 10 (9→10 autocut weak-top floor; 8→9 was #1777)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

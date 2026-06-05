@@ -718,11 +718,19 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // including conservative/no-reranker calls where autocut is a no-op (the hash
 // is global, not per-mode). Refills within cache.ttl_seconds (3600s default).
 //
-// v0.42.x bump 8→9: autocut weak-top floor adds `acmts` (autocut_min_top_score).
+// bump 8→9 (issue #1777): `archive/` moved from DEFAULT_HARD_EXCLUDES to a 0.5
+// source-boost demote. The source-boost / hard-exclude policy is NOT part of the
+// knobs hash, so without a version bump cached rows would keep returning the old
+// archive-excluded result set for up to cache.ttl_seconds. Bumping forces the fix
+// to take effect immediately (one-time global cache cold-miss on upgrade; refills
+// within cache.ttl_seconds). Same cache-key-contamination convention as the
+// autocut / title_boost / graph_signals bumps above.
+//
+// v0.42.x bump 9→10: autocut weak-top floor adds `acmts` (autocut_min_top_score).
 // The floor changes WHETHER autocut cuts at all — a write made with one floor
 // must NOT be served to a lookup at a different floor (the trimmed-vs-full set
 // differs). Same one-time global cold-miss pattern; fills within cache.ttl.
-export const KNOBS_HASH_VERSION = 9;
+export const KNOBS_HASH_VERSION = 10;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
