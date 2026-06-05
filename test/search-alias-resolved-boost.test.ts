@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('bumped to 9 (autocut weak-top floor acmts= added to the hash)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(9);
+  it('is 10 (9→10 autocut weak-top floor acmts= added; 8→9 was #1777 archive-demote)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 });

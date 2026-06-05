@@ -97,6 +97,19 @@ export class PostgresEngine implements BrainEngine {
   /** Whether a reconnect is in progress (prevents concurrent reconnects). */
   private _reconnecting = false;
   /**
+   * #1471: module-singleton OWNERSHIP token. `true` only for the engine whose
+   * connect() actually created the shared db.ts `sql` singleton (returned
+   * atomically by db.connect()). Borrowers — probe engines constructed while the
+   * singleton already exists (resolveLintContentSanity config-lift, doctor,
+   * integrity) — get `false` and must NOT db.disconnect() it, or they null the
+   * `sql` the long-lived owner (the cycle engine) still uses and every later
+   * phase throws "connect() has not been called". `_connectionStyle` alone can't
+   * separate owner from borrower: both are 'module'. Correct because the
+   * creator's lifetime dominates all borrowers — the CLI engine is created first
+   * and disconnected last (cli.ts), and borrowers are strictly nested.
+   */
+  private _ownsModuleSingleton = false;
+  /**
    * Tracks which connection path this engine is using so disconnect() is
    * idempotent. 'instance' = own _sql pool (poolSize was set);
    * 'module' = the module-level db singleton (backward compat path).
@@ -194,8 +207,12 @@ export class PostgresEngine implements BrainEngine {
       });
       this.connectionManager.setReadPool(this._sql);
     } else {
-      // Module-level singleton (backward compat for CLI main engine)
-      await db.connect(config);
+      // Module-level singleton (backward compat for CLI main engine).
+      // #1471: db.connect() returns whether THIS call created the singleton —
+      // decided atomically inside connect() (no await between its null-check and
+      // pool assignment), so two concurrent module connects can't both claim
+      // ownership. Store the token; only the owner tears the singleton down.
+      this._ownsModuleSingleton = await db.connect(config);
       this._connectionStyle = 'module';
 
       // v0.30.1: connection-manager wraps the module singleton.
@@ -237,7 +254,13 @@ export class PostgresEngine implements BrainEngine {
       return;
     }
     if (this._connectionStyle === 'module') {
-      await db.disconnect();
+      // #1471: only the engine that created the shared singleton may tear it
+      // down. A borrower clears its own markers WITHOUT calling db.disconnect(),
+      // so a probe engine's teardown can't clobber the owner's live connection.
+      if (this._ownsModuleSingleton) {
+        await db.disconnect();
+        this._ownsModuleSingleton = false;
+      }
       this._connectionStyle = null;
     }
     // else: nothing to disconnect (already done or never connected)
@@ -1509,8 +1532,9 @@ export class PostgresEngine implements BrainEngine {
     // by multiplying the chunk-grain ts_rank with a source-factor CASE.
     // Detail-gated — disabled for `detail='high'` (temporal queries) so
     // chat surfaces normally for date-framed lookups. Hard-exclude prefixes
-    // (test/, archive/, attachments/, .raw/ by default) filter at the
-    // chunk-rank stage so they never enter the candidate set.
+    // (test/, attachments/, .raw/ by default) filter at the chunk-rank stage
+    // so they never enter the candidate set. (archive/ is demoted, not
+    // excluded — issue #1777.)
     const boostMap = resolveBoostMap();
     const sourceFactorCase = buildSourceFactorCase('p.slug', boostMap, opts?.detail);
     const hardExcludePrefixes = resolveHardExcludes(opts?.exclude_slug_prefixes, opts?.include_slug_prefixes);
@@ -2006,14 +2030,15 @@ export class PostgresEngine implements BrainEngine {
         },
         // v0.41.25.0 (#1570): on null-singleton retryable errors, rebuild
         // the connection BEFORE the inter-attempt sleep so the next attempt
-        // sees a live pool. `this.reconnect()` is race-safe via
+        // sees a live pool. `this.reconnect()` is race-safe via the
         // `_reconnecting` guard, handles both module and instance pools,
         // and is a fast no-op when the underlying client is still healthy
         // (postgres.js's own connection-replacement covers that case).
         // Fail-loud per retry.ts contract: a reconnect throw propagates
         // as the real cause, replacing the symptomatic
-        // "No database connection" error.
-        reconnect: () => this.reconnect(),
+        // "No database connection" error. ctx carries the triggering error so
+        // reconnect() can classify reap-vs-other for the pool-recovery audit.
+        reconnect: (ctx) => this.reconnect(ctx),
       });
     } catch (err) {
       // Distinguish "retries exhausted" (a retryable error that ran out of
@@ -2119,13 +2144,6 @@ export class PostgresEngine implements BrainEngine {
     // on `embedding IS NULL` rather than `embedded_at IS NULL` — and it's why we now keep both
     // columns honest at write time.
     //
-    // Code-chunk metadata columns (language / symbol_name / symbol_type / line range /
-    // parent_symbol_path / doc_comment / symbol_name_qualified) follow the SAME chunk_text-gated
-    // CASE pattern as `embedding` (#769). Re-chunk (chunk_text changed) trusts EXCLUDED outright;
-    // pure re-embed (chunk_text unchanged) COALESCEs so a caller that only carries embedding
-    // doesn't clobber metadata to NULL. Without this, every embed --stale pass nuked code-def's
-    // primary index for thousands of chunks at once.
-    //
     // v0.40.3.0 D24 NULL→non-NULL race fix (TODOS.md v0.35.x item).
     // Two writers racing on the same chunk (e.g., autopilot sync + manual
     // `embed --stale` + contextual reindex) previously raced last-write-wins
@@ -2159,14 +2177,14 @@ export class PostgresEngine implements BrainEngine {
                 THEN EXCLUDED.embedded_at
            ELSE content_chunks.embedded_at
          END,
-         language = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.language ELSE COALESCE(EXCLUDED.language, content_chunks.language) END,
-         symbol_name = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.symbol_name ELSE COALESCE(EXCLUDED.symbol_name, content_chunks.symbol_name) END,
-         symbol_type = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.symbol_type ELSE COALESCE(EXCLUDED.symbol_type, content_chunks.symbol_type) END,
-         start_line = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.start_line ELSE COALESCE(EXCLUDED.start_line, content_chunks.start_line) END,
-         end_line = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.end_line ELSE COALESCE(EXCLUDED.end_line, content_chunks.end_line) END,
-         parent_symbol_path = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.parent_symbol_path ELSE COALESCE(EXCLUDED.parent_symbol_path, content_chunks.parent_symbol_path) END,
-         doc_comment = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.doc_comment ELSE COALESCE(EXCLUDED.doc_comment, content_chunks.doc_comment) END,
-         symbol_name_qualified = CASE WHEN EXCLUDED.chunk_text != content_chunks.chunk_text THEN EXCLUDED.symbol_name_qualified ELSE COALESCE(EXCLUDED.symbol_name_qualified, content_chunks.symbol_name_qualified) END,
+         language = EXCLUDED.language,
+         symbol_name = EXCLUDED.symbol_name,
+         symbol_type = EXCLUDED.symbol_type,
+         start_line = EXCLUDED.start_line,
+         end_line = EXCLUDED.end_line,
+         parent_symbol_path = EXCLUDED.parent_symbol_path,
+         doc_comment = EXCLUDED.doc_comment,
+         symbol_name_qualified = EXCLUDED.symbol_name_qualified,
          modality = EXCLUDED.modality,
          embedding_image = COALESCE(EXCLUDED.embedding_image, content_chunks.embedding_image)`,
       params as Parameters<typeof sql.unsafe>[1],
@@ -2448,7 +2466,11 @@ export class PostgresEngine implements BrainEngine {
     params.push(opts.batchSize);
     const limitIdx = params.length;
     const rows = await this.sql.unsafe(
-      `SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at
+      // #1768: project a deterministic full-µs UTC string alongside updated_at.
+      // to_char (not ::text — DateStyle-fragile) so extractStaleFromDB can stamp
+      // links_extracted_at = the exact updated_at and the staleness predicate clears.
+      `SELECT id, slug, source_id, type, title, compiled_truth, timeline, frontmatter, updated_at,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
          FROM pages
          WHERE ${where}${afterClause}
          ORDER BY id
@@ -4805,56 +4827,100 @@ export class PostgresEngine implements BrainEngine {
   }
 
   /**
-   * Reconnect the engine by tearing down the current pool and creating a fresh one.
-   * No-ops if no saved config (module-singleton mode) or if already reconnecting.
+   * Reconnect the engine after a transient connection blip. Branches on
+   * connection style; no-ops if no saved config or if already reconnecting.
+   *
+   * - MODULE-singleton engines SHARE `db.ts`'s `sql` (#1745). Calling
+   *   `db.disconnect()` here (via `this.disconnect()`) would null it out from
+   *   under EVERY concurrent op (other dream-cycle phases, minion-queue
+   *   `promoteDelayed`), which then throw "connect() has not been called" in the
+   *   disconnect→connect window. postgres.js already auto-replaces dead sockets
+   *   inside its pool, so a transient blip recovers WITHOUT a teardown. Recover
+   *   idempotently instead: `db.connect()` is a no-op when the singleton is alive
+   *   (the common case) and re-establishes it only if some other path nulled it —
+   *   never introducing a null window — then refreshes the ConnectionManager read
+   *   pool. Scope: fixes the singleton-NULL-window bug specifically; it does NOT
+   *   rebuild a genuinely WEDGED-but-live pool (db.connect() no-ops there) — a
+   *   different failure mode postgres.js owns.
+   *
+   * - INSTANCE pools (worker engines, `poolSize` set) own their `_sql` — tearing
+   *   it down and rebuilding is correct and isolated; nobody else shares it. This
+   *   path also records a pool-recovery audit event (#1685 GAP B) so the
+   *   `pool_reap_health` doctor check can answer "reaped N times AND not
+   *   auto-recovering." `ctx.error` (threaded by retry.ts) is classified: a
+   *   CONNECTION_ENDED match is a true pooler reap; anything else (or no error,
+   *   e.g. the supervisor's health-check reconnect) is `reconnect_other`. All
+   *   audit calls are best-effort and never block the reconnect (CODEX #8).
    */
-  async reconnect(): Promise<void> {
+  async reconnect(ctx?: { error?: unknown }): Promise<void> {
     if (!this._savedConfig || this._reconnecting) return;
+    if (this._connectionStyle !== 'instance') {
+      // Module-singleton: never tear down the shared pool. db.connect() is
+      // idempotent (no-op when the singleton is alive — the common #1745 path).
+      // FAIL-LOUD (codex): do NOT swallow a real connect failure — a swallowed
+      // error would make reconnect() resolve "successfully" and let the
+      // supervisor reset its health-failure counter / emit db_reconnected when
+      // the DB is actually down. A throw propagates as the real cause (matches
+      // the withRetry+reconnect contract and the instance path's posture).
+      await db.connect(this._savedConfig);
+      // If db.connect() RE-CREATED the singleton (another path nulled it), the
+      // ConnectionManager set at connect-time still points at the ended old
+      // pool. Refresh it. Idempotent no-op when the singleton was already alive.
+      this.connectionManager?.setReadPool(db.getConnection());
+      return;
+    }
     this._reconnecting = true;
-    // Build-then-swap: snapshot the live pool, build a fresh one, and only tear
-    // down the old pool once the new one is proven live. If the rebuild fails
-    // (Postgres still unreachable during a transient outage), restore the old
-    // pool so the engine is NOT left permanently dead (`_sql === null`) for the
-    // rest of the process. A dead `_sql` falls through to the module singleton
-    // accessor, which the autopilot process never connects — every subsequent
-    // non-retry-wrapped call (getConfig, per-phase reads) then throws
-    // "No database connection", crashing the worker into a respawn loop.
-    // postgres.js pools self-heal on the next query once Postgres is back, so
-    // keeping the old pool in place is safe; batchRetry's backoff retries.
-    const oldSql = this._sql;
-    const oldManager = this.connectionManager;
+
+    let isReap = false;
+    if (ctx?.error !== undefined) {
+      try {
+        const { isConnectionEndedError } = await import('./retry-matcher.ts');
+        isReap = isConnectionEndedError(ctx.error);
+      } catch { /* classification is best-effort */ }
+    }
     try {
-      this._sql = null; // force connect() to build a fresh pool, not reuse
-      // connect() validates the new pool via `SELECT 1` before returning, so on
-      // success _sql + connectionManager point at a proven-live connection.
+      const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
+      logPoolRecovery(isReap ? 'reap_detected' : 'reconnect_other', ctx?.error);
+    } catch { /* audit is best-effort */ }
+
+    try {
+      // Instance pool: tear down old pool (best-effort — it may already be dead).
+      try { await this.disconnect(); } catch { /* swallow */ }
       await this.connect(this._savedConfig);
-      // New pool is live — discard the old one best-effort.
-      if (oldSql) { try { await oldSql.end({ timeout: 5 }); } catch { /* swallow */ } }
+      try {
+        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
+        logPoolRecovery('reconnect_succeeded');
+      } catch { /* best-effort */ }
     } catch (err) {
-      // Rebuild failed: tear down the half-built pool (if any) and restore the
-      // prior live pool + manager so the engine stays usable.
-      if (this._sql && this._sql !== oldSql) {
-        try { await this._sql.end({ timeout: 5 }); } catch { /* swallow */ }
-      }
-      this._sql = oldSql;
-      this.connectionManager = oldManager;
-      throw err; // let batchRetry's backoff handle the retry
+      try {
+        const { logPoolRecovery } = await import('./audit/pool-recovery-audit.ts');
+        logPoolRecovery('reconnect_failed', err);
+      } catch { /* best-effort */ }
+      throw err;
     } finally {
       this._reconnecting = false;
     }
   }
 
-  async executeRaw<T = Record<string, unknown>>(
+  /**
+   * Shared body for executeRaw / executeRawDirect: run a raw statement on the
+   * given connection and wire AbortSignal cancellation onto the pending query.
+   * The ONLY difference between the two public methods is which connection they
+   * pick (read pool vs direct session pool), so the cancellation plumbing lives
+   * here in one place rather than being copy-pasted.
+   *
+   * v0.41.18.0 (A20, codex #7): real cancellation via postgres.js's .cancel()
+   * on the pending query. Init nudge (3s wallclock cap) is the first consumer;
+   * the AbortSignal fires when the timer trips. An already-aborted signal
+   * short-circuits before the network round-trip.
+   */
+  private runUnsafe<T>(
+    conn: ReturnType<typeof postgres>,
     sql: string,
     params?: unknown[],
     opts?: { signal?: AbortSignal },
   ): Promise<T[]> {
-    const conn = this.sql;
     const pending = conn.unsafe(sql, params as Parameters<typeof conn.unsafe>[1]);
-    // v0.41.18.0 (A20, codex #7): real cancellation via postgres.js's
-    // .cancel() on the pending query. Init nudge (3s wallclock cap) is the
-    // first consumer; the AbortSignal fires when the timer trips.
-    // Already-aborted signal short-circuits before the network round-trip.
     if (opts?.signal) {
       if (opts.signal.aborted) {
         // .cancel() is fire-and-forget; the awaited query rejects with the
@@ -4870,7 +4936,7 @@ export class PostgresEngine implements BrainEngine {
         try {
           (pending as unknown as { cancel?: () => void }).cancel?.();
         } catch {
-          // best-effort; the .then below settles regardless
+          // best-effort; the .finally below settles regardless
         }
       };
       opts.signal.addEventListener('abort', onAbort, { once: true });
@@ -4878,7 +4944,15 @@ export class PostgresEngine implements BrainEngine {
         opts.signal?.removeEventListener('abort', onAbort);
       });
     }
-    return pending as unknown as T[];
+    return pending as unknown as Promise<T[]>;
+  }
+
+  async executeRaw<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]> {
+    return this.runUnsafe<T>(this.sql, sql, params, opts);
     // Pre-#406 behavior: throw on any error including connection death.
     // Per-call auto-retry is not safe here because executeRaw is also used
     // for non-transactional mutations (DELETE/UPDATE/INSERT in sources.ts,
@@ -4887,6 +4961,34 @@ export class PostgresEngine implements BrainEngine {
     // Recovery instead happens at the supervisor level: the watchdog detects
     // 3 consecutive health-check failures and calls engine.reconnect() to
     // swap in a fresh pool. See db.ts setSessionDefaults / supervisor.ts.
+  }
+
+  /**
+   * Minion lock hot-path variant of executeRaw. Routes to the DIRECT
+   * session-mode pool (port 5432) when dual-pool is active so lock
+   * heartbeats survive the transaction-pooler's per-transaction connection
+   * recycling. See BrainEngine.executeRawDirect for the full rationale.
+   *
+   * When this engine is a transaction-scoped clone (txEngine from
+   * transaction()), `connectionManager` is inherited but `this.sql` is the tx
+   * connection; we intentionally honor the tx connection in that case by
+   * falling through to this.sql, because routing a statement inside an open
+   * transaction onto a different pool would break atomicity. The lock
+   * hot-path (claim/renewLock) does NOT run inside transaction(), so in
+   * practice this always reaches the direct pool there.
+   */
+  async executeRawDirect<T = Record<string, unknown>>(
+    sql: string,
+    params?: unknown[],
+    opts?: { signal?: AbortSignal },
+  ): Promise<T[]> {
+    // Inside an open transaction, _sql is the reserved tx connection (set via
+    // defineProperty in transaction()); never reroute off it.
+    const inTransaction = this._sql !== null && this.connectionManager?.peekReadPool() !== this._sql;
+    const conn = (!inTransaction && this.connectionManager?.isDualPoolActive())
+      ? await this.connectionManager.ddl()
+      : this.sql;
+    return this.runUnsafe<T>(conn, sql, params, opts);
   }
 
   // ============================================================
