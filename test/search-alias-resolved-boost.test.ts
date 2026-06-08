@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 10 (9→10 autocut weak-top floor acmts= added; 8→9 was #1777 archive-demote)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(10);
+  it('is 11 (fork merge: acmts weak-top floor + v0.43 relational arm both folded; 8→9 was #1777)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(11);
   });
 });

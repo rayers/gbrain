@@ -78,6 +78,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       autocut: false,
       autocut_jump: 0.2,
       autocut_min_top_score: 0.5,
+      // v0.43 — relational recall OFF for conservative.
+      relationalRetrieval: false,
+      relational_retrieval_depth: 2,
     });
   });
 
@@ -108,6 +111,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       autocut: true,
       autocut_jump: 0.2,
       autocut_min_top_score: 0.5,
+      // v0.43 — relational recall ON for balanced.
+      relationalRetrieval: true,
+      relational_retrieval_depth: 2,
     });
   });
 
@@ -136,6 +142,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       autocut: true,
       autocut_jump: 0.2,
       autocut_min_top_score: 0.5,
+      // v0.43 — relational recall ON for tokenmax.
+      relationalRetrieval: true,
+      relational_retrieval_depth: 2,
     });
   });
 
@@ -393,9 +402,11 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // post-fusion boost stage. T2: bumped 6→7 for title_boost. v0.42.3.0:
     // bumped 7→8 for autocut (ac=/acj=). issue #1777: bumped 8→9 for the
     // archive/ demote (search-exclude policy change isn't in the hash, so the
-    // version bump is what invalidates archive-excluded cache rows). v0.42.x:
-    // bumped 9→10 for the autocut weak-top floor (acmts=).
-    expect(KNOBS_HASH_VERSION).toBe(10);
+    // version bump is what invalidates archive-excluded cache rows). A query
+    // must not be served from a cache row written before the policy change.
+    // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
+    // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
+    expect(KNOBS_HASH_VERSION).toBe(11);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -560,8 +571,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 10 (9→10 autocut weak-top floor; 8→9 was #1777)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(10);
+  test('KNOBS_HASH_VERSION is 11 (fork merge: autocut weak-top floor + v0.43 relational arm)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(11);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
@@ -652,5 +663,46 @@ describe('v0.42.3.0 — autocut knobs', () => {
     const attr = attributeKnob('autocut', input, resolved);
     expect(attr.source).toBe('per-call');
     expect(attr.value).toBe(false);
+  });
+});
+
+describe('v0.43 — relational recall knobs', () => {
+  test('bundle defaults: conservative off, balanced/tokenmax on; depth 2', () => {
+    expect(MODE_BUNDLES.conservative.relationalRetrieval).toBe(false);
+    expect(MODE_BUNDLES.balanced.relationalRetrieval).toBe(true);
+    expect(MODE_BUNDLES.tokenmax.relationalRetrieval).toBe(true);
+    for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
+      expect(MODE_BUNDLES[m].relational_retrieval_depth).toBe(2);
+    }
+  });
+
+  test('per-call relationalRetrieval:false overrides bundle/config true', () => {
+    // bundle default true (balanced); per-call false wins
+    expect(resolveSearchMode({ mode: 'balanced', perCall: { relationalRetrieval: false } }).relationalRetrieval).toBe(false);
+    // config override true on conservative (bundle false); then per-call false beats config
+    expect(
+      resolveSearchMode({ mode: 'conservative', overrides: { relationalRetrieval: true }, perCall: { relationalRetrieval: false } }).relationalRetrieval,
+    ).toBe(false);
+    // config override alone flips conservative on
+    expect(resolveSearchMode({ mode: 'conservative', overrides: { relationalRetrieval: true } }).relationalRetrieval).toBe(true);
+  });
+
+  test('loadOverridesFromConfig reads search.relational_retrieval(+_depth)', () => {
+    const ov = loadOverridesFromConfig({ 'search.relational_retrieval': 'true', 'search.relational_retrieval_depth': '3' });
+    expect(ov.relationalRetrieval).toBe(true);
+    expect(ov.relational_retrieval_depth).toBe(3);
+    // out-of-range depth is ignored (falls through to bundle)
+    expect(loadOverridesFromConfig({ 'search.relational_retrieval_depth': '9' }).relational_retrieval_depth).toBeUndefined();
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS includes the relational keys', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.relational_retrieval');
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.relational_retrieval_depth');
+  });
+
+  test('knobsHash: relational-on vs off differ (cache isolation)', () => {
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced' })); // relational true
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relationalRetrieval: false } }));
+    expect(on).not.toBe(off);
   });
 });

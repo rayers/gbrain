@@ -43,7 +43,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 9 (…; 6→7 title_boost; 7→8 autocut; 8→9 archive-demote #1777)', () => {
+  test('version is 10 (…; 7→8 autocut; 8→9 archive-demote #1777; 9→10 relational recall)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -55,9 +55,11 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // v0.41.22.0 (type-unification): 5→6 to fold the alias_resolved
     // post-fusion boost. Cache rows written before the boost stage
     // cannot leak past the new stage. T2: 6→7 title_boost. v0.42.3.0: 7→8
-    // autocut. issue #1777: 8→9 archive/ demote. v0.42.x: 9→10 autocut
-    // weak-top floor (acmts=).
-    expect(KNOBS_HASH_VERSION).toBe(10);
+    // autocut. issue #1777: 8→9 archive/ demote (search-exclude policy change
+    // isn't in the hash, so the bump invalidates archive-excluded cache rows).
+    // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
+    // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
+    expect(KNOBS_HASH_VERSION).toBe(11);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
