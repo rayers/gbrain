@@ -2,6 +2,29 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.37.0] - 2026-06-08
+
+**Cross-source reads now honor the caller's grant everywhere, a single bad frontmatter value no longer wedges a whole `lint`/`sync` run, and a handful of long-standing papercuts are gone.** A triage of the open issue backlog pulled the highest-impact bugs into one wave.
+
+The headline is a source-isolation hardening pass. Every read that can be scoped to a source now resolves through one shared, fail-closed trust+grant check, so a remote client only ever sees the sources it was granted — whether it asks for one source, all sources, or reads a page by exact slug. Reads route the same way across query, the code-intel traversals, image search, and `get_page`. Legacy bearer tokens now carry the source grant an operator already stored on them, instead of being pinned to `default`.
+
+On ingestion, a non-string frontmatter value (a bare number or date in `title:`, `slug:`, or `type:`) used to throw partway through and abort the entire run — so one malformed file could stop a whole brain from linting or syncing. Now those values are coerced to a usable string (a bare date `2024-06-01` becomes a real slug, not a crash), and `gbrain lint` flags the un-quoted field by name so you can clean it up.
+
+Plus: `gbrain embed --catch-up` runs to completion instead of stopping after the first batch (and tells you when chunks genuinely can't be embedded); the frontmatter pre-commit hook actually matches `.md`/`.mdx` files now instead of silently doing nothing; the skill catalog shows the real description for skills that write it as a YAML block scalar; and `getConfig` retries through a transient connection blip instead of silently falling back to defaults.
+
+### Fixed
+- **Source-scoped reads honor the caller's grant across every read op (gbrain#1924, #1371, #1393).** One shared resolver replaces the per-op scope logic: a remote caller's "all sources" request is bounded to its grant, an out-of-grant source is refused, and `get_page`'s exact-slug path is scoped like every other read (both engines).
+- **Legacy bearer tokens carry their stored source grant (gbrain#1336).** Tokens with an operator-set source grant read across exactly those sources instead of being limited to `default`.
+- **Non-string frontmatter no longer aborts `lint`/`sync` (gbrain#1883, #1658, #1556, #1948).** Title/slug/type are coerced to usable strings instead of throwing mid-run, and `gbrain lint` reports the un-quoted field by name.
+- **`embed --catch-up` runs to completion (gbrain#1946).** The mode no longer stops after one batch, and surfaces chunks that can't be embedded instead of looking like a clean finish.
+- **Frontmatter pre-commit hook matches `.md`/`.mdx` files (gbrain#1840).** The installed hook was a silent no-op; it now validates staged markdown on commit.
+- **Skill catalog shows block-scalar descriptions (gbrain#1711).** Skills written with `description: |` show their real text instead of a stray indicator.
+- **`getConfig` retries on a transient connection blip (gbrain#1603)** instead of silently falling through to defaults (which surfaced as the wrong search mode / empty output on remote Postgres).
+
+### To take advantage of v0.42.37.0
+
+`gbrain upgrade`. No configuration needed. If `gbrain lint` now flags a `frontmatter-non-string-field` on a page, quote the value in that page's frontmatter (e.g. `title: "123"`). Reinstall the pre-commit hook with `gbrain frontmatter install-hook` to pick up the fixed matcher.
+
 ## [0.42.36.0] - 2026-06-08
 
 **A huge `gbrain sync` that keeps getting killed now converges instead of restarting from zero.** On a high-write source — hundreds of thousands of files, a generator committing faster than each sync can drain — a full sync that ran past its launching session's timeout (SIGTERM) would lose 100% of its progress and re-import the entire backlog on the next run, forever. The bookmark never advanced, the source went quietly stale for hours while the importer burned CPU the whole time, and competing hourly launches stole each other's lock and raced. This release makes a large sync **resumable, durable, and single-flight** so it banks what it imports and picks up where it left off.
