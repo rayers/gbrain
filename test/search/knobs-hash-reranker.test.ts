@@ -43,7 +43,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 10 (…; 7→8 autocut; 8→9 archive-demote #1777; 9→10 relational recall)', () => {
+  test('version is 11 (…; 8→9 archive-demote #1777; 9→10 relational recall; 10→11 asymmetric input_type #1400)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -59,7 +59,12 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // isn't in the hash, so the bump invalidates archive-excluded cache rows).
     // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
     // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
-    expect(KNOBS_HASH_VERSION).toBe(11);
+    // #1400: upstream 10→11 asymmetric input_type fix — embedQuery() now produces
+    // query-side vectors for asymmetric providers, so rows keyed on pre-fix
+    // document-side query vectors must not be served. Fork merge 11→12: that
+    // #1400 bump and our fork-merge bump both landed at 11, so the merged
+    // composition matches neither published v=11 — bump to 12 for a clean cold-miss.
+    expect(KNOBS_HASH_VERSION).toBe(12);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

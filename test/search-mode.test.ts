@@ -406,7 +406,13 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // must not be served from a cache row written before the policy change.
     // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
     // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
-    expect(KNOBS_HASH_VERSION).toBe(11);
+    // #1400: upstream bumped 10→11 for the asymmetric input_type fix — embedQuery()
+    // now produces query-side vectors for asymmetric providers (zembed-1, Voyage
+    // v3+), so rows keyed on pre-fix document-side query vectors must not be served
+    // to post-fix lookups. Fork merge 11→12: that #1400 bump and our fork-merge
+    // bump both landed at 11 independently, so the merged composition matches
+    // neither published v=11 — bump to 12 to force a clean cold-miss.
+    expect(KNOBS_HASH_VERSION).toBe(12);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -571,8 +577,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 11 (fork merge: autocut weak-top floor + v0.43 relational arm)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(11);
+  test('KNOBS_HASH_VERSION is 12 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(12);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

@@ -768,7 +768,16 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // weak-top-floor parts AND the relational parts, so its key composition matches
 // neither published v=10. Bump to 11 to force the one-time cold-miss and
 // guarantee no stale v=10 row (written by either side) is ever served.
-export const KNOBS_HASH_VERSION = 11;
+//
+// bump 11→12 (fork merge): upstream's #1400 input_type fix ALSO claimed v=11
+// independently (changes what embedQuery() produces for asymmetric embedding
+// models — zembed-1 hosted/local, Voyage v3+ — by no longer stripping the
+// query-side input_type before the wire). The merged code carries BOTH the
+// fork-merge composition AND the input_type fix, so its key composition matches
+// neither published v=11. Bump to 12 to force the one-time cold-miss and
+// guarantee no stale v=11 row (written by either side) is ever served. Same
+// global cold-miss pattern; refills within cache.ttl_seconds (3600s default).
+export const KNOBS_HASH_VERSION = 12;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The

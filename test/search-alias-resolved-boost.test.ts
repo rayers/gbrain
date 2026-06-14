@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 11 (fork merge: acmts weak-top floor + v0.43 relational arm both folded; 8→9 was #1777)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(11);
+  it('is 12 (fork merge: acmts weak-top floor + v0.43 relational arm + #1400 input_type fix all folded)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(12);
   });
 });
