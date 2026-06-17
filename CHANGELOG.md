@@ -2,6 +2,54 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.50.0] - 2026-06-17
+
+**CI reliability hardening — a wedged job can no longer run for six hours, a superseded run no longer reports a stale flaky failure, and broken workflow YAML is caught before it ships.** gbrain's CI already had the deep machinery (content-hash run-skip cache, weight-aware shard balancing, test-isolation guards, hermetic E2E). What it lacked was the cheap GitHub-Actions hygiene that was already wired into `heavy-tests.yml` but never into the two hot-path workflows. This pass closes that gap, porting the patterns from the sibling GStack project's CI-reliability work.
+
+### Changed
+- **`test.yml` and `e2e.yml` cancel a superseded run** when a newer commit lands on the same PR (`concurrency` keyed on the PR number — fork-safe — with a `github.ref` fallback so push and scheduled runs always complete). Frees runners and stops a run against an obsolete commit from reporting a flaky failure.
+- **Every job in `test.yml`/`e2e.yml` now has a `timeout-minutes` bound** (test matrix 15, verify 12, serial 15, slow jobs 12, E2E tier 1 20 / tier 2 30, trivial jobs 5-10). A wedged job is converted from a six-hour zombie (GitHub's default) into a fast, legible failure.
+- **`scripts/run-e2e.sh` scrubs operator/agent environment before E2E.** A dev or Conductor shell exporting `CONDUCTOR_*` / `MCP_*` / `GBRAIN_*` config overrides no longer bleeds into E2E child processes (which made "hermetic" E2E non-hermetic and its failures unreproducible across machines). Denylist scrub — `PATH`/`HOME`/`TMPDIR`/`DATABASE_URL` survive; `GBRAIN_HOME` is preserved for the existing HOME isolation.
+
+### Added
+- **`actionlint` workflow** (`rhysd/actionlint`, SHA-pinned) lints all workflow YAML on `.github/workflows/**` changes, catching a malformed workflow / bad action ref / missing-permission bug before it ships a broken pipeline.
+
+### To take advantage of v0.42.50.0
+Nothing to do — these are CI/test-infra changes that take effect automatically on the next push. Contributors running the suite locally get the same hermetic-E2E env scrub via `bash scripts/run-e2e.sh` (or `bun run ci:local`).
+
+## [0.42.49.0] - 2026-06-16
+
+**Big embed backfills and syncs now throttle themselves when the database gets busy, so clearing a backlog can't starve the job queue — no more external babysitter scripts.** A naive `gbrain embed --stale` or large `gbrain sync` against a PgBouncer transaction-mode pooler could saturate it and starve the minion supervisor's lock renewals, cascading `lock-renewal-failed` into dead jobs. The field workaround was an external wrapper that SIGSTOP/SIGCONT'd the process off a side-pool latency probe. That approach was blind (the side pool read low latency while the pool that mattered starved), unsafe (SIGSTOP can freeze a process mid-transaction holding locks), and couldn't touch peak pressure. gbrain now does this natively, and better.
+
+Pacing is **opt-in** (default `off`) and built on one composable primitive: it caps simultaneous in-flight DB writes (the real lever against pooler-slot starvation), measures the work's own query latency in-band (so it can never be blind), and sleeps cooperatively between safe points (never mid-transaction, so the lock heartbeat keeps firing). Turn it on per-run with `gbrain embed --stale --pace`, or set `pace.mode` in config to pace every embed path plus the production embed-backfill job automatically. `GBRAIN_PACE_*` env vars override config as an incident escape hatch.
+
+### Added
+- **`--pace[=mode]` for `gbrain embed`** — `off`/`gentle`/`balanced`/`aggressive` bundles (bare `--pace` = balanced), plus `--pace-max-concurrency=N`. `--background` carries the explicit override into the queued `embed` job; the handler re-resolves env > config > bundle at execution.
+- **`pace.mode` config + `GBRAIN_PACE_*` env** — config paces every `runEmbedCore` caller (cycle embed, catch-up, sync-auto-embed) and the prod `embed-backfill` job automatically; env beats config for incident response.
+- **Composable `db-pacer` primitive** (`src/core/db-pacer.ts`) + named bundles (`src/core/pace-mode.ts`) — concurrency permit + in-band EWMA + jittered cooperative sleep, abort-throwing, fail-open. `sync` uses the shared permit across its parallel worker engines.
+- **Pacing telemetry** — `EmbedResult.pacing` (cap, samples, EWMA latency, slept ms) in `--json`, plus a one-line stderr summary.
+
+### Changed
+- **`gbrain embed --stale` now single-flights per source** using the same lock the `embed-backfill` job holds, so a hand-run backfill and a queued job can't grind the same source concurrently. Paced runs add a bounded end-of-run rescan (catches rows that landed behind the cursor during a longer run), and the embed time budget excludes paced-sleep time so a contended DB still converges instead of exiting early.
+
+### To take advantage of v0.42.49.0
+`gbrain upgrade`. Pacing is off by default — nothing changes until you opt in. To clear a big embed backlog safely on a busy pooler: `gbrain embed --stale --pace` (or `--pace=gentle` to be extra conservative). To pace the background embed-backfill job and every embed path automatically: `gbrain config set pace.mode balanced`. During an incident you can override without a redeploy: `GBRAIN_PACE_MODE=gentle` or `GBRAIN_PACE_MAX_CONCURRENCY=4`.
+## [0.42.48.0] - 2026-06-16
+
+**Brain repos harden themselves for durability the moment gbrain is given a PAT and a GitHub URL.** Fresh agents kept drifting out of sync with their knowledge-wiki git repos: writes sat local-only and never pushed, long-lived sessions edited a stale tree, and scratch output landed outside the repo and vanished. Now `gbrain sources add --url <repo> --pat-file <p>` auto-hardens the managed clone, and `gbrain sources harden <id>` runs the same audit idempotently against any source. Hardening is six always-on guarantees: it pulls current state (divergence-safe rebase that skips a dirty tree and never leaves a half-rebase), installs a local auto-push safety net, ships a committed `scripts/brain-commit-push.sh` that refuses to report success without a confirmed push, writes always-on durability rules into the agent's context file (deterministic filing from the canonical taxonomy, commit-and-push-never-deferred, pull-before-each-write-batch), registers a 30-minute background pull so an idle session can't go stale, and verifies push access up front.
+
+This is gbrain's first push path and first credential storage, built secure by default. The push automation is installed locally per machine rather than committed into the repo, the GitHub token is wired per-repo (least-privilege; an existing credential helper is reused when present rather than writing a new one), and the token never enters the repo, the tracked remote URL, logs, or the run report. Hardening proves push works with a dry-run probe before declaring done, so a read-only token or a protected branch surfaces immediately instead of silently dropping writes later. `gbrain sources unharden <id>` cleanly removes everything it installed and runs automatically before `sources remove`.
+
+### Added
+- `gbrain sources harden <id|--all> [--pat-file <p>] [--branch <b>] [--no-cron] [--no-verify] [--dry-run] [--json]` — idempotent brain-repo durability hardening.
+- `gbrain sources pull <id> | --path <dir> [--branch <b>]` — divergence-safe rebase-pull; `--path` runs DB-free so the 30-minute cron never contends for the local engine lock.
+- `gbrain sources unharden <id>` — remove the durability cron, hook, and credential wiring.
+- `--pat-file` / `--no-harden` on `gbrain sources add`; managed clones added with a PAT auto-harden.
+- `git-remote.ts`: `divergenceSafePull`, `detectDefaultBranch`, `pushProbe`, and an env-gated `GBRAIN_GIT_ALLOW_FILE_TRANSPORT` escape hatch for self-hosted filesystem remotes.
+
+### To take advantage of v0.42.48.0
+`gbrain upgrade`. Add a brain repo with `gbrain sources add <id> --url <https-repo> --pat-file <path-to-token>` and it hardens automatically; or run `gbrain sources harden <id> --pat-file <path>` on an existing source. Use a fine-grained PAT scoped to just that repo. Existing brains are untouched until you opt in.
+
 ## [0.42.47.0] - 2026-06-16
 
 **A brain now travels with its own operating manual, and gbrain finally tells you how to run it better (gbrain#2180).** Two long-standing gaps closed. First: a brain repo can carry its own skillpack — skills authored for and versioned with that specific brain — and any harness that connects is offered it. Connect a fresh Claude Code or a thin client to a mature brain and it learns, on the spot, which meeting-ingestion or diligence protocol the brain expects, instead of starting blind. Second: gbrain stops being purely passive. `gbrain advisor` reads the brain's own state and hands back a ranked, read-only list of high-leverage actions — pending migrations, version drift, stalled backfills, low embedding coverage, setup smells — each with the exact command to fix it. It never acts on its own; it shows you and asks.
