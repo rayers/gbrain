@@ -777,7 +777,20 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // neither published v=11. Bump to 12 to force the one-time cold-miss and
 // guarantee no stale v=11 row (written by either side) is ever served. Same
 // global cold-miss pattern; refills within cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 12;
+//
+// bump 12→13 (fork merge, 2026-07-17): upstream's #2825 hard-exclude fix ALSO
+// claimed v=12 independently (folds the resolved hard-exclude slug-prefix list
+// — defaults ∪ GBRAIN_SEARCH_EXCLUDE ∪ exclude_slug_prefixes, minus
+// include_slug_prefixes — into the key via ctx.hardExcludes / the `hx` part;
+// before this it only applied at DB-query build time, so a process with
+// GBRAIN_SEARCH_EXCLUDE set could be served cached rows containing excluded
+// slugs written by a process without it). Our v=12 (fork-merge composition +
+// #1400) never carried `hx`; upstream's v=12 never carried our `acmts`. The
+// merged code carries BOTH, so its key composition matches NEITHER published
+// v=12. Bump to 13 to force the one-time cold-miss and guarantee no stale v=12
+// row (written by either side) is ever served. Same global cold-miss pattern;
+// refills within cache.ttl_seconds (3600s default).
+export const KNOBS_HASH_VERSION = 13;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -806,6 +819,16 @@ export interface KnobsHashContext {
    */
   schemaPack?: string;
   schemaPackVersion?: string;
+  /**
+   * v=12 (#2825): the RESOLVED effective hard-exclude prefix list — the same
+   * value resolveHardExcludes() produces at query-build time (defaults ∪
+   * GBRAIN_SEARCH_EXCLUDE ∪ per-call exclude_slug_prefixes, minus
+   * include_slug_prefixes). Folded (sorted, so input order is irrelevant)
+   * into the hash so a cache row written under one exclude policy can never
+   * be served to a lookup under another. Undefined falls back to the literal
+   * 'none' for legacy callers that don't thread excludes.
+   */
+  hardExcludes?: string[];
 }
 
 export function knobsHash(
@@ -900,6 +923,12 @@ export function knobsHash(
     // test/model-pricing.test.ts-style drift guards and the mode tests.
     `rel=${knobs.relationalRetrieval ? 1 : 0}`,
     `reld=${knobs.relational_retrieval_depth ?? 2}`,
+    // v=12 addition (#2825, append-only): resolved hard-exclude prefixes.
+    // Before this, resolveHardExcludes() only ran at DB-query build time
+    // (cache miss), so cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs
+    // across processes. Sorted copy so ['a/','b/'] and ['b/','a/'] hash
+    // identically; undefined falls back to 'none' for legacy callers.
+    `hx=${ctx?.hardExcludes ? [...ctx.hardExcludes].sort().join(',') : 'none'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

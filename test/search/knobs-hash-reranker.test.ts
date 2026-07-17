@@ -27,6 +27,7 @@ import {
   MODE_BUNDLES,
   type ResolvedSearchKnobs,
 } from '../../src/core/search/mode.ts';
+import { resolveHardExcludes } from '../../src/core/search/source-boost.ts';
 
 /** Build a baseline resolved knob set with all reranker fields filled. */
 function baseKnobs(): ResolvedSearchKnobs {
@@ -43,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 11 (…; 8→9 archive-demote #1777; 9→10 relational recall; 10→11 asymmetric input_type #1400)', () => {
+  test('version is 13 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825; 12→13 fork-merge union)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -64,7 +65,12 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // document-side query vectors must not be served. Fork merge 11→12: that
     // #1400 bump and our fork-merge bump both landed at 11, so the merged
     // composition matches neither published v=11 — bump to 12 for a clean cold-miss.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // #2825: upstream 11→12 folds the resolved hard-exclude prefix list (hx=) —
+    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes. Fork
+    // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
+    // (our v=12 never carried hx=; upstream's never carried acmts=), so the
+    // merged composition matches neither published v=12 — bump to 13.
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
@@ -209,5 +215,38 @@ describe('append-only convention (CDX2-F13)', () => {
     const bare = knobsHash(k);
     const explicit = knobsHash(k, { embeddingColumn: 'embedding', embeddingModel: 'default' });
     expect(bare).toBe(explicit);
+  });
+});
+
+describe('v=12 hard-exclude participation (#2825)', () => {
+  test('different exclude lists → different hashes', () => {
+    const k = baseKnobs();
+    const noEnv = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) });
+    const withEnv = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, 'private/') });
+    expect(noEnv).not.toBe(withEnv);
+  });
+
+  test('include (opt-back-in) changes the hash too', () => {
+    const k = baseKnobs();
+    const a = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) });
+    const b = knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, ['test/'], undefined) });
+    expect(a).not.toBe(b);
+  });
+
+  test('same prefixes in different input order → SAME hash (normalization)', () => {
+    const k = baseKnobs();
+    const a = knobsHash(k, { hardExcludes: ['a/', 'b/', 'test/'] });
+    const b = knobsHash(k, { hardExcludes: ['test/', 'b/', 'a/'] });
+    expect(a).toBe(b);
+  });
+
+  test('undefined hardExcludes is stable (legacy-caller fallback)', () => {
+    const k = baseKnobs();
+    expect(knobsHash(k)).toBe(knobsHash(k));
+    // ...and distinct from an explicit resolved default list — a legacy
+    // caller can never collide with a policy-carrying cache row.
+    expect(knobsHash(k)).not.toBe(
+      knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) }),
+    );
   });
 });

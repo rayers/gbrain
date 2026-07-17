@@ -1815,6 +1815,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     // side-effect free. The legacy non-federated path (no opts.sourceId) writes
     // config.sync.last_run elsewhere and isn't reached by sync_freshness's
     // `WHERE local_path IS NOT NULL` filter, so leave it alone.
+    //
+    // Fork-merge note (2026-07-17): upstream v0.42.52.0 (PR #22xx) independently
+    // converged on this same last_sync_at heartbeat, but with the bare
+    // `if (opts.sourceId)` guard. We keep our stricter condition — upstream's
+    // omits the pull-failed suppression (would mask a failed pull as fresh) and
+    // the --dry-run guard (would violate dry-run's side-effect-free contract).
+    // Same UPDATE, superset of guards.
     if (opts.sourceId && !pullAttemptedAndFailed && !opts.dryRun) {
       await engine.executeRaw(
         `UPDATE sources SET last_sync_at = now() WHERE id = $1`,
@@ -2341,11 +2348,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch {
         // Slug doesn't exist or collision, treat as add
       }
-      // Reimport at new path (picks up content changes)
+      // Reimport at new path (picks up content changes). Wrapped to match the
+      // deletes/adds loops: a malformed renamed file is recorded to failedFiles
+      // and skipped, NOT thrown uncaught. importFile still throws on content
+      // sanity-block, duplicate-slug, and missing-link endpoints; an uncaught
+      // throw here crashes the whole sync mid-run and freezes the checkpoint,
+      // defeating --skip-failed. A `skipped` result carrying an error is also
+      // captured so the failure is recorded rather than silently dropped.
       const filePath = join(repoPath, to);
       if (existsSync(filePath)) {
-        const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
-        if (result.status === 'imported') chunksCreated += result.chunks;
+        try {
+          const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+          if (result.status === 'imported') chunksCreated += result.chunks;
+          else if (result.status === 'skipped' && (result as { error?: string }).error) {
+            failedFiles.push({ path: to, error: String((result as { error?: string }).error) });
+          }
+        } catch (e: unknown) {
+          failedFiles.push({ path: to, error: e instanceof Error ? e.message : String(e) });
+        }
       }
       pagesAffected.push(newSlug);
       await markCompleted(to);
@@ -3147,23 +3167,44 @@ async function performFullSync(
     // repo-relative (importFile uses `relative(dir, filePath)`), so relativize
     // to the same form before membership-testing — otherwise every page looks
     // stale and the reconcile would wrongly delete live pages.
-    const current = new Set(
-      collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' })
-        .map(abs => relative(repoPath, abs)),
-    );
+    //
+    // #2828: planReconcileDeletes ALSO normalizes path separators on both sides
+    // of the membership test. On a Windows checkout `path.relative` yields
+    // backslash paths while a stored source_path can hold git-derived forward
+    // slashes; without normalization every file-backed page mismatches, looks
+    // stale, and the reconcile wipes the whole source.
+    const currentFiles = collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' })
+      .map(abs => relative(repoPath, abs));
     const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
       `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
       [sid],
     );
-    const staleSlugs = rows
-      .filter(r => r.source_path != null
-        && isSyncable(r.source_path, reconcileSyncOpts)
-        && !current.has(r.source_path))
-      .map(r => r.slug);
-    if (staleSlugs.length > 0) {
+    const plan = planReconcileDeletes(
+      rows,
+      currentFiles,
+      p => isSyncable(p, reconcileSyncOpts),
+    );
+    if (plan.staleSlugs.length > 0 && plan.massDelete && !massReconcileAllowed()) {
+      // #2828 mass-delete safety valve: a reconcile that would sweep more than
+      // half of the pages this strategy manages, on a source with a non-trivial
+      // number of them, is almost always a path-comparison bug or the wrong repo
+      // path — NOT a genuine bulk deletion. Skip the delete and warn loudly
+      // instead of silently wiping the brain.
+      serr(
+        `\n  WARNING: refusing to reconcile-delete ${plan.staleSlugs.length} of ` +
+        `${plan.reconcilableCount} file-backed page(s) for source '${sid}' ` +
+        `(> ${Math.round(MASS_RECONCILE_RATIO * 100)}% of them).\n` +
+        `  A full sync removes pages only when their backing file is gone. Deleting\n` +
+        `  this many at once almost always means the paths were compared wrong (e.g.\n` +
+        `  a path-separator mismatch) or the WRONG repo path was synced — not that\n` +
+        `  you actually deleted that many files. No pages were deleted.\n` +
+        `  If this bulk removal is genuinely intended, re-run with ` +
+        `GBRAIN_ALLOW_MASS_RECONCILE=1 to restore the old behavior.`,
+      );
+    } else if (plan.staleSlugs.length > 0) {
       const deleteScopedOpts = { sourceId: sid };
-      for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
-        const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
+      for (let i = 0; i < plan.staleSlugs.length; i += DELETE_BATCH_SIZE) {
+        const batch = plan.staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
         try {
           const deleted = await engine.deletePages(batch, deleteScopedOpts);
           reconciledDeletes += deleted.length;
@@ -3215,6 +3256,82 @@ async function performFullSync(
     embedded,
     pagesAffected: [],
   };
+}
+
+/**
+ * #2828 full-sync reconcile safety-valve thresholds. A reconcile that would
+ * delete more than MASS_RECONCILE_RATIO of the file-backed pages a strategy
+ * manages, on a source that holds more than MASS_RECONCILE_MIN_PAGES of them, is
+ * treated as a suspected path-comparison bug rather than a real bulk deletion.
+ */
+export const MASS_RECONCILE_RATIO = 0.5;
+export const MASS_RECONCILE_MIN_PAGES = 20;
+
+/**
+ * Normalize path separators so a page whose stored `source_path` was written
+ * with a different separator than the local OS's `path.relative` produces (e.g.
+ * git-derived forward-slash paths on a Windows checkout) still compares equal.
+ * Without this, on Windows every file-backed page looks stale and the reconcile
+ * wrongly deletes the whole source (#2828).
+ */
+function normalizeReconcilePath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+export interface ReconcilePlan {
+  /** Slugs whose backing file is genuinely gone; safe to reconcile-delete. */
+  staleSlugs: string[];
+  /**
+   * File-backed, in-strategy pages the reconcile can act on. This is the
+   * denominator for the mass-delete valve (the exact population at risk).
+   */
+  reconcilableCount: number;
+  /**
+   * True when `staleSlugs` would sweep more than MASS_RECONCILE_RATIO of
+   * `reconcilableCount`, on a source with more than MASS_RECONCILE_MIN_PAGES of
+   * them — the mass-delete signal that trips the safety valve.
+   */
+  massDelete: boolean;
+}
+
+/**
+ * #2828: decide which file-backed pages a full-sync reconcile should delete, and
+ * whether that deletion is suspiciously large. Pure and exported so both the
+ * separator normalization and the mass-delete valve are unit-testable without a
+ * live engine or a Windows host.
+ *
+ * @param rows           pages with a non-null `source_path` (deleted_at IS NULL).
+ * @param currentFiles   repo-relative paths present in the working tree.
+ * @param isSyncablePath predicate excluding metafiles and the wrong strategy.
+ */
+export function planReconcileDeletes(
+  rows: ReadonlyArray<{ slug: string; source_path: string | null }>,
+  currentFiles: Iterable<string>,
+  isSyncablePath: (p: string) => boolean,
+): ReconcilePlan {
+  const current = new Set<string>();
+  for (const f of currentFiles) current.add(normalizeReconcilePath(f));
+  const reconcilable = rows.filter(
+    r => r.source_path != null && isSyncablePath(r.source_path),
+  );
+  const staleSlugs = reconcilable
+    .filter(r => !current.has(normalizeReconcilePath(r.source_path as string)))
+    .map(r => r.slug);
+  const massDelete =
+    reconcilable.length > MASS_RECONCILE_MIN_PAGES &&
+    staleSlugs.length > reconcilable.length * MASS_RECONCILE_RATIO;
+  return { staleSlugs, reconcilableCount: reconcilable.length, massDelete };
+}
+
+/**
+ * #2828 escape hatch: `GBRAIN_ALLOW_MASS_RECONCILE=1` restores the pre-valve
+ * behavior for the rare intentional bulk removal. Env-only (an incident-time
+ * override), mirroring `resolveStallAbortSeconds`' pure, env-parameterized shape.
+ */
+export function massReconcileAllowed(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.GBRAIN_ALLOW_MASS_RECONCILE === '1';
 }
 
 /**

@@ -411,8 +411,13 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // v3+), so rows keyed on pre-fix document-side query vectors must not be served
     // to post-fix lookups. Fork merge 11→12: that #1400 bump and our fork-merge
     // bump both landed at 11 independently, so the merged composition matches
-    // neither published v=11 — bump to 12 to force a clean cold-miss.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // neither published v=11 — bump to 12 to force a clean cold-miss. #2825:
+    // upstream bumped 11→12 to fold the resolved hard-exclude prefix list (hx=) —
+    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes. Fork
+    // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
+    // independently (our v=12 never carried hx=; upstream's never carried acmts=),
+    // so the merged composition matches neither published v=12 — bump to 13.
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -577,8 +582,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 12 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(12);
+  test('KNOBS_HASH_VERSION is 13 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

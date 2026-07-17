@@ -136,7 +136,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 12 (cross-modal still appended; fork merge folds acmts + relational + input_type)', () => {
+  test('KNOBS_HASH_VERSION is 13 (cross-modal still appended; fork merge folds acmts + relational + input_type + hard-exclude)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -147,8 +147,11 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // v0.43 relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
     // Fork merge 11→12: upstream's #1400 query-side input_type fix for asymmetric
     // providers also claimed 10→11 independently, so the merged composition matches
-    // neither published v=11 — bump to 12 to force a clean cold-miss.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // neither published v=11 — bump to 12 to force a clean cold-miss. Fork merge
+    // 12→13: upstream's #2825 hard-exclude fold (hx=) also claimed 11→12
+    // independently (our v=12 never carried hx=; upstream's never carried acmts=),
+    // so the merged composition matches neither published v=12 — bump to 13.
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 
   test('flipping unified_multimodal changes the hash', () => {
