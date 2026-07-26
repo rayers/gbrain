@@ -301,7 +301,13 @@ describe('sync no-op touches last_sync_at (federated source)', () => {
       // exercise the failure-suppression branch.
       noEmbed: true,
     });
-    expect(result.status).toBe('up_to_date');
+    // Fork-merge (2026-07-26): upstream #3068 retired `up_to_date` for this
+    // case — a failed pull with zero imports now early-returns `partial`
+    // (reason='pull_failed') instead of a clean status, and `sync --all` exits
+    // 1 on it. The invariant this test actually guards (heartbeat must NOT
+    // advance when the pull failed) is unchanged and asserted below; only the
+    // status name moved.
+    expect(result.status).toBe('partial');
 
     const after2 = await engine.executeRaw<{ last_sync_at: Date }>(
       `SELECT last_sync_at FROM sources WHERE id = $1`,
