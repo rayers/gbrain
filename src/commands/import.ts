@@ -60,6 +60,11 @@ export async function runImport(
      */
     exclude?: string[];
     /**
+     * Opt out of the git-visible fast path and walk the filesystem directly,
+     * so markdown/code files matched by .gitignore can still be imported.
+     */
+    includeGitignored?: boolean;
+    /**
      * #753/#774 monorepo subdir-source support: when set, slugs and
      * `source_path` are computed relative to this root (the git repo root)
      * instead of `dir` (the sync scope), so `wiki/page1.md` lands as slug
@@ -71,6 +76,7 @@ export async function runImport(
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
   const jsonOutput = args.includes('--json');
+  const includeGitignored = args.includes('--include-gitignored') || opts.includeGitignored === true;
 
   // T7 (D9): refuse cleanly when init persisted the deferred-setup sentinel,
   // unless the user is explicitly skipping embedding via `--no-embed` (in
@@ -219,6 +225,7 @@ export async function runImport(
 
   if (!dirArg) {
     console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--json] [--strategy markdown|code|auto]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--json]');
     process.exit(1);
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -243,7 +250,7 @@ export async function runImport(
   const strategy: SyncStrategy = opts.strategy ?? cliStrategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
-  let allFiles = collectSyncableFiles(dir, { strategy });
+  let allFiles = collectSyncableFiles(dir, { strategy, includeGitignored });
   console.error(
     `[gbrain phase] import.collect_files done ${Date.now() - _walkT0}ms files=${allFiles.length}`,
   );
@@ -579,6 +586,7 @@ function resolveMaxWalkDepth(): number {
 
 interface CollectOpts {
   strategy?: SyncStrategy;
+  includeGitignored?: boolean;
 }
 
 /**
@@ -709,8 +717,10 @@ export function collectSyncableFiles(dir: string, opts: CollectOpts = {}): strin
   // vendored data/fixtures). `--cached --others --exclude-standard` = tracked
   // PLUS untracked-not-ignored, so uncommitted source is still indexed. Non-git
   // dirs (or git unavailable) fall through to the FS walk below.
-  const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
-  if (gitFiles) return gitFiles;
+  if (!opts.includeGitignored) {
+    const gitFiles = gitListSyncableFiles(dir, strategy, multimodalOn);
+    if (gitFiles) return gitFiles;
+  }
 
   const maxDepth = resolveMaxWalkDepth();
   const visitedInodes = new Map<string, true>();
