@@ -417,7 +417,12 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
     // independently (our v=12 never carried hx=; upstream's never carried acmts=),
     // so the merged composition matches neither published v=12 — bump to 13.
-    expect(KNOBS_HASH_VERSION).toBe(13);
+    // #3390/#3391: upstream bumped 12→13 for the embedding-provider migration
+    // wave — legacy callers hash prov=default before AND after a provider swap,
+    // so pre-migration cache rows must become unreachable on upgrade. Fork merge
+    // 13→14: that bump and our fork-merge bump both landed at 13 independently,
+    // so the merged composition matches neither published v=13 — bump to 14.
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -582,8 +587,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 13 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(13);
+  test('KNOBS_HASH_VERSION is 14 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

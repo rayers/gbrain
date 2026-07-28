@@ -44,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 13 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825; 12→13 fork-merge union)', () => {
+  test('version is 14 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825; 12→13 fork-merge union; 13→14 embedding-provider migration #3390)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -70,7 +70,12 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
     // (our v=12 never carried hx=; upstream's never carried acmts=), so the
     // merged composition matches neither published v=12 — bump to 13.
-    expect(KNOBS_HASH_VERSION).toBe(13);
+    // #3390/#3391: upstream 12→13 embedding-provider migration wave — legacy
+    // callers hash prov=default across a provider swap, so pre-migration rows
+    // must become unreachable. Fork merge 13→14: that bump and our fork-merge
+    // bump both landed at 13, so the merged composition matches neither
+    // published v=13 — bump to 14.
+    expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

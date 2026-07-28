@@ -784,13 +784,30 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // include_slug_prefixes — into the key via ctx.hardExcludes / the `hx` part;
 // before this it only applied at DB-query build time, so a process with
 // GBRAIN_SEARCH_EXCLUDE set could be served cached rows containing excluded
-// slugs written by a process without it). Our v=12 (fork-merge composition +
-// #1400) never carried `hx`; upstream's v=12 never carried our `acmts`. The
-// merged code carries BOTH, so its key composition matches NEITHER published
-// v=12. Bump to 13 to force the one-time cold-miss and guarantee no stale v=12
-// row (written by either side) is ever served. Same global cold-miss pattern;
-// refills within cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 13;
+// slugs written by a process without it, and vice versa). Our v=12 (fork-merge
+// composition + #1400) never carried `hx`; upstream's v=12 never carried our
+// `acmts`. The merged code carries BOTH, so its key composition matches NEITHER
+// published v=12. Bump to 13 to force the one-time cold-miss and guarantee no
+// stale v=12 row (written by either side) is ever served. Same global cold-miss
+// pattern; refills within cache.ttl_seconds (3600s default).
+//
+// bump 13→14 (fork merge, 2026-07-28): upstream's #3390/#3391 embedding-provider
+// migration wave ALSO claimed v=13 independently. Its rationale: the `prov=`
+// component only isolates callers that thread KnobsHashContext.embeddingModel;
+// legacy callers hash `prov=default` before AND after a provider swap, so a
+// cache row computed against the pre-migration embedding space could be served
+// post-migration. `gbrain migrate embeddings` purges query_cache directly at
+// swap time; their bump is the belt-and-braces for rows written between the
+// #3391 stale-fix (which changes which chunks count as current) and the
+// operator's migration run.
+//
+// Our v=13 (fork-merge composition + `acmts`) never carried that migration-wave
+// semantic; upstream's v=13 never carried our `acmts`. The merged code carries
+// BOTH, so its key composition matches NEITHER published v=13. Bump to 14 to
+// force the one-time cold-miss and guarantee no stale v=13 row (written by
+// either side) is ever served. Same global cold-miss pattern; refills within
+// cache.ttl_seconds (3600s default).
+export const KNOBS_HASH_VERSION = 14;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
