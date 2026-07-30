@@ -75,6 +75,9 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // must become unreachable. Fork merge 13→14: that bump and our fork-merge
     // bump both landed at 13, so the merged composition matches neither
     // published v=13 — bump to 14.
+    // #3430: upstream's compiled_truth boost no longer applies at detail=medium
+    // also reached 14 independently; rows ranked under the old boost semantics
+    // must not be served. Both sides land at 14 and stay at 14.
     expect(KNOBS_HASH_VERSION).toBe(14);
   });
 

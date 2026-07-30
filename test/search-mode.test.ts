@@ -422,6 +422,9 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // so pre-migration cache rows must become unreachable on upgrade. Fork merge
     // 13→14: that bump and our fork-merge bump both landed at 13 independently,
     // so the merged composition matches neither published v=13 — bump to 14.
+    // #3430: upstream's compiled_truth boost no longer applies at detail=medium
+    // also reached 14 independently; cached rows ranked under the old semantics
+    // must become unreachable. Both sides land at 14 and stay at 14.
     expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
@@ -587,7 +590,7 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 14 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave)', () => {
+  test('KNOBS_HASH_VERSION is 14 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave + #3430 compiled_truth boost scope)', () => {
     expect(KNOBS_HASH_VERSION).toBe(14);
   });
 

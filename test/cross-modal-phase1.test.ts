@@ -136,7 +136,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 14 (cross-modal still appended; fork merge folds acmts + relational + input_type + hard-exclude + embedding-provider migration)', () => {
+  test('KNOBS_HASH_VERSION is 14 (cross-modal still appended; fork merge folds acmts + relational + input_type + hard-exclude + embedding-provider migration + upstream #3430 compiled_truth boost scope)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
@@ -155,6 +155,9 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // also claimed 12→13 independently (legacy callers hash prov=default before
     // AND after a provider swap, so pre-migration rows must become unreachable),
     // so the merged composition matches neither published v=13 — bump to 14.
+    // This fork merge: upstream's #3430 (compiled_truth boost no longer applies
+    // at detail=medium) independently also reached v=14; both sides land at 14
+    // and the merged code carries both semantics, so v stays at 14.
     expect(KNOBS_HASH_VERSION).toBe(14);
   });
 
