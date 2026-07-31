@@ -158,7 +158,9 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // This fork merge: upstream's #3430 (compiled_truth boost no longer applies
     // at detail=medium) independently also reached v=14; both sides land at 14
     // and the merged code carries both semantics, so v stays at 14.
-    expect(KNOBS_HASH_VERSION).toBe(14);
+    // 14→15: the resolved FTS configuration name (fts=) — a language switch
+    // plus `reindex-search-vector` must not keep serving pre-switch rows.
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

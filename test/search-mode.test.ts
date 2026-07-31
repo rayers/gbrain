@@ -424,8 +424,12 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // so the merged composition matches neither published v=13 — bump to 14.
     // #3430: upstream's compiled_truth boost no longer applies at detail=medium
     // also reached 14 independently; cached rows ranked under the old semantics
-    // must become unreachable. Both sides land at 14 and stay at 14.
-    expect(KNOBS_HASH_VERSION).toBe(14);
+    // must become unreachable. Both sides land at 14.
+    // Bumped 14→15 to fold the resolved FTS configuration name (fts=) —
+    // GBRAIN_FTS_LANGUAGE retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language must
+    // not survive a `reindex-search-vector` switch.
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {

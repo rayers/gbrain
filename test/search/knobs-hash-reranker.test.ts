@@ -44,7 +44,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 14 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825; 12→13 fork-merge union; 13→14 embedding-provider migration #3390)', () => {
+  test('version is 15 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825; 12→13 fork-merge union; 13→14 embedding-provider migration #3390; 14→15 FTS language)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -58,27 +58,20 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // cannot leak past the new stage. T2: 6→7 title_boost. v0.42.3.0: 7→8
     // autocut. issue #1777: 8→9 archive/ demote (search-exclude policy change
     // isn't in the hash, so the bump invalidates archive-excluded cache rows).
-    // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
-    // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
-    // #1400: upstream 10→11 asymmetric input_type fix — embedQuery() now produces
-    // query-side vectors for asymmetric providers, so rows keyed on pre-fix
-    // document-side query vectors must not be served. Fork merge 11→12: that
-    // #1400 bump and our fork-merge bump both landed at 11, so the merged
-    // composition matches neither published v=11 — bump to 12 for a clean cold-miss.
-    // #2825: upstream 11→12 folds the resolved hard-exclude prefix list (hx=) —
-    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes. Fork
-    // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
-    // (our v=12 never carried hx=; upstream's never carried acmts=), so the
-    // merged composition matches neither published v=12 — bump to 13.
-    // #3390/#3391: upstream 12→13 embedding-provider migration wave — legacy
-    // callers hash prov=default across a provider swap, so pre-migration rows
-    // must become unreachable. Fork merge 13→14: that bump and our fork-merge
-    // bump both landed at 13, so the merged composition matches neither
-    // published v=13 — bump to 14.
-    // #3430: upstream's compiled_truth boost no longer applies at detail=medium
-    // also reached 14 independently; rows ranked under the old boost semantics
-    // must not be served. Both sides land at 14 and stay at 14.
-    expect(KNOBS_HASH_VERSION).toBe(14);
+    // v0.43: 9→10 relational recall arm (rel=/reld=).
+    // #1400: 10→11 asymmetric input_type fix — embedQuery() now produces
+    // query-side vectors for asymmetric providers, so rows keyed on
+    // pre-fix document-side query vectors must not be served.
+    // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
+    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    // FTS language: 14→15 to fold the resolved GBRAIN_FTS_LANGUAGE config
+    // name (fts=). It retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language
+    // must not survive a `reindex-search-vector` language switch.
+    expect(KNOBS_HASH_VERSION).toBe(15);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
