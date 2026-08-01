@@ -2407,7 +2407,7 @@ export class PGLiteEngine implements BrainEngine {
     }
 
     // CONSISTENCY: when chunk_text changes and no new embedding is supplied, BOTH embedding AND
-    // embedded_at must reset to NULL so `embed --stale` correctly picks up the row for re-embedding.
+    // embedded_at must reset to NULL so 'embed --stale' correctly picks up the row for re-embedding.
     // See postgres-engine.ts upsertChunks for the full rationale — pglite mirrors it for parity.
     //
     // Code-chunk metadata columns follow the same chunk_text-gated CASE pattern as `embedding`
@@ -4313,7 +4313,11 @@ export class PGLiteEngine implements BrainEngine {
                  $14, $15,
                  $16, $17, $18, $19,
                  $20
-               ) RETURNING id`
+               )
+               ON CONFLICT (source_id, source_markdown_slug, row_num)
+               WHERE row_num IS NOT NULL
+               DO NOTHING
+               RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
@@ -4327,12 +4331,16 @@ export class PGLiteEngine implements BrainEngine {
                  $15, $16,
                  $17, $18, $19, $20,
                  $21
-               ) RETURNING id`,
+               )
+               ON CONFLICT (source_id, source_markdown_slug, row_num)
+               WHERE row_num IS NOT NULL
+               DO NOTHING
+               RETURNING id`,
           embedStr === null
             ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
             : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
         );
-        out.push(ins.rows[0].id);
+        if (ins.rows[0]) out.push(ins.rows[0].id);
       }
       return out;
     });
@@ -5388,7 +5396,16 @@ export class PGLiteEngine implements BrainEngine {
         (SELECT count(*) FROM links l
          WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = l.to_page_id)
         ) as dead_links,
-        (SELECT count(*) FROM content_chunks WHERE embedded_at IS NULL) as missing_embeddings,
+        -- Parity with postgres-engine.ts: same predicate as
+        -- buildStaleChunkWhere / countStaleChunks, i.e. what 'embed --stale'
+        -- actually processes. 'embedding IS NULL' (not embedded_at, which can
+        -- be non-NULL while embedding is NULL) and embed_skip excluded, so the
+        -- count can reach zero and the embed.stale remediation can converge.
+        (SELECT count(*) FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE cc.embedding IS NULL
+            AND NOT jsonb_exists(COALESCE(p.frontmatter, '{}'::jsonb), 'embed_skip')
+        ) as missing_embeddings,
         (SELECT count(*) FROM links) as link_count,
         (SELECT count(*) FROM entity_pages e
          WHERE EXISTS (SELECT 1 FROM links l WHERE l.to_page_id = e.id))::float /
