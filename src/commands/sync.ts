@@ -65,7 +65,11 @@ import {
   slog,
   serr,
 } from '../core/console-prefix.ts';
-import { loadStorageConfig } from '../core/storage-config.ts';
+import { loadStorageConfig, findDbOnlyCollisions } from '../core/storage-config.ts';
+// #2788: collector-output vs db_only collision warning at .gitignore-write
+// time. integrations.ts is side-effect-free at module load (pure recipe I/O
+// helpers), so a static import is safe here.
+import { getConfiguredCollectorOutputs } from './integrations.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // v0.41.32.0: stamp the durable newest-COMMIT timestamp at sync time so the
 // remote staleness path reads a column instead of shelling out to git.
@@ -2003,7 +2007,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   serr(`[gbrain phase] sync.detect_head`);
   // Detect detached HEAD up front so the working-tree fallback fires for both
   // the default sync and `--no-pull` callers. Only the actual git pull is
-  // gated on opts.noPull.
+  // gated on opts.noPull or opts.dryRun.
   const detachedHead = isDetachedHead(gitContextRoot);
   if (detachedHead && !opts.noPull) {
     // Print the caller's repoPath spelling (not the realpathed git root) —
@@ -2011,7 +2015,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     serr(`Detached HEAD on ${repoPath}; skipping git pull. Syncing from local working tree.`);
   }
 
-  // Git pull (unless --no-pull). v0.28.1 codex finding (HIGH): the legacy
+  // Git pull (unless --no-pull or --dry-run). v0.28.1 codex finding (HIGH): the legacy
   // git() helper at sync.ts:192 spawns git without GIT_SSRF_FLAGS, so
   // every steady-state pull was bypassing the redirect/submodule/protocol
   // hardening that cloneRepo applies. Route through pullRepo from
@@ -2063,7 +2067,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // while #1430's writeSyncAnchor gate covers the case upstream leaves exit-0
   // and heartbeat-fresh (pull failed, but local commits still imported).
   let pullFailed = false;
-  if (!opts.noPull && !detachedHead && originRemotePresent) {
+  if (!opts.dryRun && !opts.noPull && !detachedHead && originRemotePresent) {
     const _t0 = Date.now();
     serr(`[gbrain phase] sync.git_pull start`);
     try {
@@ -2428,6 +2432,31 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
   }
 
+  const totalChanges = filtered.added.length + filtered.modified.length +
+    filtered.deleted.length + filtered.renamed.length;
+
+  // Dry run
+  if (opts.dryRun) {
+    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${headCommit.slice(0, 8)}`);
+    if (filtered.added.length) slog(`  Added: ${filtered.added.join(', ')}`);
+    if (filtered.modified.length) slog(`  Modified: ${filtered.modified.join(', ')}`);
+    if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
+    if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
+    if (totalChanges === 0) slog(`  No syncable changes.`);
+    return {
+      status: 'dry_run',
+      fromCommit: lastCommit,
+      toCommit: headCommit,
+      added: filtered.added.length,
+      modified: filtered.modified.length,
+      deleted: filtered.deleted.length,
+      renamed: filtered.renamed.length,
+      chunksCreated: 0,
+      embedded: 0,
+      pagesAffected: [],
+    };
+  }
+
   // Delete pages that became un-syncable (modified but filtered out).
   // v0.20.0 Cathedral II SP-5: resolveSlugForPath picks the right slug shape
   // (markdown vs code) based on the chunker's classifier, so a Rust file that
@@ -2473,31 +2502,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         slog(`  Deleted un-syncable page: ${slug}`);
       }
     } catch { /* ignore */ }
-  }
-
-  const totalChanges = filtered.added.length + filtered.modified.length +
-    filtered.deleted.length + filtered.renamed.length;
-
-  // Dry run
-  if (opts.dryRun) {
-    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${headCommit.slice(0, 8)}`);
-    if (filtered.added.length) slog(`  Added: ${filtered.added.join(', ')}`);
-    if (filtered.modified.length) slog(`  Modified: ${filtered.modified.join(', ')}`);
-    if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
-    if (filtered.renamed.length) slog(`  Renamed: ${filtered.renamed.map(r => `${r.from} -> ${r.to}`).join(', ')}`);
-    if (totalChanges === 0) slog(`  No syncable changes.`);
-    return {
-      status: 'dry_run',
-      fromCommit: lastCommit,
-      toCommit: headCommit,
-      added: filtered.added.length,
-      modified: filtered.modified.length,
-      deleted: filtered.deleted.length,
-      renamed: filtered.renamed.length,
-      chunksCreated: 0,
-      embedded: 0,
-      pagesAffected: [],
-    };
   }
 
   if (totalChanges === 0) {
@@ -5677,6 +5681,24 @@ export function manageGitignore(
   }
   if (!storageConfig || storageConfig.db_only.length === 0) {
     return;
+  }
+
+  // #2788: a configured collector whose output dir sits inside a db_only
+  // path dies silently — the dir is auto-gitignored below, the git-walking
+  // sync never sees its files, and `gbrain import` honors .gitignore too.
+  // Warn at the moment the config takes effect. Recipe scan failure never
+  // blocks the gitignore housekeeping.
+  try {
+    for (const c of findDbOnlyCollisions(getConfiguredCollectorOutputs(), storageConfig.db_only)) {
+      console.warn(
+        `WARNING: collector '${c.id}' writes to '${c.output_path}', which is inside db_only path ` +
+          `'${c.db_only_dir}'. db_only dirs are auto-gitignored, so gbrain sync and gbrain import ` +
+          `will silently skip its files. Remove the prefix from storage.db_only in gbrain.yml, or ` +
+          `move the collector output.`,
+      );
+    }
+  } catch {
+    // recipes unavailable in this context — the doctor check still covers it
   }
 
   // D4 soft-warn: storage tiering has limited effect on PGLite, but the
