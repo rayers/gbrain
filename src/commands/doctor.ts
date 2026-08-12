@@ -67,6 +67,13 @@ import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/sourc
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
 import { unverifiedExtractionFragment } from '../core/extraction-review.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
+// Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
+import { readReceipt } from '../core/bootstrap/format.ts';
+import { probeLivePgliteHolder, resolveBrainDataDir } from '../core/bootstrap/uninstall.ts';
+import { readRunbookStamp, hooksInstalled, listVerifyRuns } from '../core/bootstrap/status.ts';
+import { resolveGbrainHome } from '../core/gbrain-home.ts';
+import { VERSION as GBRAIN_BINARY_VERSION } from '../version.ts';
+import { execFileSync } from 'child_process';
 
 export interface Check {
   name: string;
@@ -425,6 +432,119 @@ export async function jsonbIntegrityCheck(
   }
 }
 
+/**
+ * Per-channel push-context visibility (harness hook adapters). Groups
+ * context_volunteer_events by channel over the last 7 days so the operator
+ * can see which adapters (ambient reflex / op / watch / claude-code / codex)
+ * are actually firing. Engine-aware SIBLING of buildRetrievalReflexCheck
+ * (which is engine-free and heartbeat-file based) — deliberately a separate
+ * check so the existing builder keeps its signature.
+ *
+ * Info-only (never warn/fail on quiet channels — most installs use a subset).
+ * The message distinguishes the two "installed but nothing happens" classes:
+ * a hook script that never registered (restart the harness session) vs a
+ * registered adapter whose channel went quiet. Pre-v117 brains (no events
+ * table) return ok with a note instead of throwing. A serve started before
+ * this build logs hook traffic as 'reflex' — restart serve after upgrade.
+ */
+export async function checkVolunteerChannels(
+  engine: BrainEngine,
+  opts: { sourceIds?: string[] } = {},
+): Promise<Check> {
+  const name = 'volunteer_channels';
+  try {
+    // Source scoping (cross-model P1): remote source-bound callers pass their
+    // authorized ids — an unqualified aggregate would leak other sources'
+    // activity counts/timestamps. Local trusted doctor passes none (brain-wide).
+    // Unscoped shape: no source_id predicate → the composite
+    // (source_id, volunteered_at DESC) index can't range-scan and this
+    // seq-scans the table. Accepted DELIBERATELY for the local info check
+    // (table is TTL-pruned at 90 days) — do NOT reuse on a hot path.
+    const scoped = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
+    const rows = await engine.executeRaw<{ channel: string; n: string | number; last_fired: string | Date | null }>(
+      scoped
+        ? `SELECT channel, count(*)::int AS n, max(volunteered_at) AS last_fired
+             FROM context_volunteer_events
+            WHERE source_id = ANY($1::text[])
+              AND volunteered_at > now() - interval '7 days'
+            GROUP BY channel
+            ORDER BY channel`
+        : `SELECT channel, count(*)::int AS n, max(volunteered_at) AS last_fired
+             FROM context_volunteer_events
+            WHERE volunteered_at > now() - interval '7 days'
+            GROUP BY channel
+            ORDER BY channel`,
+      scoped ? [opts.sourceIds] : [],
+    );
+    const channels: Record<string, { count: number; last_fired: string | null }> = {};
+    for (const r of rows) {
+      channels[r.channel] = {
+        count: Number(r.n),
+        last_fired: r.last_fired ? new Date(r.last_fired).toISOString() : null,
+      };
+    }
+    const active = Object.keys(channels);
+
+    // RT reconciliation: server-side delivery counts fire at the response
+    // write — a hook client that timed out / hit its deadline / trimmed to
+    // nothing still gets counted. The hook's own heartbeat records those
+    // degradations, so surface the degraded rate next to the counts: a
+    // "healthy" channel with a mostly-degraded heartbeat is delivery failure.
+    let heartbeatNote = '';
+    let heartbeat: { user_prompt_ok: number; user_prompt_degraded: number } | undefined;
+    try {
+      const { readHeartbeatTail } = await import('./hook.ts');
+      const tail = await readHeartbeatTail(200);
+      // Same 7-day window as the event counts (a month-old degraded streak
+      // must not indict a healthy current week), and a minimum sample floor
+      // so one bad entry can't trigger the caution.
+      const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const up = tail.filter(
+        (e) => e.event === 'user-prompt' && Date.parse(e.ts ?? '') >= cutoff,
+      );
+      if (up.length >= 5) {
+        const degraded = up.filter((e) => e.outcome !== 'ok').length;
+        heartbeat = { user_prompt_ok: up.length - degraded, user_prompt_degraded: degraded };
+        if (degraded > up.length / 2) {
+          heartbeatNote = ` — CAUTION: the hook heartbeat shows ${degraded}/${up.length} user-prompt events degraded this week, so server-side counts may overstate what was actually injected`;
+        }
+      }
+    } catch { /* heartbeat surface is best-effort */ }
+
+    // Engine-aware quiet-channel guidance: the harness-hook lane rides the
+    // PGLite serve socket — on a Postgres brain, "check your registration and
+    // restart" can never make the channel fire (pull-mode covers Postgres).
+    const cfg = (() => { try { return loadConfig(); } catch { return null; } })();
+    const quietGuidance =
+      cfg?.engine === 'pglite'
+        ? 'if a hook adapter is installed, confirm its registration landed and the harness session was RESTARTED (hooks snapshot at session start); a serve older than this build logs NOTHING for the hook lane — restart serve on the new build to activate the feedback loop'
+        : 'note: the harness-hook channels require a PGLite serve socket — on this engine the hook lane stays quiet by design (pull-mode retrieval covers it)';
+    const message = active.length
+      ? `push-context channels active (7d): ${active.map((c) => `${c}=${channels[c].count}`).join(', ')}${heartbeatNote}`
+      : `no push-context activity in 7 days — ${quietGuidance}`;
+    return {
+      name,
+      status: 'ok',
+      message,
+      details: { window_days: 7, channels, ...(heartbeat ? { hook_heartbeat: heartbeat } : {}) },
+    };
+  } catch (e) {
+    // Discriminate table-absent (pre-v117 brain) from transient failures —
+    // a connection blip on a fully-migrated brain must not be misreported
+    // as an old schema. Info-only either way; never block doctor.
+    const msg = e instanceof Error ? e.message : String(e);
+    const tableAbsent = /does not exist|undefined table|no such table|42P01/i.test(msg);
+    return {
+      name,
+      status: 'ok',
+      message: tableAbsent
+        ? 'volunteer-events table not available (pre-v117 brain) — per-channel push visibility inactive'
+        : `volunteer_channels query failed (info-only check; may or may not be transient): ${msg}`,
+      details: { window_days: 7, channels: {} },
+    };
+  }
+}
+
 export async function takesWeightGridCheck(engine: BrainEngine): Promise<Check> {
   try {
     const rows = await engine.executeRaw<{ off_grid: string | number; total: string | number }>(
@@ -658,7 +778,10 @@ export async function checkSourceConfigShape(engine: BrainEngine): Promise<Check
   }
 }
 
-export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorReport> {
+export async function doctorReportRemote(
+  engine: BrainEngine,
+  opts: { sourceIds?: string[] } = {},
+): Promise<DoctorReport> {
   const checks: Check[] = [];
 
   // 1. Connection
@@ -916,6 +1039,12 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // next subagent job submission. (Layers 1+2 also enforce — this is the
   // surfacing layer.)
   checks.push(await checkSubagentCapability(engine));
+
+  // Harness hook adapters — per-channel push-context visibility (sibling of
+  // the engine-free retrieval_reflex_health heartbeat check). Source-scoped
+  // for remote callers (cross-model P1): a source-bound token must not see
+  // other sources' activity counts/timestamps.
+  checks.push(await checkVolunteerChannels(engine, { sourceIds: opts.sourceIds }));
 
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
@@ -5177,6 +5306,14 @@ export async function buildChecks(
     checks.push(buildRetrievalReflexCheck(skillsDir));
   }
 
+  // 1b-2. Per-channel push-context visibility (the hook lane's feedback
+  // loop). Engine-aware sibling of the reflex heartbeat check above — the
+  // LOCAL `gbrain doctor` is the primary operator surface for this, so it
+  // runs here as well as on the remote report path. Skipped in fs-only mode.
+  if (scope === 'all' && engine && !fastMode) {
+    checks.push(await checkVolunteerChannels(engine));
+  }
+
   // 1c. MEMORY_VERBS v1 usage sidecar health (Cathedral 1, E4). Read-only,
   // fail-open: reports whether the local JSONL sidecar is present + parseable
   // and when a verb last fired. Local file only — never uploaded.
@@ -5215,6 +5352,12 @@ export async function buildChecks(
   if (scope === 'all' && skillsDir) {
     checks.push(skillsManifestIntegrityCheck(skillsDir));
   }
+
+  // 2d. Agent-bootstrap health (plan B2/B4/ENG-4). Filesystem-first; the
+  // one engine-dependent pairing check degrades gracefully when engine is
+  // null. Emits NOTHING on machines with no bootstrap state, so ordinary
+  // brains keep a clean doctor.
+  checks.push(...(await bootstrapDoctorChecks(engine)));
 
   // 3. Half-migrated Minions detection (filesystem-only).
   // If completed.jsonl has any status:"partial" entry with no later
@@ -6367,7 +6510,7 @@ export async function buildChecks(
           status: 'warn',
           message:
             'Auto-RLS event trigger missing. New tables created outside gbrain may not get RLS. ' +
-            'Fix: gbrain apply-migrations --force-retry 35',
+            'Fix: recreate it with the SQL in docs/guides/rls-and-you.md ("What if the trigger gets dropped?").',
         });
       } else if (rows[0].evtenabled !== 'O' && rows[0].evtenabled !== 'A') {
         checks.push({
@@ -8182,6 +8325,172 @@ export async function buildChecks(
  * test/doctor-behavioral.test.ts for the in-process seam coverage and
  * test/doctor-cli-smoke.test.ts for the subprocess wrapper coverage.
  */
+/**
+ * Agent-bootstrap check group (plan B2, B4, ENG-4, one-live-serve, C1 skew).
+ *
+ * Gated on bootstrap state actually existing on this machine (install
+ * receipt, hook heartbeat, or push-status) — machines that never ran
+ * `gbrain bootstrap` get ZERO checks from this group. Every probe is
+ * fail-soft: a broken telemetry file degrades to a warn, never a throw.
+ */
+export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise<Check[]> {
+  const checks: Check[] = [];
+  let home: string;
+  try {
+    home = resolveGbrainHome();
+  } catch {
+    return [];
+  }
+  const receipt = readReceipt(home);
+  const pushStatusFile = join(home, 'bootstrap', 'push-status.json');
+  const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
+  const hasBootstrapState = receipt !== null || existsSync(pushStatusFile) || existsSync(heartbeatFile);
+  if (!hasBootstrapState) return [];
+
+  const ws = receipt?.workspace_dir ?? null;
+
+  // 1. Hook heartbeat failure rate [B3 read side]. Hard errors only —
+  // degraded entries are DESIGNED fallbacks (pull-mode, no serve).
+  let hooksSeen = false;
+  try {
+    const { readHeartbeatTail, HEARTBEAT_FAILURE_WINDOW, HEARTBEAT_FAILURE_RATE_THRESHOLD } =
+      await import('./hook.ts');
+    const tail = await readHeartbeatTail(HEARTBEAT_FAILURE_WINDOW);
+    if (tail.length > 0) {
+      hooksSeen = true;
+      const failures = tail.filter((e) => e.outcome === 'error').length;
+      const rate = failures / tail.length;
+      if (rate > HEARTBEAT_FAILURE_RATE_THRESHOLD) {
+        checks.push({
+          name: 'bootstrap_hooks_heartbeat',
+          status: 'fail',
+          message: `${failures}/${tail.length} recent hook invocations hard-failed — brain context is not reaching the session. Check \`gbrain bootstrap verify\` and the serve process.`,
+        });
+      } else if (rate > 0.2) {
+        checks.push({
+          name: 'bootstrap_hooks_heartbeat',
+          status: 'warn',
+          message: `${failures}/${tail.length} recent hook invocations hard-failed. Watch it; hooks fail open so sessions still work.`,
+        });
+      } else {
+        checks.push({
+          name: 'bootstrap_hooks_heartbeat',
+          status: 'ok',
+          message: `hook heartbeat healthy (${failures}/${tail.length} hard failures in the trailing window)`,
+        });
+      }
+    }
+  } catch {
+    checks.push({ name: 'bootstrap_hooks_heartbeat', status: 'warn', message: 'hook heartbeat unreadable' });
+  }
+
+  // 2. Push staleness [B4]: fail when the last successful push is >48h old
+  // AND the workspace tree is dirty (recent work provably unpushed).
+  try {
+    if (existsSync(pushStatusFile)) {
+      const { PUSH_STALE_MS } = await import('./hook.ts'); // hook.ts owns the threshold (single source)
+      const s = JSON.parse(readFileSync(pushStatusFile, 'utf8')) as { ts?: string; ok?: boolean; reason?: string };
+      const t = s.ts ? Date.parse(s.ts) : NaN;
+      const stale = Number.isFinite(t) && Date.now() - t > PUSH_STALE_MS;
+      let dirty = false;
+      if (ws) {
+        try {
+          dirty = execFileSync('git', ['-C', ws, 'status', '--porcelain'], {
+            stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000,
+          }).toString().trim() !== '';
+        } catch { dirty = false; }
+      }
+      if (s.ok === false) {
+        checks.push({
+          name: 'bootstrap_push_health',
+          status: 'warn',
+          message: `last workspace push FAILED (${s.ts ?? 'unknown'}): ${s.reason ?? 'unknown'} — run \`gbrain sources push${ws ? ` --path ${ws}` : ''}\``,
+        });
+      } else if (stale && dirty) {
+        checks.push({
+          name: 'bootstrap_push_health',
+          status: 'fail',
+          message: `last successful push ${s.ts} (>48h) with a DIRTY workspace tree — recent agent memory is unpushed [B4]. Run \`gbrain sources push --path ${ws}\`.`,
+        });
+      } else if (stale) {
+        checks.push({ name: 'bootstrap_push_health', status: 'warn', message: `last successful push ${s.ts} (>48h ago); tree clean — likely just idle` });
+      } else {
+        checks.push({ name: 'bootstrap_push_health', status: 'ok', message: `last push ok (${s.ts ?? 'unknown'})` });
+      }
+    }
+  } catch {
+    checks.push({ name: 'bootstrap_push_health', status: 'warn', message: 'push-status.json unreadable' });
+  }
+
+  // 3. One-live-serve / lock collision note. A live serve is the healthy
+  // shape (it provides hook IPC); the note names the v1 contract.
+  try {
+    const dataDir = resolveBrainDataDir(home);
+    const holder = probeLivePgliteHolder(dataDir);
+    if (holder) {
+      checks.push({
+        name: 'bootstrap_serve_lock',
+        status: holder.serve ? 'ok' : 'warn',
+        message: holder.serve
+          ? `live serve (pid ${holder.pid}) owns the brain — hook IPC available. One live serve per brain is the v1 contract; a second simultaneous session collides politely.`
+          : `a non-serve gbrain process (pid ${holder.pid}) holds the PGLite lock — hook IPC and new sessions will fail until it exits.`,
+      });
+    }
+  } catch { /* probe is best-effort */ }
+
+  // 4. [ENG-4] Hooks-in-use + unmigrated brain: the direct-engine hook paths
+  // swallow missing-table errors on pre-v110/v117 schemas, so context
+  // degrades SILENTLY. Pair the two signals into a named warning.
+  const hooksActive = hooksSeen || (ws !== null && hooksInstalled(ws));
+  if (hooksActive && engine) {
+    try {
+      const versionStr = await engine.getConfig('version');
+      const version = parseInt(versionStr || '0', 10);
+      if (version < LATEST_VERSION) {
+        checks.push({
+          name: 'bootstrap_hook_schema_pairing',
+          status: 'warn',
+          message: `hooks are in use but the brain schema is v${version} (< v${LATEST_VERSION}) — hook context can degrade silently on missing tables [ENG-4]. Run \`gbrain apply-migrations --yes\`.`,
+        });
+      }
+    } catch { /* schema_version check above already covers unreadable version */ }
+  }
+
+  // 5. Runbook skew [C1]: the fetched runbook's stamp vs this binary.
+  if (ws) {
+    try {
+      const stamp = readRunbookStamp(ws);
+      if (stamp !== null && stamp !== GBRAIN_BINARY_VERSION) {
+        checks.push({
+          name: 'bootstrap_runbook_skew',
+          status: 'warn',
+          message: `BOOTSTRAP_FOR_AGENTS.md stamp ${stamp} != installed binary ${GBRAIN_BINARY_VERSION} — prefer the binary's instructions; re-fetch the runbook.`,
+        });
+      }
+    } catch { /* best effort */ }
+  }
+
+  // 6. Last verify freshness [B2 read side] — surfaced so "verify weekly"
+  // has a nag with teeth.
+  try {
+    const runs = listVerifyRuns(home);
+    if (runs.length > 0) {
+      const last = runs[0];
+      const t = Date.parse(last.ts);
+      const ageDays = Number.isFinite(t) ? (Date.now() - t) / 86_400_000 : NaN;
+      if (!last.ok) {
+        checks.push({ name: 'bootstrap_last_verify', status: 'warn', message: `last bootstrap verify FAILED (${last.ts}): ${last.checks_failed.join(', ') || 'see snapshot'} — re-run \`gbrain bootstrap verify\`` });
+      } else if (Number.isFinite(ageDays) && ageDays > 14) {
+        checks.push({ name: 'bootstrap_last_verify', status: 'warn', message: `last bootstrap verify passed ${Math.floor(ageDays)}d ago — re-run it as the workspace rot self-check` });
+      } else {
+        checks.push({ name: 'bootstrap_last_verify', status: 'ok', message: `last verify passed (${last.ts})` });
+      }
+    }
+  } catch { /* best effort */ }
+
+  return checks;
+}
+
 export async function runDoctor(
   engine: BrainEngine | null,
   args: string[],

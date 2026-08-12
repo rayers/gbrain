@@ -2,6 +2,111 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.45.2.0] - 2026-08-11
+
+**Make your agent's repo yourself, then let it move in.** If you'd rather own the GitHub repo up front, create a new empty private repo under your own account, clone it, open it in Claude Code or Codex, and paste the bootstrap block — bootstrap now detects your empty repo and adopts it instead of creating one, verifying it is private before anything is pushed. The default (open an empty folder and let bootstrap make the repo) is unchanged and now stated plainly in the docs. Either way, the folder you open becomes your agent's durable, private body.
+
+### Added
+- **Create-repo-first bootstrap.** `gbrain bootstrap repo` adopts an empty, private, personally-owned GitHub repo you created, instead of only ever creating one. The README (Claude Code + Codex), the bootstrap runbook, and the bootstrap guide now lead with the repo and document both paths (open an empty folder, or bring your own empty repo).
+
+### Changed
+- Bootstrap now reports how the repo was set up — created, adopted, or already pushed.
+
+### Fixed
+- Pointing bootstrap at a repo that already has content no longer reports success without pushing your workspace. It stops with a clear message: make an empty repo, or run `gbrain bootstrap attach` for an existing agent clone.
+- Adopting a repo on a fresh machine no longer fails at the first commit — a repo-local git identity is set on the adopt path, not just the create path.
+- A failed first push no longer looks "done" on the next run: the repo is recorded only after the push succeeds, so a re-run resumes instead of skipping.
+- The pre-push secret scan now also covers an already-committed tree, and a failure to enumerate files stops the push instead of passing silently.
+- Automatic per-turn and session-end pushes wait until the repo phase has verified the repo is private, so nothing is published to an unverified remote.
+
+To take advantage of v0.45.2.0: upgrade with `bun install -g github:garrytan/gbrain#latest-stable`. Nothing to migrate. To use the new path, create an empty private repo under your own account, clone it, open it in your agent, and run the bootstrap block — it adopts your repo. If anything about the repo or push looks off, `gbrain doctor` names it with the exact fix.
+## [0.45.1.0] - 2026-08-11
+
+**Your per-prompt brain hooks are now measurable and non-repetitive.** v0.45.0.0's paste-in agent install gave every prompt a context injection; this release makes that channel behave like a product instead of a firehose. The hook remembers what it already told you — a page it injected earlier in the session isn't re-injected every time the name comes up — and every delivery now lands in the same precision feedback loop the other push channels use, so `gbrain volunteer-context --stats` and a new doctor check show exactly which harnesses are firing and how useful their pushes are.
+
+### Added
+- **Cross-turn dedupe for the per-prompt hook.** `gbrain hook user-prompt` reads its own previous injections back out of the session transcript (recorded as structured attachments — verified against a live Claude Code session) and suppresses re-volunteering, so a page is pushed once per session, not once per mention. The dedupe input is deduplicated and byte-capped, only gbrain-marked blocks count (another tool's hook output can't silence your brain), and the extraction is structural — a slug appearing in some tool payload can't over-suppress.
+- **Per-harness feedback loop.** Delivered hook context now logs to the volunteered-pages feedback table under its harness channel (`claude-code` today; `--harness codex` reserved for a codex hook registration), counted at the delivery point only — a block the hook abandoned mid-deadline is never counted, and the hook records partial trims so drift is visible.
+- **`volunteer_channels` doctor check** on both the local and remote doctor: per-channel activity over the last 7 days, with guidance that distinguishes "hook installed but never registered (restart the session)" from "registered but quiet", engine-aware messaging, and a caution when the hook's own heartbeat shows deliveries mostly degrading.
+
+### Changed
+- The turn-context IPC response now carries the post-budget volunteered pages, and the request carries an attribution channel — both additive; older serves and clients interoperate unchanged (an older serve simply doesn't log hook deliveries until restarted).
+- When a turn-context request exceeds the IPC message cap, the advisory dedupe payload is dropped before any conversation turn — context quality is never sacrificed to preserve a hint.
+
+### Fixed
+- A remote doctor report requested with a source-scoped token no longer aggregates push-activity metadata across sources it isn't authorized for.
+- The IPC connection handler processes exactly one request per connection — trailing bytes can no longer double-process a request (which would have double-counted deliveries).
+- A transient database error during the doctor's channel check is no longer misreported as an old-schema brain.
+
+## To take advantage of v0.45.1.0
+
+No migration and no re-registration needed. **Restart your `gbrain serve`** (or
+just restart the harness session — it respawns the MCP serve) so the new
+delivery logging activates; hooks registered by `gbrain bootstrap` pick up the
+dedupe automatically on the next prompt. Then check the loop is live:
+
+```bash
+gbrain volunteer-context --stats   # per-channel precision, incl. claude-code
+gbrain doctor                      # look for the volunteer_channels check
+```
+
+## [0.45.0.0] - 2026-08-10
+
+**Your coding agent can now become your personal agent.** Paste one block into Codex or Claude Code and it sets itself up as a persistent agent with a memory that survives across sessions: it interviews you, writes its own identity files from your answers, spins up a local brain, and keeps a private GitHub repo as its durable body. Close the laptop and reopen it tomorrow, and it still knows who you are, who you're talking to, and what you told it last time. This is the OpenClaw/Hermes experience — identity, memory, schedules, persistence — running on the subscription you already pay for, with nothing to deploy.
+
+**Start with Codex.** It runs on your ChatGPT subscription, takes about fifteen minutes, and deploys nothing. Claude Code is the same install. OpenClaw and Hermes are still the way to run GBrain exactly as designed — always on, enriching around the clock — at real server and API cost; Codex is the recommended first step for anyone new to GBrain.
+
+### How to use it
+
+Pick the folder that will become your agent's home and paste (Codex shown; the Claude Code block is identical):
+
+```
+Read and follow every step of:
+https://raw.githubusercontent.com/garrytan/gbrain/latest-stable/BOOTSTRAP_FOR_AGENTS.md
+Goal: set yourself up as my persistent personal agent in this folder, with gbrain
+as your memory. Interview me before writing any identity file — never invent
+answers. Ask before anything destructive. You are not done until
+`gbrain bootstrap verify` exits 0.
+```
+
+The agent runs `gbrain bootstrap` — a new command family (`status`, `interview`, `render`, `repo`, `hooks`, `verify`, `attach`, `uninstall`) that drives the whole install. It works with **zero API keys**: your harness's model is the LLM, so the agent authors memory directly and search runs keyword-only; add one optional key (OpenAI, Anthropic, or Voyage) to unlock semantic search and automatic fact extraction. Everything is consent-gated — hooks, background push, MCP scope — and nothing runs while your harness is closed (the honest desktop contract; true 24/7 is what a hosted brain adds).
+
+### What you get
+
+- **A memory that compounds.** On Claude Code, session hooks inject relevant brain context at the start of each prompt and ingest the transcript when the session ends; on Codex, the rendered `AGENTS.md` carries the same pull protocol. Facts you state get written back through the brain's own tools and resurface next session.
+- **A portable body.** Your workspace is a private GitHub repo (privacy verified via the API before anything is pushed, secret-scanned before every commit). Clone it on a second machine and run `gbrain bootstrap attach`. It mounts anywhere GBrain runs — the exit plan if a provider ever changes its terms.
+- **Multi-model install.** Works in the ChatGPT desktop app, the Codex CLI, Claude Code desktop, and the Claude Code CLI. Same body format, two doors.
+
+### What to know after upgrading
+
+Existing installs are untouched — this is a new, opt-in surface. If you want it, run the paste block in a fresh folder. `gbrain doctor` gained bootstrap health checks (hook heartbeat, push staleness, serve/lock collisions, runbook skew); if anything looks off after an install, `gbrain doctor` names it and prints the fix.
+
+### What we caught and fixed before merging
+
+This shipped through a full review pass (architecture, security, adversarial, cross-model). Highlights, in plain terms: the credential scanner now recognizes today's API-key formats and reads the exact bytes being committed rather than a stale snapshot, so a key can't slip through a timing gap; private-key material is redacted whole, not just its header; and the scanner fails safe — an unreadable or oversized file blocks the push instead of passing unscanned. The GitHub repo is confirmed to belong to you and to be private before any content leaves the machine.
+
+## To take advantage of v0.45.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor`
+warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **To try the new agent-bootstrap surface,** paste the block above into Codex
+   or Claude Code in a fresh folder, or read
+   [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) for the full contract.
+   Existing brains need no action — bootstrap is an opt-in new surface, not a
+   change to how your current install works.
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor
+   gbrain stats
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`
+   and `~/.gbrain/upgrade-errors.jsonl` if it exists.
 ## [0.44.1.0] - 2026-08-11
 
 **Any current model works now. gbrain stops rejecting model ids it hasn't heard of.**

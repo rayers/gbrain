@@ -7,7 +7,7 @@ Deferred from the BrainBench wave (eng-reviewed; plan + GSTACK REVIEW REPORT at
 
 - [ ] **`--live` agent-in-the-loop know-to-ask.** Replay fixtures with a real model deciding whether to issue retrieval calls; grade the agent, not just the deterministic reflex. Pre-registered in `docs/eval/BRAINBENCH.md` (the v1 metric grades the injection decision, which IS the shipped mechanism). Needs: seeded N-repeat methodology for model stochasticity + budget rails. Priority: P2.
 - [ ] **Intrusion-budget gating calibration.** `avg_injected_tokens` is reported, non-gating (decision 18) — a wrong threshold is worse than none. After a few weeks of scoreboard data across PRs, pick calibrated per-seam thresholds and promote it to a gated metric. Priority: P2.
-- [ ] **Flip contract adapters to production when real integrations land.** `adapters/claude-code.ts` exports the UserPromptSubmit hook wire types; the real hook swaps the in-process transport for an exec of the hook script and flips `seam: 'contract'` → `'production'` with continuous bench numbers. Same for codex fragments. This is the integration PR's checklist item — without it the seam disclosure goes stale. Priority: P1 (attached to the harness-integration PR, not standalone).
+- [ ] **Flip contract adapters to production — claude-code half now unblocked.** `adapters/claude-code.ts` exports the UserPromptSubmit hook wire types; the real hook (`gbrain hook user-prompt`, shipped with the bootstrap lane and extended with cross-turn dedupe + the channel feedback loop in the cathedral-3 convergence) swaps the in-process transport for an exec of the hook script and flips `seam: 'contract'` → `'production'` with continuous bench numbers. Note the production hook also exercises transcript-based dedupe, which the memoryless contract row deliberately doesn't. Same for codex fragments when that integration lands. Priority: P1 (the claude-code integration has landed; this is now standalone-actionable).
 - [ ] **Cathedral 1 conformance-kit fixture import.** The memory-verbs conformance scenarios convert to BrainBench fixtures via the published `evals/brainbench/schema/fixture.schema.json` once `garrytan/cathedral-1` merges ("conformance tests double as BrainBench seed fixtures", decision log 2026-06-12). Free corpus growth from already-reviewed scenarios. Blocked by: cathedral-1 on master. Priority: P2.
 - [ ] **Live-embeddings fidelity mode (`--embeddings`).** Hermetic CI grades the keyword/alias arms only (disclosed); an opt-in mode seeding real embeddings would grade write-back/continuity retrieval through the vector path. Same budget rails as `--llm`. Priority: P3.
 - [ ] **Community fixture intake + competitor adapters.** The TD1 remainder after the generated corpus absorbed in-PR growth: an `external-authors/`-style intake path for contributed fixtures (validator + privacy guard already gate them) and adapters for non-gbrain memory systems against the published schemas, enabling true head-to-head rows in the gbrain-evals scorecard. Priority: P3.
@@ -491,6 +491,42 @@ Deferred from the #2139 delta-estimator wave. See plan + GSTACK REVIEW REPORT at
   filed embedding-latency-by-minutes complaint. **Start:** thread per-source estimates
   through `runOne` (`src/commands/sync.ts`); design worked out at D8A in the plan.
 
+## Harness hook lane follow-ups (filed from the cathedral-3 convergence)
+
+Filed when the cathedral-3 branch converged its push-adapter work into the
+#3975 hook lane (feedback loop + cross-turn dedupe for `gbrain hook
+user-prompt`). Context: the hook lane now logs channel-attributed volunteer
+events at the IPC delivery point and dedupes via the transcript's
+`hook_additional_context` attachments.
+
+- [ ] **P3 — PostToolUse / mid-turn push adapter, evaluated against per-channel stats.**
+  The user-prompt hook fires at prompt time only; entities that first appear mid-turn
+  in tool output (a file opened, a person named in a search result) get no pointer
+  until the NEXT prompt. Harnesses expose a PostToolUse hook, but it fires dozens of
+  times per turn (one `gbrain hook` process spawn each). Now that the feedback loop
+  exists, the per-channel `--stats` precision + volume data is exactly the evidence
+  needed to decide. **Trigger:** claude-code channel stats showing healthy precision
+  plus user reports of "it only noticed on my next message". **Start:**
+  `src/commands/hook.ts` (the event already has a dispatch slot pattern),
+  `src/core/bootstrap/hooks.ts` registration writers.
+- [ ] **P3 — engine-uniform IPC listener (Postgres serves).** serve's resolve/turn_context
+  socket is PGLite-gated (`src/mcp/server.ts`: `cfg?.engine === 'pglite'`), so on a
+  Postgres brain `gbrain hook user-prompt` short-circuits (`no_pglite_path`) and the
+  hook lane is PGLite-only. Extending the listener needs (a) a canonical per-connection
+  socket path for brains with no data dir (e.g. `~/.gbrain/run/resolve-<hash12(database_url)>.sock`,
+  0700 dir) and (b) a secret-file home for `turn_context` auth (same hash-keyed run dir).
+  The cathedral-3 branch prototyped (a) as `resolveSocketPathForConfig` (see branch
+  history at commit 2350294c) before the convergence dropped it pending the secret
+  design. **Trigger:** a Postgres-brain user asking why hooks stay silent. **Start:**
+  `src/core/context/resolve-ipc.ts` socket-path helpers + `src/mcp/server.ts` listener gate
+  + `src/commands/hook.ts:no_pglite_path` branch.
+- [ ] **P3 — thin-client remote push route.** Thin-client installs (remote_mcp) have no
+  local engine and no serve socket — every push channel is dead there and only the
+  hook's typed heartbeat reason says why. The natural route is `volunteer_context`
+  over the remote MCP transport (`callRemoteTool`), rate-limited per prompt.
+  **Trigger:** thin-client adoption of bootstrap. **Start:** `src/commands/hook.ts`
+  user-prompt branch + `src/cli.ts` remote-tool plumbing.
+
 ## gbrain#2095 push-based context follow-ups (v0.43+)
 
 Filed from the #2095 wave (volunteer_context op + reflex window + `gbrain watch`).
@@ -504,20 +540,22 @@ are the bar). Plan + GSTACK REVIEW REPORT at
   deployments get push too. **Cons:** async plumbing + auth scoping; no consumer
   wired today. **Where:** `src/commands/serve-http.ts` + `src/core/context/volunteer.ts`.
   **Blocked by:** a real consumer (revisit when one exists).
-- [ ] **P3 — policy skill + doctor check for push-context.** The ambient reflex
-  needed doctor visibility because silent failure was invisible; volunteer is
-  invoked-on-demand so v1 skipped it. If `volunteer-context --stats` adoption shows
-  agents not discovering the surface, ship a `push-context` recipe (mirror
-  `recipes/retrieval-reflex/`) + a doctor check reading the events table.
-  **Where:** `recipes/`, `src/commands/doctor.ts`.
+- [ ] **P3 — policy skill (recipe) for push-context.** The doctor-check half of
+  this item shipped with the harness hook lane: `volunteer_channels`
+  (`src/commands/doctor.ts:checkVolunteerChannels`) reads the events table
+  per-channel on both the local and remote doctor. Remaining scope: if
+  `volunteer-context --stats` adoption shows agents not discovering the
+  surface, ship a `push-context` recipe (mirror `recipes/retrieval-reflex/`).
+  **Where:** `recipes/`.
 - [ ] **P3 — structured `messages[]` param for volunteer_context.** v1 takes a
   string window (`user:`/`assistant:` prefixes) to avoid a dual-shape contract.
   If MCP callers accumulate parsing bugs, add a structured array param beside it.
   **Where:** `src/core/operations.ts:volunteer_context` + `src/core/context/volunteer.ts:parseWindow`.
 - [ ] **P3 — index shapes for the per-turn resolver query.** The arm-2 resolver
   (`retrieval-reflex.ts`: `lower(title) = ANY() OR slug = ANY() OR slug LIKE
-  ANY('%/...')`) predates #2095 but now runs per turn on three channels
-  (reflex window, volunteer_context, watch) federated across sources. Neither
+  ANY('%/...')`) predates #2095 but now runs per turn on four channel surfaces
+  (reflex window, volunteer_context, watch, and the harness-hook `turn_context`
+  lane) federated across sources. Neither
   the leading-wildcard suffix arm nor `lower(title)` is index-served. If
   per-turn latency telemetry on large brains comes back hot: add
   `(source_id, lower(title))` btree + a reverse(slug) text_pattern_ops (or
@@ -5015,3 +5053,164 @@ respective shapes. Small, mechanical; pinned by `test/init-embed-check.test.ts`
 + the models-doctor tests.
 
 **Depends on:** nothing.
+
+## Agent-bootstrap wave follow-ups (filed at build time)
+
+- [ ] **P2 — bootstrap first-push secret scan reads the working tree, not the
+  index blobs; fail-open on binary/large files.** `secretScanOrThrow` /
+  `scanFiles` (src/core/bootstrap/repo.ts + src/core/secret-scan.ts) read
+  working-tree bytes and silently skip unreadable, binary, and >25 MiB files, so
+  a git clean filter could commit a secret whose working-tree copy scans clean,
+  and a secret in a binary/large file is never seen. Pre-existing across ALL
+  bootstrap pushes (create + adopt), not specific to create-repo-first. Fix:
+  scan the staged index blobs (`git show :file` / `git cat-file`) fail-closed,
+  or reuse the hardened scanner path from `workspacePush`. Filed from the
+  v0.45.2.0 /ship Codex adversarial pass (P0 there; scoped to P2 here as a
+  shared-scanner hardening that needs its own tests, deliberately out of the
+  create-repo-first change).
+
+- [x] **P2 — compiled `gbrain` binary can now `serve` a PGLite brain.** FIXED:
+  `src/core/pglite-embedded-assets.ts` embeds PGLite's runtime payload
+  (`pglite.wasm`, `initdb.wasm`, `pglite.data`, `vector.tar.gz`,
+  `pg_trgm.tar.gz`) with Bun's `import ... with { type: 'file' }` and hands them
+  to PGLite via `PGliteOptions` (`pgliteWasmModule` / `initdbWasmModule` /
+  `fsBundle` + custom `vector`/`pg_trgm` extensions whose `setup()` returns a
+  `bundlePath` pointing at the embedded tarball, materialized to a temp file
+  because `createReadStream` — unlike `readFileSync` — can't read `/$bunfs`
+  paths). `src/core/pglite-engine.ts` spreads `getEmbeddedPgliteOptions()` at
+  both `PGlite.create()` sites, so the Bun-vfs #1340 ENOENT no longer fires for
+  a correctly-built binary. Guarded by `scripts/check-pglite-embedded.sh`
+  (compiles a smoketest and asserts a real PGLite query round-trips), wired into
+  `bun run verify` + `check:all` + `check:pglite-embedded`. The real-agent e2e
+  harness (`test/helpers/agent-harness.ts`) now resolves to the fast compiled
+  MCP server; the `bun run` fallback stays as a safety net. Upstream Bun issue
+  (still open since Nov 2024) is now moot for gbrain.
+- [ ] **P1 — `--background --follow` spawns a nonexistent subcommand.**
+  `src/core/cli-options.ts` (~:391) spawns `gbrain jobs follow <id>` after a
+  background submit, but jobs.ts has no `follow` subcommand (`jobs watch
+  --follow` exists and takes no id; `jobs submit --follow` is inline-only).
+  The spawned child hits the unknown-subcommand path, so `--background
+  --follow` submits fine but the live stream never attaches. Fix: implement
+  `jobs follow <id>` (poll get_job + stream progress) or retarget the spawn.
+  Found during the v0.45.0.0 doc audit; KEY_FILES documents current behavior.
+- [ ] **P1 — bootstrap status is not workspace-scoped.** status.ts reads the
+  newest GLOBAL verify snapshot + global push-status, so a green verify in
+  workspace A can report workspace B as verified/healthy. Key the verify
+  snapshots + push-status by workspace path (or store them under the
+  workspace's own state dir) so status reflects the workspace it runs in.
+  Found by the v0.45.0.0 adversarial pass (Codex P2, raised to P1 — multi-
+  workspace is the graduation/multi-device story).
+- [ ] **P2 — mkdir-lock ABA steal race (folds into the shared-primitive TODO).**
+  Both acquirePushLock (workspace-push.ts) and acquireBootstrapLock (lock.ts)
+  steal a dead+stale lock as rmSync-then-mkdir with no re-verify between, so
+  two simultaneous stealers can both believe they hold it (same known class as
+  pglite-lock; git index.lock bounds the push damage). When extracting the
+  shared mkdir-lock primitive, harden the steal: re-read + token-compare the
+  stale owner immediately before rmSync, or use an atomic rename-based steal.
+  Cross-model finding (Claude + Codex) v0.45.0.0 adversarial.
+- [ ] **P2 — uninstall TOCTOU on a live PGLite DB.** uninstall probes the serve
+  lock then recursively deletes later; a serve starting in between wins the
+  race. Gated today by the lock probe + refuse-on-live-serve, so this is the
+  residual known lock-class window — close it when the shared lock primitive
+  lands (hold the lock across the probe→delete span). Codex P1 v0.45.0.0.
+- [ ] **P2 — sweep fairness: recency-only selection starves old pages.**
+  sweep.ts pass 2 repeatedly takes the newest batchLimit pages with no
+  extraction-watermark filter, so frequently-updated pages monopolize every
+  sweep and older pages never get link/timeline extraction. Add an
+  extracted-watermark (or round-robin) so the backlog drains. Codex P2.
+- [ ] **P2 — untracked deny-glob exclusion is invisible under detached push.**
+  A first-time deny-glob file (e.g. a fresh .env) is dropped from staging and
+  reported only via the logger callback + excludedUntracked — but session-end/
+  session-start auto-push runs via spawnDetachedPush with stdio:'ignore', so
+  the warning is discarded. Fail-safe (never leaves the machine) but the user
+  gets a false "synced" impression. Surface excluded deny-matches via the
+  heartbeat/push-status file so doctor + status can report them. Claude
+  adversarial (minor) v0.45.0.0.
+
+- [ ] **P2 — shared receipt upsert helper.** InstallReceipt construct/merge
+  logic is quadruplicated (bootstrap.ts writeRenderReceipt +
+  appendReceiptRegistration, attach.ts, repo.ts recordRepoInReceipt) with
+  slightly different defaults; guardReceiptOverwrite is wired at each site
+  individually. One `upsertReceipt(home, ws, patch)` in format.ts.
+- [ ] **P2 — promote the atomic tmp+rename write idiom to one core helper.**
+  ~7 hand-rolled copies across format.ts/interview.ts/lock.ts/render.ts/
+  hook.ts/workspace-push.ts/verify.ts; hooks.ts already has a private
+  atomicWriteJson to promote (plus a text variant).
+- [ ] **P2 — extract a shared mkdir-lock primitive.** bootstrap/lock.ts and
+  workspace-push.ts both implement atomic-mkdir + PID/age/token steal rules
+  citing the same pglite-lock learnings (#2058/#2348); three parallel
+  implementations counting pglite-lock. One primitive with injectable stale
+  window + throw-vs-result adapters.
+- [ ] **P2 — move the hook heartbeat read surface into core.** core/bootstrap/
+  status.ts and core/bootstrap/verify.ts dynamic-import readHeartbeatTail
+  from commands/hook.ts (core→commands inversion). A core/hooks-telemetry.ts
+  owning the read/write surface removes the reach-ins.
+- [ ] **P2 — consolidate the two GitHub remote parsers + privacy probes.**
+  workspace-push.ts parseGithubOwnerRepo (accepts ssh:// + trailing /) vs
+  repo.ts parseGithubRemote (scp-form only), and verifyRemotePrivacy (gh repo
+  view) vs verifyRepoPrivate (gh api): grammars/failure classes can drift.
+  One exported parser + one privacy-probe core returning the verdict union.
+- [ ] **P2 — connector-ingest capability probe (with v1.1 connector ingest).**
+  The plan's build-order-2 probe (email/calendar connector availability wired
+  into install output) deferred with the feature it gates; the capability
+  report today covers embeddings + extraction only.
+- [ ] **P2 — G15 retention warnings in doctor.** MEMORY.md size cap + corpus
+  retention + orphaned stop-hook buffers are enforced/pruned but doctor never
+  warns when they accumulate; add the three checks to the bootstrap group.
+- [ ] **P2 — NER-based graph floor in verify.** The graph-floor check asserts
+  wikilink-edge/backlink link-table rows; a true entity-extraction floor
+  (≥1 NER entity + one edge-only query op) needs the extraction path or a
+  keyed provider, so it rides with a keyed-mode verify extension.
+- [ ] **P2 — `--isolated` flag productization.** GBRAIN_HOME threading through
+  MCP registration env, hooks, and uninstall guards ships in v1; the
+  documented `bootstrap --isolated` one-flag wrapper (set env + assert
+  database_path containment + gitignore check, per D2=C) is not yet a flag.
+- [ ] **P2 — sweep N+1 page fetch.** The links/timeline pass getPage-per-slug
+  loop is bounded (batchLimit 20) but serializes round-trips on the live
+  serve connection; add a getPagesBySlugs batch read to both engines (engine
+  parity + bootstrap-probe obligations) and use it.
+
+- [ ] **P2 — `gbrain quota` meter command.** Productize the release-gate quota
+  measurement (script+doc ship with the bootstrap wave) into a command that reports
+  a session/day's token burn against the harness subscription allowance. Blocked on
+  a proven per-harness token-count method — an inaccurate meter erodes the trust it
+  exists to build (CEO review D3.4; not promoted by a passing quota gate, by
+  decision). Start: the spike's measurement scripts under docs/designs/.
+- [ ] **P2 — Networked Docker paste-flow e2e.** The offline container e2e (interview
+  → render → verify with fake gh) ships with the wave; the full networked flow (bun
+  install, gh auth, repo create, MCP registration) stays manual. Unblocks after 10
+  consecutive green offline runs in heavy-tests (CEO review D3.3b). Start:
+  tests/docker/ harness + the fake-gh recording shim.
+- [ ] **P2 — Real-agent door e2e needs a provisioned runner.** The real-binary door
+  tests (`test/e2e/bootstrap-real-{claude,codex}.serial.test.ts`) drive the ACTUAL
+  `claude`/`codex` binaries against a real gbrain and pay API cost. They self-SKIP
+  (`describe.skipIf` on binary/auth) everywhere else, so the `real-agent-e2e` job in
+  `.github/workflows/heavy-tests.yml` is a green no-op on stock GitHub runners. To
+  actually EXERCISE them we need a self-hosted / manually-provisioned runner with
+  authed `claude` + `codex` and provider creds exported
+  (`GSTACK_ANTHROPIC_API_KEY`/`ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`). Until then they
+  run locally on an operator machine only. Start: stand up a labeled runner with the
+  binaries pre-authed, or a scheduled self-hosted lane.
+
+- [ ] **P1 — unit-shard exit hang: bun test process leaks a ref'd handle and never
+  exits after all tests pass.** Probabilistic (scales with file count/duration),
+  PRE-EXISTING: reproduces on origin/master with the same 274-file combination
+  (`bun test $(cat list) --max-concurrency=2` — shard-2 composition from the
+  agent-bootstrap wave's reshuffled split; solo halves/eighths pass, full list
+  hangs on both branches; a repeat of the same 68-file quarter passed, so it is a
+  race, not a single file). Forensics: the "[process-cleanup] db-lock:test:r1:
+  PGlite is closed" tail line is printed BY the SIGTERM cleanup at kill time, not
+  pre-hang; db-lock refresh + process-watchdog intervals are already unref'd —
+  the leak is elsewhere (candidate class: a ref'd handle in a PGLite/worker
+  teardown race). run-unit-parallel.sh now classifies the exact signature
+  (killed at cap + all assigned files started + zero fail markers) as a loud
+  warn-pass so it can't red-X unrelated work; fixing the leak removes the
+  classifier's reason to exist. Start: reproduce with `--inspect` /
+  Bun.unsafe process handle dumps on the full shard-2 list.
+- [ ] **P2 — WAL-repair unit tests flake under parallel shard load.**
+  `test/pglite-repair.test.ts` (`repairPgliteWal rename-based backup`,
+  `inspectPgliteDataDir verdicts`) failed once in a full 4-shard run and pass
+  44/44 standalone — load-sensitive, from the v0.42.75.0 WAL auto-repair wave
+  (pre-existing on master; observed during the agent-bootstrap gate runs).
+  Start: run the file under `--max-concurrency=4` alongside PGLite-heavy
+  neighbors to reproduce; suspect tmp-dir or timing assumptions.
