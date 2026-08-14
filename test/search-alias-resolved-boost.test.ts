@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 14 (fork merge: acmts weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390 embedding-provider migration + #3430 compiled_truth boost scope all folded)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(14);
+  it('is 17 (fork merge: acmts weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390 embedding-provider migration + #3430 compiled_truth boost scope + 15→16 detail fold #3515 all folded)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(17);
   });
 });

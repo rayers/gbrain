@@ -429,7 +429,26 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // GBRAIN_FTS_LANGUAGE retokenizes both the trigger-built search_vector and
     // the query-side tsquery, so rows written under the previous language must
     // not survive a `reindex-search-vector` switch.
-    expect(KNOBS_HASH_VERSION).toBe(15);
+    // #3515: bumped 15→16 to fold the effective detail level (det=) — a
+    // detail=low write must not be served to a detail=medium lookup.
+    // Fork merge 16→17 (2026-08-14): upstream reached v=16 (fts=/det=) without
+    // our acmts; fork last published v=14 with acmts but not fts=/det=; the
+    // merged composition carries all three, so it matches neither published side.
+    expect(KNOBS_HASH_VERSION).toBe(17);
+  });
+
+  test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
+    const knobs = resolveSearchMode({ mode: 'balanced' });
+    const low = knobsHash(knobs, { detail: 'low' });
+    const medium = knobsHash(knobs, { detail: 'medium' });
+    const high = knobsHash(knobs, { detail: 'high' });
+    const unset = knobsHash(knobs);
+    expect(low).not.toBe(medium);
+    expect(medium).not.toBe(high);
+    expect(low).not.toBe(high);
+    // Undefined falls back to 'medium' — the documented default — so legacy
+    // callers that don't thread detail share the default-detail rows.
+    expect(unset).toBe(medium);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -594,8 +613,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 14 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave + #3430 compiled_truth boost scope)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(14);
+  test('KNOBS_HASH_VERSION is 17 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave + #3430 compiled_truth boost scope + 15→16 detail fold #3515)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(17);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {

@@ -808,7 +808,27 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // force the one-time cold-miss and guarantee no stale v=13 row (written by
 // either side) is ever served. Same global cold-miss pattern; refills within
 // cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 14;
+//
+// bump 15→16 (#3515): `detail` folds into the key via ctx.detail (det=).
+// detail is result-affecting by design — it gates dedup, chunk-source
+// filtering, and the compiled_truth boost — but was absent from the key, so
+// a `--detail low` write (compiled-truth-only result set) was served to a
+// default `medium` lookup for the whole TTL. Same contamination class as
+// [CDX-4], floor_ratio (v=3), and relationalRetrieval (v=10). v=14 was
+// claimed by #3514 (compiled_truth boost scope, #3430) and v=15 by the
+// `fts=` fold (#3677), so this lands as v=16 per the D8 sequencing
+// convention (see the v=4/v=5 note above). Same one-time global cold-miss
+// pattern as the bumps above.
+//
+// bump 16→17 (fork merge, 2026-08-14): upstream reached v=16 via the `fts=`
+// (#3677) and `det=` (#3515) folds but never carried our fork's `acmts`
+// (autocut_min_top_score, local v=10); our fork last published v=14 carrying
+// `acmts` but not `fts=`/`det=`. The merged code carries acmts + fts + det, so
+// its key composition matches NEITHER published v=14 (fork) nor v=16 (upstream).
+// Bump to 17 to force the one-time cold-miss and guarantee no stale row written
+// by either side is ever served. Same global cold-miss pattern; refills within
+// cache.ttl_seconds (3600s default).
+export const KNOBS_HASH_VERSION = 17;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -847,6 +867,17 @@ export interface KnobsHashContext {
    * 'none' for legacy callers that don't thread excludes.
    */
   hardExcludes?: string[];
+  /**
+   * v=16 (#3515): the EFFECTIVE detail level for this call — per-call
+   * SearchOpts.detail, or the auto-detected level when the caller didn't
+   * specify (hybridSearchCached threads `opts.detail ?? autoDetectDetail(query)`,
+   * matching what bare hybridSearch resolves). detail gates dedup,
+   * chunk-source filtering, and the compiled_truth boost, so a detail=low
+   * write must never be served to a detail=medium lookup. Lives in ctx (not
+   * ResolvedSearchKnobs) because it's per-call, not a mode knob — same path
+   * as col=/prov=. Undefined falls back to 'medium' (the documented default).
+   */
+  detail?: 'low' | 'medium' | 'high';
 }
 
 export function knobsHash(
@@ -957,6 +988,11 @@ export function knobsHash(
     // memoizes and validates against /^[a-z][a-z0-9_]*$/, so this stays a
     // cheap, bounded string.
     `fts=${getFtsLanguage()}`,
+    // v=16 addition (#3515, append-only): effective detail level. detail
+    // gates dedup, chunk-source filtering, and the compiled_truth boost, so
+    // a low write (compiled-truth-only set) must never be served to a
+    // medium/high lookup. Undefined falls back to 'medium' (the default).
+    `det=${ctx?.detail ?? 'medium'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
