@@ -449,6 +449,9 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // Undefined falls back to 'medium' — the documented default — so legacy
     // callers that don't thread detail share the default-detail rows.
     expect(unset).toBe(medium);
+    // WP2/T3: bumped 16→17 for the degradation-stamp epoch — cache rows now
+    // carry degraded[]/retrieved_count; pre-stamp rows must not claim clean.
+    expect(KNOBS_HASH_VERSION).toBe(17);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
