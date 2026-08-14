@@ -800,7 +800,10 @@ events at the IPC delivery point and dedupes via the transcript's
   0700 dir) and (b) a secret-file home for `turn_context` auth (same hash-keyed run dir).
   The cathedral-3 branch prototyped (a) as `resolveSocketPathForConfig` (see branch
   history at commit 2350294c) before the convergence dropped it pending the secret
-  design. **Trigger:** a Postgres-brain user asking why hooks stay silent. **Start:**
+  design. **Trigger:** a Postgres-brain user asking why hooks stay silent — and as of
+  #4043, every `gbrain bootstrap harness` install on a Postgres brain: harness mode
+  pre-wires all five hooks and states the degradation plainly, so this listener is what
+  lights them up. **Start:**
   `src/core/context/resolve-ipc.ts` socket-path helpers + `src/mcp/server.ts` listener gate
   + `src/commands/hook.ts:no_pglite_path` branch.
 - [ ] **P3 — thin-client remote push route.** Thin-client installs (remote_mcp) have no
@@ -5407,6 +5410,91 @@ respective shapes. Small, mechanical; pinned by `test/init-embed-check.test.ts`
 + the models-doctor tests.
 
 **Depends on:** nothing.
+
+## Harness-mode follow-ups (#4043, filed at build time)
+
+- [ ] **P2 — serve-side port/pid record for discovery.** `gbrain bootstrap harness`
+  and its `--status` probe `/health` at 127.0.0.1:3131 (or an explicit `--url`/`--port`);
+  a serve on a non-default port is invisible without flags. Write a record (port, pid,
+  started_at) from `runServeHttp`'s `app.listen` callback into `~/.gbrain/run/`,
+  mtime-as-heartbeat like `src/core/autopilot-paths.ts` — the stale-record semantics
+  (crashed serve, multi-serve boxes) are why this deferred; a wrong record misdirecting
+  probes is worse than no record. **Trigger:** a harness box running serve on a custom
+  port asking why discovery misses it. **Start:** `src/commands/serve-http.ts` listen
+  callback + `src/core/bootstrap/harness.ts` url resolution.
+- [ ] **P3 — legacy HTTP transport scope asymmetry.** `src/mcp/http-transport.ts` is
+  test-only (no production caller; `serve --http` uses serve-http.ts) and hardcodes
+  `scopes: []` with no per-op scope gate — if it is ever revived, a scoped legacy token
+  is fully UNSCOPED there. Mirror the `scopes TEXT[]` honor + `hasScope` dispatch gate
+  before any revival. **Trigger:** any production caller of `startHttpTransport`.
+- [ ] **P3 — partial unique index on active `access_tokens.name`.** Names are not
+  unique; `auth revoke <name>` clears every active row and the 23505 handler in
+  `auth create` is dead code for name collisions. Harness mode sidesteps this with
+  revoke-by-id + receipt-carried ids, but a
+  `CREATE UNIQUE INDEX ... ON access_tokens (name) WHERE revoked_at IS NULL` would
+  make names honest for humans too. Needs a dedup pass first on brains that already
+  carry twins. **Start:** `src/core/migrate.ts` (CONCURRENTLY + `transaction: false`).
+- [ ] **P2 — codex hook lane.** codex-cli 0.147.0 ships a real hook system (hooks.json;
+  PreToolUse…SessionEnd — recorded on `TARGETS['codex-2026-08']` in
+  `src/core/bootstrap/host-specs.ts`), falsifying the old "codex has no hooks" premise.
+  Wiring SessionEnd transcript capture (+ SessionStart context) would give codex
+  sessions the same memory loop Claude Code gets, and supersedes the FF2 notify-sweeper
+  idea. Needs its own dated spec-target verification (payload shapes, deny-unknown-fields
+  config) + e2e before any writer lands. **Trigger:** first user asking why codex
+  sessions don't persist; **Start:** `host-specs.ts` TARGETS + a codex sibling of
+  `writeClaudeHooksAt`.
+- [ ] **P3 — PGLite admin-lane scoped minting.** `gbrain bootstrap harness` refuses to
+  mint under a live PGLite serve (single-writer) and points at pre-mint + `--token`.
+  Auto-driving `POST /admin/login` + `POST /admin/api/api-keys` (when
+  GBRAIN_ADMIN_BOOTSTRAP_TOKEN is present) would erase that friction — BLOCKED ON
+  extending that admin route to carry a scopes/permissions payload (today it inserts
+  only id/name/token_hash, so it can only mint full-access tokens, defeating the
+  harness lane's least-privilege default). **Start:** `src/commands/serve-http.ts`
+  api-keys route + `src/core/bootstrap/harness.ts` mint seam.
+- [ ] **P3 — OpenClaw plugin setup hook (self-demoted from the #4043 wave).** The
+  issue's closing ask is "frameworks call `gbrain bootstrap harness` at setup time".
+  The in-repo `openclaw.plugin.json` cannot express it: OpenClaw installs plugins with
+  lifecycle scripts disabled (`--ignore-scripts`) and the manifest schema has no
+  setup/command field (verified against the OpenClaw plugin docs, 2026-08-12). When the
+  plugin API grows a setup surface, add `gbrain bootstrap harness --yes` AND remove the
+  manifest's static stdio `mcpServers.gbrain` entry in the same commit (one owner per
+  server name). **Trigger:** OpenClaw plugin-API setup/command support shipping.
+- [ ] **P3 — harness federated-drift visibility.** The harness token's
+  `permissions.source_id` federation array is a mint-time snapshot of the
+  `federated=true` sources; sources added later are invisible to wired sessions until
+  a re-run rotates the token. `--status` could diff the snapshot against the live
+  config and suggest a re-run — needs either an engine open (breaks status's
+  engine-free posture under a live PGLite serve) or a sources probe over MCP with the
+  recovered token. **Start:** `src/core/bootstrap/harness.ts:statusHarness`.
+- [ ] **P3 — harness smoke: add BRAIN-IDENTITY comparison on top of the canary
+  (ship-review residual).** The ship-review batch landed the two cheap layers: an
+  apply-time CANARY (a random same-format bearer must fail auth before the real smoke —
+  an impostor cannot tell the canary from the real token, so it is caught whichever way
+  it answers) and immediate revocation of the fresh mint on any failed smoke. The
+  remaining hardening is comparing the smoke's returned identity against the local
+  brain's (the default mint path already opens the engine and could capture it);
+  registrar mode (`--token` + remote url) has no engine and would state the weaker
+  guarantee honestly. **Start:** `src/core/bootstrap/harness.ts` steps 5+8.
+- [ ] **P3 — harness orphan-mint reconciliation (red-team finding).** A hard crash in
+  the window between the mint INSERT committing and the `receipt.token.id` save leaves
+  an ACTIVE token no receipt records — `--remove` cannot revoke it and doctor never
+  flags it. On apply, when the prior receipt has `minted: true` but no id, list active
+  `access_tokens` rows matching `token.name` created after `receipt.created_at` and
+  fold them into `previous_ids` (or surface them loudly). **Start:**
+  `src/core/bootstrap/harness.ts` step 5 + `src/core/token-mint.ts`.
+- [ ] **P3 — bootstrap lock.ts error-path polish (plan micro-item, deferred at ship).**
+  Non-EEXIST mkdir errors (EACCES/EROFS) misreport as BOOTSTRAP_IN_PROGRESS, and the
+  missing-dir message says "workspace directory" even when the lock target is the
+  gbrain HOME (harness lane) or a host config dir. Add an accurate message path.
+  **Start:** `src/core/bootstrap/lock.ts:acquireBootstrapLock`.
+- [ ] **P3 — dedupe `auth create` against `mintLegacyToken`.** `src/commands/auth.ts`
+  create() re-implements the INSERT + `{a,b}` text[]-literal trick that token-mint.ts
+  owns (the extraction note says so); routing create() through `mintLegacyToken` (the
+  engine is in scope inside `withConfiguredSql`) would leave one canonical mint. Same
+  for the doctor's inline `/health` probe vs `probeServeHealth`, which also wants an
+  injectable fetch seam so `bootstrap_harness_health` tests stop making real TEST-NET
+  calls (3s each). **Start:** `src/commands/auth.ts:create`, `src/commands/doctor.ts`
+  bootstrap_harness_health.
 
 ## Agent-bootstrap wave follow-ups (filed at build time)
 

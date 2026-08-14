@@ -36,6 +36,7 @@ import {
 } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { normalizeTokenScopes } from '../core/legacy-token-scope.ts';
 import { normalizeSourceInput, normalizeFederatedReadInput } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall, requestLogStatusForResult } from '../mcp/dispatch.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
@@ -1381,7 +1382,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       `;
       const legacyKeys = await sql`
         SELECT a.id, a.name, 'api_key' as auth_type,
-          '{"bearer"}' as grant_types, 'read write admin' as scope, a.created_at, null as token_ttl,
+          '{"bearer"}' as grant_types,
+          a.scopes,
+          a.created_at, null as token_ttl,
           CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
           a.last_used_at,
           (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name) as total_requests,
@@ -1390,7 +1393,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       `;
       res.json([
         ...oauthClients,
-        ...legacyKeys.map((key) => ({ ...key, source_id: null, federated_read: [] })),
+        ...legacyKeys.map(({ scopes, ...key }) => ({
+          ...key,
+          // The SAME normalizer the verify path uses — the dashboard must
+          // never display a grant the serve doesn't enforce (NULL =
+          // grandfathered full access; damaged/deny rows show empty).
+          scope: normalizeTokenScopes(scopes)?.join(' ') ?? 'read write admin',
+          source_id: null,
+          federated_read: [],
+        })),
       ]);
     } catch (e) {
       res.status(503).json({ error: 'service_unavailable' });
