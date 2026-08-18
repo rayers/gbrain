@@ -301,11 +301,11 @@ Before merging anything that touches:
 
 - `src/core/search/hybrid.ts` (RRF, fusion, dedup, two-pass retrieval)
 - `src/core/search/source-boost.ts` / `sql-ranking.ts` (per-source ranking)
-- `src/core/search/intent.ts` (auto-detail classification)
+- `src/core/search/query-intent.ts` (auto-detail classification)
 - `src/core/search/expansion.ts` (Haiku query expansion)
 - `src/core/search/dedup.ts` (cross-page result collapse)
 - `src/core/embedding.ts` or any embedding model swap
-- `src/core/operations.ts` `query` or `search` op handlers (capture surface)
+- `src/core/ops/search.ts` `query` or `search` op handlers (capture surface)
 - `src/core/postgres-engine.ts` / `pglite-engine.ts` `searchKeyword` /
   `searchVector` SQL
 
@@ -588,9 +588,10 @@ gbrain config set autopilot.nightly_quality_probe.enabled true
 gbrain config set autopilot.nightly_quality_probe.max_usd 5.00   # optional override
 ```
 
-Note: `--phase nightly_quality_probe` wiring into the autopilot scheduler is
-deferred to a v0.41+ follow-up (see TODOS.md). For now the phase is callable
-in isolation; the test harness exercises it via DI stubs.
+The autopilot scheduler invokes the probe on its tick cadence when the
+config gate is on (`src/commands/autopilot.ts`, pinned by
+`test/autopilot-nightly-probe-wiring.test.ts`); the phase also stays
+callable in isolation, and the test harness exercises it via DI stubs.
 
 ```bash
 # Manual smoke (exercises the path via DI stubs, no real API spend).

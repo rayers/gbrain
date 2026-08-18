@@ -156,6 +156,15 @@ export interface ModeBundle {
    */
   title_boost: number | undefined;
 
+  /**
+   * v0.46.15 — cosine floor for evidence's `high_vector_match` (see
+   * evidence.ts DEFAULT_HIGH_COSINE_FLOOR). Config `search.evidence_cosine_floor`.
+   * Deliberately EXCLUDED from knobsHash: it shapes the evidence LABEL, not
+   * the result set — a floor change serves TTL-bounded stale labels on cached
+   * rows, which is acceptable for an operator tuning knob.
+   */
+  evidence_cosine_floor: number | undefined;
+
   // v0.36 cross-modal wave knobs (D2 + D3 + D6 + D8 + D13 + LLM-intent).
   // All three mode bundles default these to the same values — cross-modal
   // is opt-in per-call (D6 weighting), opt-in per-brain (D8 unified flags),
@@ -268,15 +277,12 @@ export interface ModeBundle {
    */
   autocut_jump: number;
   /**
-   * v0.42.x — autocut weak-top floor: the minimum top cross-encoder rerank
-   * score for the cliff cut to be trusted. autocut normalizes the cliff test by
-   * the top score, so a weak top (e.g. 0.317 on a rare-term cross-source query)
-   * rescales to 1.0 and fabricates a confident cliff — collapsing a rich pool to
-   * 1 (the `--source __all__` collapse). Below this floor autocut no-ops (recall
-   * preserved). Default 0.5 (zerank-2 is bimodal: real ≈0.95+, weak ≈0.3). 0
-   * disables the floor. Override: `search.autocut_min_top_score` config → bundle.
+   * v0.46.15 (#1863) — weak-top floor: when the TOP rerank score is below
+   * this, autocut no-ops (gap normalization by a weak top manufactures
+   * spurious cliffs). Scale-dependent on the reranker — the September
+   * reranker default flip must re-tune it. Config: `search.autocut_min_top`.
    */
-  autocut_min_top_score: number;
+  autocut_min_top: number;
   /**
    * v0.43 — relational recall arm. When on, a relational query ("who invested
    * in widget-co", "what connects fund-a and fund-b") resolves its seed
@@ -319,6 +325,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -342,7 +349,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relationalRetrieval: false,
     relational_retrieval_depth: 2,
     autocut_jump: 0.2,
-    autocut_min_top_score: 0.5,
+    autocut_min_top: 0.35,
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -374,6 +381,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -401,7 +409,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relationalRetrieval: true,
     relational_retrieval_depth: 2,
     autocut_jump: 0.2,
-    autocut_min_top_score: 0.5,
+    autocut_min_top: 0.35,
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -430,6 +438,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     floor_ratio: undefined,
     // T2 — title-phrase boost ON by default (correctness fix, cheap + gated).
     title_boost: 1.25,
+    evidence_cosine_floor: 0.8,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -453,7 +462,7 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     relationalRetrieval: true,
     relational_retrieval_depth: 2,
     autocut_jump: 0.2,
-    autocut_min_top_score: 0.5,
+    autocut_min_top: 0.35,
   }),
 });
 
@@ -489,6 +498,8 @@ export interface SearchKeyOverrides {
   floor_ratio?: number;
   // T2 — title-phrase boost override.
   title_boost?: number;
+  // v0.46.15 — evidence cosine-floor override (label-only; not in knobsHash).
+  evidence_cosine_floor?: number;
   // v0.36 cross-modal overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -508,8 +519,7 @@ export interface SearchKeyOverrides {
   relationalRetrieval?: boolean;
   relational_retrieval_depth?: number;
   autocut_jump?: number;
-  // v0.42.x — autocut weak-top floor override.
-  autocut_min_top_score?: number;
+  autocut_min_top?: number;
 }
 
 /**
@@ -537,6 +547,8 @@ export interface SearchPerCallOpts {
   floor_ratio?: number;
   // T2 — title-phrase boost per-call override.
   title_boost?: number;
+  // v0.46.15 — evidence cosine-floor per-call override.
+  evidence_cosine_floor?: number;
   // v0.36 cross-modal per-call overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -556,8 +568,7 @@ export interface SearchPerCallOpts {
   // numeric per-call knob threaded through the bundle.
   autocut?: boolean;
   autocut_jump?: number;
-  // v0.42.x — autocut weak-top floor per-call override.
-  autocut_min_top_score?: number;
+  autocut_min_top?: number;
   // v0.43 — relational recall per-call overrides.
   relationalRetrieval?: boolean;
   relational_retrieval_depth?: number;
@@ -637,6 +648,7 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     // v0.35.6.0 — floor-ratio resolved via the same pick chain.
     floor_ratio: pick('floor_ratio'),
     title_boost: pick('title_boost'),
+    evidence_cosine_floor: pick('evidence_cosine_floor'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
     cross_modal_both_image_weight: pick('cross_modal_both_image_weight'),
@@ -653,8 +665,7 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     // v0.42.3.0 — autocut resolved via the same pick chain.
     autocut: pick('autocut'),
     autocut_jump: pick('autocut_jump'),
-    // v0.42.x — autocut weak-top floor resolved via the same pick chain.
-    autocut_min_top_score: pick('autocut_min_top_score'),
+    autocut_min_top: pick('autocut_min_top'),
     // v0.43 — relational recall resolved via the same pick chain.
     relationalRetrieval: pick('relationalRetrieval'),
     relational_retrieval_depth: pick('relational_retrieval_depth'),
@@ -764,54 +775,44 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // within cache.ttl_seconds). Same cache-key-contamination convention as the
 // autocut / title_boost / graph_signals bumps above.
 //
-// bump 9→10 (autocut weak-top floor) adds `acmts` (autocut_min_top_score).
-// The floor changes WHETHER autocut cuts at all — a write made with one floor
-// must NOT be served to a lookup at a different floor (the trimmed-vs-full set
-// differs). Same one-time global cold-miss pattern; fills within cache.ttl.
+// bump 10→11 (#1400 input_type fix): asymmetric embedding models (zembed-1
+// hosted or local, Voyage v3+) had their query-side input_type stripped by
+// the AI SDK before the wire, so every cached row's key embedding AND result
+// set were computed with document-side query vectors. The fix changes what
+// embedQuery() produces for those providers; pre-fix rows must not be served
+// to post-fix lookups. Same one-time global cold-miss pattern as the bumps
+// above (the hash is global, not per-provider); refills within
+// cache.ttl_seconds (3600s default).
 //
-// bump 10→11 (fork merge): upstream's v0.43 relational-recall arm ALSO claimed
-// v=10 independently (adds `rel`/`reld`). The merged code carries BOTH the
-// weak-top-floor parts AND the relational parts, so its key composition matches
-// neither published v=10. Bump to 11 to force the one-time cold-miss and
-// guarantee no stale v=10 row (written by either side) is ever served.
-//
-// bump 11→12 (fork merge): upstream's #1400 input_type fix ALSO claimed v=11
-// independently (changes what embedQuery() produces for asymmetric embedding
-// models — zembed-1 hosted/local, Voyage v3+ — by no longer stripping the
-// query-side input_type before the wire). The merged code carries BOTH the
-// fork-merge composition AND the input_type fix, so its key composition matches
-// neither published v=11. Bump to 12 to force the one-time cold-miss and
-// guarantee no stale v=11 row (written by either side) is ever served. Same
-// global cold-miss pattern; refills within cache.ttl_seconds (3600s default).
-//
-// bump 12→13 (fork merge, 2026-07-17): upstream's #2825 hard-exclude fix ALSO
-// claimed v=12 independently (folds the resolved hard-exclude slug-prefix list
-// — defaults ∪ GBRAIN_SEARCH_EXCLUDE ∪ exclude_slug_prefixes, minus
-// include_slug_prefixes — into the key via ctx.hardExcludes / the `hx` part;
-// before this it only applied at DB-query build time, so a process with
+// bump 11→12 (2026-07-16, #2825): the resolved hard-exclude slug-prefix list
+// (defaults ∪ GBRAIN_SEARCH_EXCLUDE ∪ exclude_slug_prefixes, minus
+// include_slug_prefixes) folds into the key via ctx.hardExcludes. It only
+// applied at DB-query build time (cache miss), so a process with
 // GBRAIN_SEARCH_EXCLUDE set could be served cached rows containing excluded
-// slugs written by a process without it, and vice versa). Our v=12 (fork-merge
-// composition + #1400) never carried `hx`; upstream's v=12 never carried our
-// `acmts`. The merged code carries BOTH, so its key composition matches NEITHER
-// published v=12. Bump to 13 to force the one-time cold-miss and guarantee no
-// stale v=12 row (written by either side) is ever served. Same global cold-miss
-// pattern; refills within cache.ttl_seconds (3600s default).
+// slugs written by a process without it, and vice versa. Same one-time
+// global cold-miss pattern as the bumps above; refills within
+// cache.ttl_seconds (3600s default).
 //
-// bump 13→14 (fork merge, 2026-07-28): upstream's #3390/#3391 embedding-provider
-// migration wave ALSO claimed v=13 independently. Its rationale: the `prov=`
+// bump 12→13 (#3390/#3391): embedding-provider migration wave. The `prov=`
 // component only isolates callers that thread KnobsHashContext.embeddingModel;
 // legacy callers hash `prov=default` before AND after a provider swap, so a
-// cache row computed against the pre-migration embedding space could be served
-// post-migration. `gbrain migrate embeddings` purges query_cache directly at
-// swap time; their bump is the belt-and-braces for rows written between the
-// #3391 stale-fix (which changes which chunks count as current) and the
-// operator's migration run.
+// cache row computed against the pre-migration embedding space could be
+// served post-migration. `gbrain migrate embeddings` purges query_cache
+// directly at swap time; this version bump is the belt-and-braces for rows
+// written between the #3391 stale-fix (which changes which chunks count as
+// current) and the operator's migration run. Same one-time global cold-miss
+// pattern as the bumps above.
 //
-// Our v=13 (fork-merge composition + `acmts`) never carried that migration-wave
-// semantic; upstream's v=13 never carried our `acmts`. The merged code carries
-// BOTH, so its key composition matches NEITHER published v=13. Bump to 14 to
-// force the one-time cold-miss and guarantee no stale v=13 row (written by
-// either side) is ever served. Same global cold-miss pattern; refills within
+// bump 14→15: the FTS configuration name (GBRAIN_FTS_LANGUAGE, resolved by
+// getFtsLanguage()) folds into the key via the `fts=` part. It reaches BOTH
+// engines' keyword SQL (websearch_to_tsquery/to_tsvector in postgres-engine
+// and pglite-engine) and the two search_vector trigger functions, so it
+// changes which rows the keyword arm returns — but it only applied at
+// DB-query build time (cache miss). Switching language and running
+// `gbrain reindex-search-vector` therefore left every pre-switch query_cache
+// row reachable: the freshly retokenized index was silently bypassed for up
+// to cache.ttl_seconds, with no warning and no way for an operator to tell.
+// Same one-time global cold-miss pattern as the bumps above; refills within
 // cache.ttl_seconds (3600s default).
 //
 // bump 15→16 (#3515): `detail` folds into the key via ctx.detail (det=).
@@ -825,15 +826,16 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // convention (see the v=4/v=5 note above). Same one-time global cold-miss
 // pattern as the bumps above.
 //
-// bump 16→17 (fork merge, 2026-08-14): upstream reached v=16 via the `fts=`
-// (#3677) and `det=` (#3515) folds but never carried our fork's `acmts`
-// (autocut_min_top_score, local v=10); our fork last published v=14 carrying
-// `acmts` but not `fts=`/`det=`. The merged code carries acmts + fts + det, so
-// its key composition matches NEITHER published v=14 (fork) nor v=16 (upstream).
-// Bump to 17 to force the one-time cold-miss and guarantee no stale row written
-// by either side is ever served. Same global cold-miss pattern; refills within
-// cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 17;
+// bump 16→17 (WP2/T3): degradation-stamp epoch. HybridSearchMeta gains
+// `degraded[]` + `retrieved_count` and every cache write now stamps them
+// (degraded rows additionally get a short TTL). A pre-stamp row served as a
+// hit would claim a clean run it can't prove; bumping makes pre-upgrade rows
+// unreachable (one-time cold-miss, refills within cache.ttl_seconds), and
+// any row that still lacks the stamp surfaces as
+// degraded:[{stage:'cache_prestamp'}] at hit time (belt-and-braces).
+// (Merge note: both this wave and master's #3515 wave claimed v=16 in
+// flight; the merge sequences them as 16 then 17.)
+export const KNOBS_HASH_VERSION = 18;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -962,14 +964,11 @@ export function knobsHash(
     // etc.) so a partial-knobs caller (tests passing a minimal literal) can't
     // crash the hash. Typed callers always carry the field.
     `acj=${(knobs.autocut_jump ?? 0.2).toFixed(2)}`,
-    // v=10 (ours) — weak-top floor shifts whether autocut cuts at all, so an
-    // autocut-cut write must not be served to a different-floor lookup.
-    // `?? 0.5` mirrors the module default for partial-knobs callers. 4 decimals
-    // (vs acj's 2): the floor is compared directly against raw rerank scores, so
-    // nearby config values (0.501 vs 0.504) can flip trim-vs-no-op and must not
-    // collide on the cache key.
-    `acmts=${(knobs.autocut_min_top_score ?? 0.5).toFixed(4)}`,
-    // v=10 (upstream, append-only): relational recall arm. A
+    // v=18 addition (v0.46.15 #1863, append-only): weak-top floor. A floored
+    // write (full cluster kept on a weak top) must not be served to an
+    // unfloored lookup and vice versa — the kept set differs.
+    `acm=${(knobs.autocut_min_top ?? 0.35).toFixed(2)}`,
+    // v=10 additions (v0.43, append-only): relational recall arm. A
     // relational-on write (edge-seeded result set) must NOT be served to a
     // relational-off lookup — same contamination class as graph_signals. The
     // depth changes the candidate set too, so it folds in as well. ONE-TIME
@@ -1103,6 +1102,14 @@ export function loadOverridesFromConfig(
     if (Number.isFinite(n) && n >= 1.0 && n <= 5.0) out.title_boost = n;
   }
 
+  // v0.46.15 — evidence cosine floor (label-only knob; deliberately not in
+  // knobsHash). [0, 1] sanity-bounded.
+  const ecf = get('search.evidence_cosine_floor');
+  if (ecf !== undefined) {
+    const n = parseFloat(ecf);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.evidence_cosine_floor = n;
+  }
+
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');
   if (cmbt !== undefined) {
@@ -1164,12 +1171,11 @@ export function loadOverridesFromConfig(
     const n = parseFloat(acj);
     if (Number.isFinite(n) && n > 0 && n <= 1) out.autocut_jump = n;
   }
-  // v0.42.x — autocut weak-top floor. [0, 1]: 0 disables, 1 pins at ceiling;
-  // out-of-range falls through to the bundle.
-  const acmts = get('search.autocut_min_top_score');
-  if (acmts !== undefined) {
-    const n = parseFloat(acmts);
-    if (Number.isFinite(n) && n >= 0 && n <= 1) out.autocut_min_top_score = n;
+  // v0.46.15 (#1863) — weak-top floor. [0, 1]; 0 disables the floor.
+  const acm = get('search.autocut_min_top');
+  if (acm !== undefined) {
+    const n = parseFloat(acm);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.autocut_min_top = n;
   }
 
   // v0.43 — relational recall arm.
@@ -1204,6 +1210,7 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   // v0.35.6.0 — floor-ratio gate
   'search.floor_ratio',
   'search.title_boost',
+  'search.evidence_cosine_floor',
   // v0.36 cross-modal keys (D3)
   'search.cross_modal.both_mode_text_weight',
   'search.cross_modal.both_mode_image_weight',
@@ -1225,8 +1232,7 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.relational_retrieval',
   'search.relational_retrieval_depth',
   'search.autocut_jump',
-  // v0.42.x autocut weak-top floor
-  'search.autocut_min_top_score',
+  'search.autocut_min_top',
 ]);
 
 /**

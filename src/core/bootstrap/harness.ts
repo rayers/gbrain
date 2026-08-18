@@ -104,6 +104,17 @@ import {
   removeOpencodeMcpEntry,
   writeOpencodeMcpEntry,
 } from './opencode-json.ts';
+import { isServeOlderThanScopes, probeServeHealth } from './serve-health.ts';
+
+// Peeled façade seam (cathedral-6): the serve probe + scopes version floor
+// moved to serve-health.ts; re-exported so this module's public surface — and
+// every import site — is unchanged.
+export {
+  SCOPES_MIN_SERVE_VERSION,
+  isServeOlderThanScopes,
+  probeServeHealth,
+  type ServeHealth,
+} from './serve-health.ts';
 
 // ── Flags ───────────────────────────────────────────────────────────────────
 
@@ -227,13 +238,6 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
 
 // ── Deps (injectable for the serial suite) ──────────────────────────────────
 
-export interface ServeHealth {
-  ok: boolean;
-  engine?: string;
-  version?: string;
-  detail?: string;
-}
-
 export interface HarnessDeps {
   runner: ExecRunner;
   gbrainHome: string;
@@ -349,25 +353,6 @@ function defaultPgliteLiveServe(): boolean {
   const cfg = loadConfig();
   if (!cfg?.database_path) return false;
   return probeLivePgliteHolder(cfg.database_path) !== null;
-}
-
-// ── Serve probe ─────────────────────────────────────────────────────────────
-
-export async function probeServeHealth(
-  mcpUrl: string,
-  fetchFn: typeof fetch,
-  timeoutMs = 3000,
-): Promise<ServeHealth> {
-  const base = mcpUrl.replace(/\/mcp$/, '');
-  try {
-    const res = await fetchFn(`${base}/health`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { ok: false, detail: `GET ${base}/health → ${res.status}` };
-    const body = (await res.json()) as { status?: string; version?: string; engine?: string };
-    if (body.status !== 'ok') return { ok: false, detail: `health status: ${body.status ?? 'unknown'}` };
-    return { ok: true, version: body.version, engine: body.engine };
-  } catch (e) {
-    return { ok: false, detail: (e as Error).message };
-  }
 }
 
 // ── Consent copy [C5 / #4029 register] ──────────────────────────────────────
@@ -1026,6 +1011,20 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   for (const t of targets) {
     if (t.host !== 'codex') continue;
     try {
+      // Plugin-lane collision WARN (not a refusal — the harness lane serves
+      // framework-spawned sessions over HTTP and may legitimately coexist
+      // with the plugin's stdio serve): two servers named `<name>` in
+      // different layers means duplicate tool registration, and which wins
+      // is host-defined.
+      const pluginOwner = codexPluginProvidesName(t.path!, flags.name);
+      if (pluginOwner) {
+        d.logError(
+          `WARNING: the '${pluginOwner}' codex plugin also provides an MCP server named '${flags.name}' — ` +
+            'after this wire, two servers with the same name exist in different layers (plugin + managed block); ' +
+            'duplicate tool registration behavior is host-defined. Keep one: `codex plugin remove gbrain`, ' +
+            'or re-run with `--remove` to drop the managed block.',
+        );
+      }
       const codexDir = dirname(t.path!);
       mkdirSync(codexDir, { recursive: true });
       const codexLock = await acquireBootstrapLock(codexDir);
@@ -1365,24 +1364,6 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     );
   }
   return allConfirmed && smokeOk ? 0 : 1;
-}
-
-/** The scopes-honoring release: any serve older verifies scoped tokens as full access. */
-/** The first release whose verify path honors the scopes column. PINNED — a
- * comparison against the moving CLI VERSION would false-flag every scope-aware
- * serve as soon as the next release ships (ship-review P3). */
-export const SCOPES_MIN_SERVE_VERSION = '0.45.14.0';
-
-export function isServeOlderThanScopes(serveVersion: string): boolean {
-  const parse = (v: string): number[] => v.split('.').map((n) => Number.parseInt(n, 10) || 0);
-  const a = parse(serveVersion);
-  const b = parse(SCOPES_MIN_SERVE_VERSION);
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    const x = a[i] ?? 0;
-    const y = b[i] ?? 0;
-    if (x !== y) return x < y;
-  }
-  return false;
 }
 
 // ── Remove [C9/F2/C8] ───────────────────────────────────────────────────────
@@ -1807,4 +1788,127 @@ export function codexBlockOwnsName(configPath: string, name: string): boolean {
   } catch {
     return false;
   }
+}
+
+// ── Plugin-lane detection (codex/claude plugins provide an MCP server) ─────
+//
+// Plugin-provided MCP servers never appear in `codex mcp list` or in
+// `[mcp_servers.*]` — the only cheap CONFIG signal is the plugin-enable
+// entry in the harness's own config. Config is not health (an enabled
+// plugin whose launcher can't find the gbrain binary still matches), so
+// every consumer pairs the detection with an override path
+// (`--mcp-even-if-plugin`) and copy that says "enabled, not necessarily
+// healthy". All three detectors below share the read/normalize posture of
+// codexBlockOwnsName: fail-open (null/false) on any read or parse error.
+
+/**
+ * Marketplace-qualified id (`<name>@<marketplace>`) when an ENABLED codex
+ * plugin named `name` exists in the codex config, else null. Line-anchored
+ * table-header scan — a commented-out lookalike or an inline mention never
+ * matches — followed by `enabled = true` before the next table header.
+ */
+export function codexPluginProvidesName(configPath: string, name: string): string | null {
+  if (!existsSync(configPath)) return null;
+  try {
+    const lines = readFileSync(configPath, 'utf8').replace(/\r\n/g, '\n').split('\n');
+    const header = new RegExp(`^\\[plugins\\."${name}@([^"]+)"\\]\\s*$`);
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(header);
+      if (!m) continue;
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j].trim();
+        if (line.startsWith('[')) break;
+        if (/^enabled\s*=\s*true\b/.test(line)) return `${name}@${m[1]}`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Marketplace-qualified id when an ENABLED Claude Code plugin named `name`
+ * exists in `~/.claude/settings.json` (`enabledPlugins`: `"<name>@<mkt>":
+ * true` — the shape verified on a live install), else null. User-level file
+ * only; project-scope enablement is out of best-effort scope.
+ */
+export function claudePluginProvidesName(settingsPath: string, name: string): string | null {
+  if (!existsSync(settingsPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf8')) as {
+      enabledPlugins?: Record<string, unknown>;
+    };
+    const enabled = parsed.enabledPlugins;
+    if (!enabled || typeof enabled !== 'object') return null;
+    const prefix = `${name}@`;
+    for (const [key, value] of Object.entries(enabled)) {
+      if (key.startsWith(prefix) && value === true) return key;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Doctor-side coexistence scan: does ANY registration for `name` exist in
+ * the harness config, regardless of owner? Unlike codexBlockOwnsName this
+ * deliberately counts foreign/manual entries — a hand-wired
+ * `[mcp_servers.<name>]` next to an enabled plugin is exactly the
+ * double-registration the doctor advisory reports. Claude side scans BOTH
+ * the user config (`~/.claude.json` mcpServers) and, when a project dir is
+ * given, the project-scope `.mcp.json`.
+ */
+export function codexAnyRegistrationExists(configPath: string, name: string): boolean {
+  if (!existsSync(configPath)) return false;
+  try {
+    const lines = readFileSync(configPath, 'utf8').replace(/\r\n/g, '\n').split('\n');
+    const header = new RegExp(`^\\[mcp_servers\\.(?:${name}|"${name}")\\]\\s*$`);
+    return lines.some(l => header.test(l));
+  } catch {
+    return false;
+  }
+}
+
+export function claudeAnyRegistrationExists(
+  userConfigPath: string,
+  name: string,
+  projectDir?: string,
+): boolean {
+  const hasInMcpServers = (servers: unknown): boolean =>
+    !!servers && typeof servers === 'object' && Object.prototype.hasOwnProperty.call(servers, name);
+  const readJson = (path: string): Record<string, unknown> | null => {
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+  const userCfg = readJson(userConfigPath) as {
+    mcpServers?: unknown;
+    projects?: Record<string, { mcpServers?: unknown }>;
+  } | null;
+  if (userCfg) {
+    // User scope: top-level mcpServers.
+    if (hasInMcpServers(userCfg.mcpServers)) return true;
+    // LOCAL scope: `claude mcp add` (README Option 1) defaults here —
+    // projects.<cwd>.mcpServers in ~/.claude.json, keyed by the resolved
+    // project path. Scan the projectDir entry (and, defensively, any entry —
+    // a duplicate under ANY project path is still a real coexistence).
+    const projects = userCfg.projects;
+    if (projects && typeof projects === 'object') {
+      if (projectDir && hasInMcpServers(projects[projectDir]?.mcpServers)) return true;
+      for (const entry of Object.values(projects)) {
+        if (hasInMcpServers(entry?.mcpServers)) return true;
+      }
+    }
+  }
+  // Project-committed .mcp.json.
+  if (projectDir) {
+    const projCfg = readJson(join(projectDir, '.mcp.json')) as { mcpServers?: unknown } | null;
+    if (projCfg && hasInMcpServers(projCfg.mcpServers)) return true;
+  }
+  return false;
 }

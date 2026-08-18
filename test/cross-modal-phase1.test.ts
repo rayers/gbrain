@@ -136,34 +136,23 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     return resolveSearchMode({ mode: 'balanced' });
   }
 
-  test('KNOBS_HASH_VERSION is 17 (cross-modal still appended; fork merge folds acmts + relational + input_type + hard-exclude + embedding-provider migration + #3430 compiled_truth boost scope + 15→16 detail fold #3515)', () => {
+  test('KNOBS_HASH_VERSION is 18 (cross-modal still appended; 16→17 degradation-stamp epoch; 17→18 autocut weak-top floor #1863)', () => {
     // v0.35 ladder: 1→2 reranker, 2→3 floor_ratio. v0.36 piggybacks on v=3
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
     // v0.40.3.0 D8 bumps to v=5 (sequenced behind salem's v=4 graph-signals).
     // v0.41.22.0 (type-unification): 5→6 for alias_resolved post-fusion boost.
-    // T2: 6→7 title_boost. v0.42.3.0: 7→8 autocut. issue #1777: 8→9 archive/
-    // demote. 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's
-    // v0.43 relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
-    // Fork merge 11→12: upstream's #1400 query-side input_type fix for asymmetric
-    // providers also claimed 10→11 independently, so the merged composition matches
-    // neither published v=11 — bump to 12 to force a clean cold-miss. Fork merge
-    // 12→13: upstream's #2825 hard-exclude fold (hx=) also claimed 11→12
-    // independently (our v=12 never carried hx=; upstream's never carried acmts=),
-    // so the merged composition matches neither published v=12 — bump to 13.
-    // Fork merge 13→14: upstream's #3390/#3391 embedding-provider migration wave
-    // also claimed 12→13 independently (legacy callers hash prov=default before
-    // AND after a provider swap, so pre-migration rows must become unreachable),
-    // so the merged composition matches neither published v=13 — bump to 14.
-    // This fork merge: upstream's #3430 (compiled_truth boost no longer applies
-    // at detail=medium) independently also reached v=14; both sides land at 14
-    // and the merged code carries both semantics, so v stays at 14.
+    // T2: 6→7 title_boost. v0.42.3.0: 7→8 autocut. issue #1777: 8→9 archive/ demote.
+    // v0.43: 9→10 relational recall arm. #1400: 10→11 query-side input_type
+    // finally reaches asymmetric providers — pre-fix rows were keyed on
+    // document-side query vectors. #2825: 11→12 hard-exclude fold (hx=).
+    // #3430: 13→14 compiled_truth boost no longer applies at detail=medium.
     // 14→15: the resolved FTS configuration name (fts=) — a language switch
     // plus `reindex-search-vector` must not keep serving pre-switch rows.
     // #3515: 15→16 detail fold (det=).
-    // Fork merge 16→17: upstream reached v=16 (fts=/det=) without our acmts;
-    // fork last published v=14 with acmts but not fts=/det=; merged carries all.
-    expect(KNOBS_HASH_VERSION).toBe(17);
+    // WP2/T3: 16→17 degradation-stamp epoch — pre-stamp cache rows must not
+    // claim a clean (undegraded) run they can't prove.
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

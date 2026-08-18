@@ -23,6 +23,7 @@ follows is `BOOTSTRAP_FOR_AGENTS.md` at the repo root, fetched at the
 | Hooks (Claude Code, ON by default) | local installs: `.claude/settings.local.json` (gitignored); cloud sandboxes: the COMMITTED `.claude/settings.json` (PATH-resolved, fail-open commands) | each prompt; fail-open; `--no-hooks` opts out at install, `GBRAIN_HOOKS=0` disables at runtime |
 | Per-turn persistence | Stop hook → debounced, detached scan-gated push (per workspace; 5 min default, every turn in cloud sandboxes) | after each assistant turn; `GBRAIN_STOP_PUSH=0` disables; `GBRAIN_STOP_PUSH_DEBOUNCE_MIN` / config `hooks.stop_push_debounce_min` tune it |
 | Session persistence | SessionEnd hook → scan-gated commit+push | at session end (note: the harness never fires SessionEnd on `/exit` — the per-turn push is what covers that) |
+| Compaction checkpoints | PreCompact hook → secret-scanned boundary segment banked to the corpus dir; a live serve harvests it into facts + `brain://` links (see `docs/guides/checkpoint-compaction.md`) | at each Claude Code compaction; links render as `## Compaction checkpoints` on the post-compaction session start |
 | Push-failure visibility | next turn's context + a user-visible notice; re-announces every 30 min while failing | whenever a background push fails |
 | Optional background job (consent-gated) | git post-commit auto-push + launchd/cron 30-min pull (pull job skipped honestly on hosts without a scheduler) | while logged in |
 | Private GitHub repo | your account, created by `bootstrap repo` (or an empty repo you made yourself, adopted) | privacy verified via API |
@@ -156,6 +157,7 @@ you'd apply to any journal: write what you'd be comfortable persisting.
 | Hooks (Claude Code) | pull protocol via AGENTS.md gates | automatic per-turn context + session-end persistence |
 | Codex (no wired hooks, no MCP scope flag) | pull protocol + MCP tools | per-turn push (stated plainly; not oversold — codex 0.147+ ships a hook system, but gbrain does not wire it yet) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
 | opencode (no wired hooks; scope INVERTED: user-global by default) | pull protocol (opencode reads AGENTS.md natively) + MCP tools; project scope available as an explicit opt-in | per-turn push (opencode ships a plugin/event system, but gbrain does not wire it yet). The project-scope default is deliberately NOT offered: opencode spawns project-config servers with no trust prompt, so a committed entry would auto-execute on every collaborator machine |
+| Bootstrap at all (plugin-only install) | MCP tools (`starter` surface, `--source-guard`) + the curated skill set via the codex/claude plugin (docs/mcp/CODEX.md) | identity files, hooks/push protocol, the private-repo body — the plugin is the lightweight lane; bootstrap is the full agent |
 | Second simultaneous session | first session unaffected | second session's brain tools fail politely (one live serve per brain — v1 contract) |
 | Postgres brain (incl. harness mode) | MCP tools every session + pull protocol | per-turn hook injection (`no_pglite_path`: the hook IPC socket is PGLite-only today; hooks stay pre-wired and light up when the engine-uniform listener lands) |
 
@@ -188,7 +190,11 @@ mode wires them in one command, with no `agent.json` and no interview:
 - Codex: one managed `[mcp_servers.gbrain]` block with the bearer token
   INLINE in the codex config (0600) — framework-spawned codex inherits no
   shell profile, so the env-var lane the `connect` path uses would never
-  reach it.
+  reach it. One owner per server name: if the gbrain codex PLUGIN is
+  also enabled, two `gbrain` servers exist in different layers — the wire
+  proceeds with a loud WARNING and `gbrain doctor` reports the collision
+  (`plugin_lane_collision`); keep one (`codex plugin remove gbrain@gbrain`, or
+  `--remove` here).
 - opencode: one managed `mcp.gbrain` remote entry with the bearer header
   INLINE in the user-global JSONC config (0600), written by the same
   comment-preserving editor the workspace lane uses — the `{env:…}`

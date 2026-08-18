@@ -265,6 +265,15 @@ export interface GBrainConfig {
    * reflex knobs.
    */
   retrieval_reflex_window_turns?: number;
+  /**
+   * v0.46.15 (identity wave) — kill switch for the reflex's lexical recall
+   * arms (lowercase weak-candidate alias arm + surname arm). Default ON
+   * (absent = enabled); `false` reproduces pre-wave resolution exactly.
+   * File-plane / env (GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS) only — same
+   * plane as the other reflex knobs; a false-fire regression in production
+   * reverts on the next turn with a config edit, no redeploy.
+   */
+  retrieval_reflex_lexical_arms?: boolean;
   embedding_image_ocr?: boolean;
   embedding_image_ocr_model?: string;
 
@@ -666,6 +675,15 @@ export function loadConfig(): GBrainConfig | null {
     ...(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS &&
       Number.isFinite(Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS))
       ? { retrieval_reflex_window_turns: Number(process.env.GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS) }
+      : {}),
+    ...(process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS
+      ? {
+          // Case-insensitive + common negatives — incident escape hatch;
+          // mirrors reflex.ts:lexicalArmsEnabled (adversarial F11).
+          retrieval_reflex_lexical_arms: !/^(false|0|off|no)$/i.test(
+            process.env.GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS.trim(),
+          ),
+        }
       : {}),
     ...(process.env.GBRAIN_REMOTE_CLIENT_SECRET && fileConfig?.remote_mcp
       ? { remote_mcp: { ...fileConfig.remote_mcp, oauth_client_secret: process.env.GBRAIN_REMOTE_CLIENT_SECRET } }
@@ -1191,6 +1209,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // stops claiming "Nothing in gbrain reads this" for a key the resolver
   // reads on every unqualified call.
   'sources.default',
+  // Alias/undeclared explicit-type warnings at sync/import (default on).
+  // Read by performSync + runImport summary aggregation; 'false'/'0'/'off'
+  // silences both surfaces (schema lint rules stay active).
+  'schema.type_warnings',
 ];
 
 /**
@@ -1211,6 +1233,12 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // chronicle.tz + future Life Chronicle knobs (#2390)
   'self_upgrade.',      // v0.42 self-upgrade (mode, quiet_hours, state)
+  // Queue admission control (per-name sub-keys):
+  //   minions.coalesce_params.<name>, minions.ttl_waiting_hours.<name>,
+  //   minions.quota_max_waiting.<name>, plus the one-time
+  //   minions.ttl_notice_shown flag. Booleans via the canonical truthiness
+  //   parser; numeric 0 disables.
+  'minions.',
 ];
 
 /**

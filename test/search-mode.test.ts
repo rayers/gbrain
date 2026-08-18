@@ -70,6 +70,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
@@ -77,7 +78,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut OFF for conservative (no reranker).
       autocut: false,
       autocut_jump: 0.2,
-      autocut_min_top_score: 0.5,
+      autocut_min_top: 0.35,
       // v0.43 — relational recall OFF for conservative.
       relationalRetrieval: false,
       relational_retrieval_depth: 2,
@@ -103,6 +104,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -110,7 +112,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut ON.
       autocut: true,
       autocut_jump: 0.2,
-      autocut_min_top_score: 0.5,
+      autocut_min_top: 0.35,
       // v0.43 — relational recall ON for balanced.
       relationalRetrieval: true,
       relational_retrieval_depth: 2,
@@ -134,6 +136,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       title_boost: 1.25,
+      evidence_cosine_floor: 0.8,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -141,7 +144,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       // v0.42.3.0 — autocut ON.
       autocut: true,
       autocut_jump: 0.2,
-      autocut_min_top_score: 0.5,
+      autocut_min_top: 0.35,
       // v0.43 — relational recall ON for tokenmax.
       relationalRetrieval: true,
       relational_retrieval_depth: 2,
@@ -404,37 +407,29 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // archive/ demote (search-exclude policy change isn't in the hash, so the
     // version bump is what invalidates archive-excluded cache rows). A query
     // must not be served from a cache row written before the policy change.
-    // 9→10 autocut weak-top floor (acmts=). Fork merge 10→11: upstream's v0.43
-    // relational recall arm (rel=/reld=) also claimed 9→10, so both land at 11.
-    // #1400: upstream bumped 10→11 for the asymmetric input_type fix — embedQuery()
-    // now produces query-side vectors for asymmetric providers (zembed-1, Voyage
-    // v3+), so rows keyed on pre-fix document-side query vectors must not be served
-    // to post-fix lookups. Fork merge 11→12: that #1400 bump and our fork-merge
-    // bump both landed at 11 independently, so the merged composition matches
-    // neither published v=11 — bump to 12 to force a clean cold-miss. #2825:
-    // upstream bumped 11→12 to fold the resolved hard-exclude prefix list (hx=) —
-    // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes. Fork
-    // merge 12→13: that #2825 bump and our fork-merge bump both landed at 12
-    // independently (our v=12 never carried hx=; upstream's never carried acmts=),
-    // so the merged composition matches neither published v=12 — bump to 13.
-    // #3390/#3391: upstream bumped 12→13 for the embedding-provider migration
-    // wave — legacy callers hash prov=default before AND after a provider swap,
-    // so pre-migration cache rows must become unreachable on upgrade. Fork merge
-    // 13→14: that bump and our fork-merge bump both landed at 13 independently,
-    // so the merged composition matches neither published v=13 — bump to 14.
-    // #3430: upstream's compiled_truth boost no longer applies at detail=medium
-    // also reached 14 independently; cached rows ranked under the old semantics
-    // must become unreachable. Both sides land at 14.
+    // v0.43: bumped 9→10 for the relational recall arm (rel=/reld=) — a
+    // relational-on write must not be served to a relational-off lookup.
+    // #1400: bumped 10→11 for the asymmetric input_type fix — embedQuery()
+    // now produces query-side vectors for asymmetric providers (zembed-1,
+    // Voyage v3+), so rows keyed on pre-fix document-side query vectors
+    // must not be served to post-fix lookups.
+    // #2825: bumped 11→12 to fold the resolved hard-exclude prefix list
+    // (hx=) — cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across
+    // processes.
+    // #3390/#3391: bumped 12→13 for the embedding-provider migration wave —
+    // legacy callers hash prov=default before AND after a provider swap, so
+    // pre-migration cache rows must become unreachable on upgrade.
+    // v0.42.67.x bumped 13→14: the compiled_truth boost no longer applies at
+    // detail=medium (#3430). Cached rows were ranked under the old semantics,
+    // so they must become unreachable rather than be served under the new ones.
     // Bumped 14→15 to fold the resolved FTS configuration name (fts=) —
     // GBRAIN_FTS_LANGUAGE retokenizes both the trigger-built search_vector and
     // the query-side tsquery, so rows written under the previous language must
     // not survive a `reindex-search-vector` switch.
     // #3515: bumped 15→16 to fold the effective detail level (det=) — a
     // detail=low write must not be served to a detail=medium lookup.
-    // Fork merge 16→17 (2026-08-14): upstream reached v=16 (fts=/det=) without
-    // our acmts; fork last published v=14 with acmts but not fts=/det=; the
-    // merged composition carries all three, so it matches neither published side.
-    expect(KNOBS_HASH_VERSION).toBe(17);
+    // v0.46.15 (#1863): bumped 17→18 to fold the autocut weak-top floor (acm=).
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('#3515: detail set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -451,7 +446,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     expect(unset).toBe(medium);
     // WP2/T3: bumped 16→17 for the degradation-stamp epoch — cache rows now
     // carry degraded[]/retrieved_count; pre-stamp rows must not claim clean.
-    expect(KNOBS_HASH_VERSION).toBe(17);
+    // v0.46.15 (#1863): 17→18 — autocut weak-top floor folds in (acm=).
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -616,8 +612,8 @@ describe('v0.40.4 — graph_signals knob', () => {
 });
 
 describe('v0.42.3.0 — autocut knobs', () => {
-  test('KNOBS_HASH_VERSION is 17 (fork merge: autocut weak-top floor + v0.43 relational arm + #1400 input_type + #2825 hard-exclude + #3390/#3391 embedding-migration wave + #3430 compiled_truth boost scope + 15→16 detail fold #3515)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(17);
+  test('KNOBS_HASH_VERSION is 18 (16→17 degradation-stamp epoch; 17→18 autocut weak-top floor #1863)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(18);
   });
 
   test('bundle defaults: conservative off, balanced/tokenmax on @0.20', () => {
@@ -626,8 +622,6 @@ describe('v0.42.3.0 — autocut knobs', () => {
     expect(MODE_BUNDLES.tokenmax.autocut).toBe(true);
     for (const m of ['conservative', 'balanced', 'tokenmax'] as const) {
       expect(MODE_BUNDLES[m].autocut_jump).toBe(0.2);
-      // v0.42.x — weak-top floor default 0.5 across all bundles.
-      expect(MODE_BUNDLES[m].autocut_min_top_score).toBe(0.5);
     }
   });
 
@@ -657,37 +651,9 @@ describe('v0.42.3.0 — autocut knobs', () => {
     expect(ov.autocut_jump).toBe(0.35);
   });
 
-  test('resolveSearchMode threads autocut_min_top_score: per-call > config > bundle', () => {
-    expect(resolveSearchMode({ mode: 'balanced' }).autocut_min_top_score).toBe(0.5);
-    expect(
-      resolveSearchMode({ mode: 'balanced', overrides: { autocut_min_top_score: 0.7 } }).autocut_min_top_score,
-    ).toBe(0.7);
-    expect(
-      resolveSearchMode({
-        mode: 'balanced',
-        overrides: { autocut_min_top_score: 0.7 },
-        perCall: { autocut_min_top_score: 0.3 },
-      }).autocut_min_top_score,
-    ).toBe(0.3);
-  });
-
-  test('loadOverridesFromConfig reads search.autocut_min_top_score (clamped [0,1])', () => {
-    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '0.7' }).autocut_min_top_score).toBe(0.7);
-    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '0' }).autocut_min_top_score).toBe(0);
-    // out of range → ignored (undefined, falls through to bundle)
-    expect(loadOverridesFromConfig({ 'search.autocut_min_top_score': '1.5' }).autocut_min_top_score).toBeUndefined();
-  });
-
   test('SEARCH_MODE_CONFIG_KEYS includes the autocut keys', () => {
     expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut');
     expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_jump');
-    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_min_top_score');
-  });
-
-  test('knobsHash includes acmts= — different weak-top floors differ', () => {
-    const a = knobsHash(resolveSearchMode({ mode: 'balanced' })); // floor 0.5
-    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { autocut_min_top_score: 0.3 } }));
-    expect(a).not.toBe(b);
   });
 
   test('knobsHash includes ac= / acj= — autocut-on vs off differ', () => {
@@ -749,5 +715,38 @@ describe('v0.43 — relational recall knobs', () => {
     const on = knobsHash(resolveSearchMode({ mode: 'balanced' })); // relational true
     const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { relationalRetrieval: false } }));
     expect(on).not.toBe(off);
+  });
+});
+
+describe('v0.46.15 — retrieval-wave knobs (evidence_cosine_floor + autocut_min_top)', () => {
+  test('loadOverridesFromConfig parses both new keys with [0,1] range guards', () => {
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '0.75' }).evidence_cosine_floor).toBe(0.75);
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '1.5' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': '-0.1' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.evidence_cosine_floor': 'cheese' }).evidence_cosine_floor).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '0.5' }).autocut_min_top).toBe(0.5);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '0' }).autocut_min_top).toBe(0);
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '2' }).autocut_min_top).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.autocut_min_top': '-1' }).autocut_min_top).toBeUndefined();
+  });
+
+  test('SEARCH_MODE_CONFIG_KEYS includes both new keys', () => {
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.evidence_cosine_floor');
+    expect(SEARCH_MODE_CONFIG_KEYS).toContain('search.autocut_min_top');
+  });
+
+  test('autocut_min_top participates in knobsHash (acm=) — cache key bifurcates', () => {
+    const base = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const tuned = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { autocut_min_top: 0.5 } }));
+    expect(base).not.toBe(tuned);
+  });
+
+  test('evidence_cosine_floor is label-only — deliberately NOT in knobsHash', () => {
+    // The floor relabels evidence strings on already-fetched results; it never
+    // changes WHICH rows come back, so folding it into the cache key would
+    // fragment the cache for zero isolation benefit.
+    const base = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const relabeled = knobsHash(resolveSearchMode({ mode: 'balanced', overrides: { evidence_cosine_floor: 0.5 } }));
+    expect(relabeled).toBe(base);
   });
 });

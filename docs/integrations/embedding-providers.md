@@ -25,7 +25,7 @@ The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atom
 |---|---|---|---|---|---|
 | `voyage` (**default** — `voyage-4` @ 1024d; `rerank-2.5` reranker on the same key) | `VOYAGE_API_KEY` | 1024 | 0.06 (`voyage-4`) | no | yes (`voyage-multimodal-3`) |
 | `openai` | `OPENAI_API_KEY` | 1536 | 0.13 | no | no |
-| `openrouter` | `OPENROUTER_API_KEY` | 1536 | 0.02 | no | model-dependent |
+| `openrouter` | `OPENROUTER_API_KEY` | per-model (1536 for the default `openai/text-embedding-3-small`; unlisted ids require explicit dims) | 0.02 | no | model-dependent |
 | `zeroentropyai` — **DEPRECATED** (hosted API **shuts down 2026-09-04**; replacement `voyage:voyage-4` — see note below) | `ZEROENTROPY_API_KEY` | 2560 (Matryoshka to 1280/640/320/...) | 0.05 | no | no |
 | `google` | `GOOGLE_GENERATIVE_AI_API_KEY` | 768 | 0.025 | no | no |
 | `azure-openai` | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT` | 1536 | 0.13 | no | no |
@@ -42,11 +42,11 @@ The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atom
 
 **Note on local providers.** Ollama and llama-server have no required API key, so they don't show up in env-detection auto-pick. Pick them explicitly with `--embedding-model ollama:<model>` to avoid silently routing to a daemon that may not be running.
 
-**Note on the ZeroEntropy hosted API.** ZeroEntropy announced (2026-07-24) that its hosted endpoints shut down on **2026-09-04**, and the recipe is deprecated: init auto-pick and the interactive picker exclude it (explicit `--embedding-model zeroentropyai:*` still works, with a loud warning), every ZE embed/rerank call prints a once-per-process deprecation warning, and `gbrain providers` annotates it DEPRECATED. A brain still embedding through the hosted API loses semantic retrieval entirely on that date — query embedding uses the same endpoint, so existing vectors become unqueryable, not just new content. The off-ramp: `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run` (cost preview), then `--yes`. 1280 is not a valid Voyage width (valid: 256/512/1024/2048), so a 1280d brain gets a one-time schema/HNSW rebuild to 1024; the OpenAI alternative keeps the width (flexible dims): `--to openai:text-embedding-3-small --dim 1280`. See [the migration guide](../guides/embedding-migration.md). Self-hosting the Apache-2.0 zembed-1 weights keeps every existing vector with zero re-embed, but the endpoint must speak ZeroEntropy's wire dialect — a generic OpenAI-compatible llama-server/Ollama will NOT work without a compat proxy (details in [`docs/ai-providers/zeroentropy.md`](../ai-providers/zeroentropy.md)). `gbrain doctor` (check `provider_sunset`) flags affected brains — including ZE-backed custom embedding columns — and prints target-aware paste-ready commands (Voyage at 1024; OpenAI keep-width when the brain's actual width is valid there); accepted the risk? `gbrain config set doctor.suppress_provider_sunset true` silences it.
+**Note on the ZeroEntropy hosted API.** ZeroEntropy announced (2026-07-24) that its hosted endpoints shut down on **2026-09-04**, and the recipe is deprecated: init auto-pick and the interactive picker exclude it (explicit `--embedding-model zeroentropyai:*` still works, with a loud warning), every ZE embed/rerank call prints a once-per-process deprecation warning, and `gbrain providers` annotates it DEPRECATED (`providers env zeroentropyai` prints the deprecation notice + migration command instead of the signup funnel, `providers explain` leads the row with ⚠ regardless of key readiness, and `gbrain doctor`'s ZE missing-key hint is migration-first). A brain still embedding through the hosted API loses semantic retrieval entirely on that date — query embedding uses the same endpoint, so existing vectors become unqueryable, not just new content. The off-ramp: `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024 --dry-run` (cost preview), then `--yes`. 1280 is not a valid Voyage width (valid: 256/512/1024/2048), so a 1280d brain gets a one-time schema/HNSW rebuild to 1024; the OpenAI alternative keeps the width (flexible dims): `--to openai:text-embedding-3-small --dim 1280`. See [the migration guide](../guides/embedding-migration.md). Self-hosting the Apache-2.0 zembed-1 weights keeps every existing vector with zero re-embed, but the endpoint must speak ZeroEntropy's wire dialect — a generic OpenAI-compatible llama-server/Ollama will NOT work without a compat proxy (details in [`docs/ai-providers/zeroentropy.md`](../ai-providers/zeroentropy.md)). `gbrain doctor` (check `provider_sunset`) flags affected brains — including ZE-backed custom embedding columns — and prints target-aware paste-ready commands (Voyage at 1024; OpenAI keep-width when the brain's actual width is valid there); accepted the risk? `gbrain config set doctor.suppress_provider_sunset true` silences it.
 
 ## If first import fails
 
-If `gbrain import` fails with `expected N dimensions, not M`, run `gbrain doctor`. The output will print the exact `gbrain config set ...` or `gbrain retrieval-upgrade` command to repair the mismatch. **You should not need to delete `~/.gbrain`.** The bug-class that historically forced `rm -rf` recoveries is closed as of v0.37.
+If `gbrain import` fails with `expected N dimensions, not M`, run `gbrain doctor`. The output will print the exact `gbrain config set ...` or `gbrain migrate embeddings` command to repair the mismatch. **You should not need to delete `~/.gbrain`.** The bug-class that historically forced `rm -rf` recoveries is closed as of v0.37.
 
 The doctor distinguishes two repair paths:
 
@@ -55,10 +55,13 @@ The doctor distinguishes two repair paths:
   gbrain init --force --pglite --embedding-model <provider>:<model> --embedding-dimensions <N>
   ```
 
-- **Non-empty brain** — migrate cleanly with the supported reindex path:
+- **Non-empty brain** — migrate cleanly with the supported migration path
+  (resumable; preview cost with `--dry-run` first):
   ```
-  gbrain retrieval-upgrade --to <provider>:<model> --reindex
+  gbrain migrate embeddings --to <provider>:<model> --dim <N>
   ```
+  Leaving ZeroEntropy specifically: `gbrain migrate embeddings --to voyage:voyage-4 --dim 1024`
+  (the full playbook is `skills/migrations/v0.46.3.0.md`).
 
 ## Decision tree
 
@@ -95,7 +98,7 @@ Voyage also serves the hosted rerankers `rerank-2.5` ($0.05/M) and `rerank-2.5-l
 gbrain init --pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 ```
 
-To switch an existing brain, use `gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024` (PGLite) or follow `docs/embedding-migrations.md` (Postgres). `gbrain config set embedding_model` is refused — the schema column has to resize.
+To switch an existing brain, run `gbrain migrate embeddings --to voyage:voyage-code-3 --dim 1024` (works on both engines; resumable, cost-previewed with `--dry-run` — see [`docs/guides/embedding-migration.md`](../guides/embedding-migration.md)). `gbrain config set embedding_model` is refused — the schema column has to resize, and the migration command is the path that does that safely.
 
 `gbrain reindex --code` will print a recommendation when run against a brain whose configured embedding model isn't code-tuned; suppress with `GBRAIN_NO_CODE_MODEL_NUDGE=1` if you've intentionally chosen another model (single-vendor procurement, compliance, etc.).
 
@@ -109,7 +112,7 @@ For GCP service-account / Vertex AI auth (production deployments), see the v0.32
 
 Single OpenAI-compatible API for fan-out to OpenAI, Anthropic, Google, DeepSeek, Meta Llama, Qwen, and dozens of other hosted providers. One key, many models. Set `OPENROUTER_API_KEY` or `openrouter_api_key` in `~/.gbrain/config.json`, then use `openrouter:<provider>/<model>` (e.g. `openrouter:openai/gpt-5.2`, `openrouter:anthropic/claude-sonnet-4.6`).
 
-**Embedding**: `openai/text-embedding-3-small` (1536d default, Matryoshka shrink to 512/768/1024). OR's embedding catalog also includes `text-embedding-3-large`, `google/gemini-embedding-2-preview`, `qwen/qwen3-embedding-8b`, `bge-m3` — opt in via `--embedding-model openrouter:<id>`. Pricing matches the upstream provider (OR adds a small markup).
+**Embedding**: `openai/text-embedding-3-small` (1536d default, Matryoshka shrink to 512/768/1024). The recipe carries verified per-model native dims for its catalog — `openai/text-embedding-3-large` (3072), `qwen/qwen3-embedding-8b` (4096), `bge-m3` (1024) — so opting in via `--embedding-model openrouter:<id>` plans the right column width automatically. Any id NOT in that list (including `google/gemini-embedding-2-preview`, whose width is unverified) has no silent default: you must pass explicit dimensions (`--embedding-dimensions <N>` or `embedding_dimensions` config) or the command errors with the fix. Pricing matches the upstream provider (OR adds a small markup).
 
 **Chat**: every chat model OR proxies works through `/v1/chat/completions`. The recipe lists 8 curated entry points (GPT-5.2 family, Claude 4.5/4.6/4.7, Gemini 3 Flash Preview, DeepSeek); any other OR catalog ID also works. Tool-calling envelope is supported by the OR endpoint, but per-model capability varies — check https://openrouter.ai/models before counting on tools for a specific slug.
 
