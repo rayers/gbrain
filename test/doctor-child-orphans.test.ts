@@ -41,7 +41,9 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.status).toBe('warn');
     expect(result.message).toContain('5 orphan row(s)');
     expect(result.message).toContain('content_chunks.page_id=5');
-    expect(result.message).toContain('DELETE FROM content_chunks WHERE page_id NOT IN (SELECT id FROM pages)');
+    expect(result.message).toContain(
+      'DELETE FROM content_chunks t WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.page_id)',
+    );
   });
 
   test('orphans in multiple tables → aggregated breakdown + multi-line cleanup', async () => {
@@ -72,14 +74,14 @@ describe('childTableOrphansCheck (#1063)', () => {
     await childTableOrphansCheck(engine);
     // The nullable-FK tables MUST have `IS NOT NULL AND` in their predicate
     // (NULL is a valid SET NULL outcome, not an orphan).
-    const filesSql = capturedSql.find((s) => s.includes('FROM files WHERE'));
+    const filesSql = capturedSql.find((s) => s.includes('FROM files t WHERE'));
     expect(filesSql).toBeDefined();
-    expect(filesSql!).toContain('page_id IS NOT NULL AND page_id NOT IN');
-    const linksOrigSql = capturedSql.find((s) => s.includes('FROM links WHERE') && s.includes('origin_page_id'));
+    expect(filesSql!).toContain('t.page_id IS NOT NULL AND NOT EXISTS');
+    const linksOrigSql = capturedSql.find((s) => s.includes('FROM links t WHERE') && s.includes('origin_page_id'));
     expect(linksOrigSql).toBeDefined();
-    expect(linksOrigSql!).toContain('origin_page_id IS NOT NULL AND origin_page_id NOT IN');
+    expect(linksOrigSql!).toContain('t.origin_page_id IS NOT NULL AND NOT EXISTS');
     // NOT-NULL FK tables MUST NOT have the IS NOT NULL filter (it'd be redundant)
-    const ccSql = capturedSql.find((s) => s.includes('FROM content_chunks WHERE'));
+    const ccSql = capturedSql.find((s) => s.includes('FROM content_chunks t WHERE'));
     expect(ccSql).toBeDefined();
     expect(ccSql!).not.toContain('IS NOT NULL');
   });
@@ -117,11 +119,31 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.message).toContain('content_chunks.page_id=234');
   });
 
+  // Regression guard for the doctor wedge: `NOT IN (SELECT id FROM pages)`
+  // cannot be planned as a hash anti-join once the id list outgrows work_mem,
+  // so it degrades to a per-outer-row rescan and hangs doctor for hours on a
+  // large brain. Every probe MUST use the NOT EXISTS anti-join form.
+  test('every probe uses a NOT EXISTS anti-join, never NOT IN', async () => {
+    const capturedSql: string[] = [];
+    const engine = makeMockEngine(async (sql: string) => {
+      capturedSql.push(sql);
+      return [{ n: 1 }];
+    });
+    const result = await childTableOrphansCheck(engine);
+    expect(capturedSql.length).toBe(10);
+    for (const sql of capturedSql) {
+      expect(sql).toContain('NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.');
+      expect(sql).not.toContain('NOT IN');
+    }
+    // The paste-ready cleanup SQL must not reintroduce the quadratic form either.
+    expect(result.message).not.toContain('NOT IN');
+  });
+
   test('all 10 target tables are queried (no silent drops)', async () => {
     const queriedTables = new Set<string>();
     const engine = makeMockEngine(async (sql: string) => {
       // Extract `FROM <table>` to verify every target gets visited
-      const m = sql.match(/FROM (\w+) WHERE/);
+      const m = sql.match(/FROM (\w+) t WHERE/);
       if (m) queriedTables.add(m[1]);
       return [{ n: 0 }];
     });

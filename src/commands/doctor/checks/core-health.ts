@@ -456,18 +456,29 @@ export async function childTableOrphansCheck(engine: BrainEngine): Promise<Check
   const errors: string[] = [];
   for (const { table, col, allowNull } of targets) {
     try {
-      // NOT IN subquery is portable across postgres + PGLite. The `pages.id`
-      // subquery covers every existing parent row.
-      const nullFilter = allowNull ? `${col} IS NOT NULL AND ` : '';
+      // NOT EXISTS is portable across postgres + PGLite *and* lets the planner
+      // use a hash anti-join. The old `NOT IN (SELECT id FROM pages)` form
+      // could not: once the id list outgrows work_mem the subplan stops being
+      // hashed and degrades to a per-outer-row rescan of pages. On a brain with
+      // ~485K pages / ~684K chunks that plan costs ~1e10 and never finishes, so
+      // doctor wedged indefinitely on this check (it has no internal timeout,
+      // and doctor only emits its JSON at the very end, so one wedged check
+      // zeroes the whole run).
+      //
+      // Semantics are unchanged: `pages.id` is the primary key, so the
+      // subquery never yields NULL — the case where NOT IN and NOT EXISTS
+      // differ. `nullFilter` still excludes outer NULLs for the two ON DELETE
+      // SET NULL columns, preserving the previous behaviour exactly.
+      const nullFilter = allowNull ? `t.${col} IS NOT NULL AND ` : '';
       const rows = await engine.executeRaw<{ n: string | number }>(
-        `SELECT COUNT(*)::int AS n FROM ${table} WHERE ${nullFilter}${col} NOT IN (SELECT id FROM pages)`,
+        `SELECT COUNT(*)::int AS n FROM ${table} t WHERE ${nullFilter}NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.${col})`,
       );
       const n = Number(rows[0]?.n ?? 0);
       if (n > 0) {
         totalOrphans += n;
         breakdown.push(`${table}.${col}=${n}`);
         cleanupSql.push(
-          `DELETE FROM ${table} WHERE ${nullFilter}${col} NOT IN (SELECT id FROM pages);`,
+          `DELETE FROM ${table} t WHERE ${nullFilter}NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.${col});`,
         );
       }
     } catch (e) {
