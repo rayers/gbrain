@@ -22,6 +22,7 @@
  */
 
 import { chat, embedOne, isAvailable } from '../ai/gateway.ts';
+import { classifyGlobalLlmError } from '../ai/errors.ts';
 import { stripReasoningBlocks } from '../llm-json.ts';
 import type { ChatResult } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
@@ -29,6 +30,7 @@ import { resolveModel } from '../model-config.ts';
 import { normalizeModelId } from '../model-id.ts';
 import type { BrainEngine, NewFact, FactKind } from '../engine.ts';
 import { normalizeMetricLabel } from './extract-from-fence.ts';
+import { isNullLikeEntity } from './write-single.ts';
 
 /**
  * v0.31 (D15): kill-switch for fact extraction.
@@ -328,6 +330,48 @@ export function buildExtractorSystem(admitsLow: boolean): string {
 
 const MAX_TURN_TEXT_CHARS = 8000;
 
+/**
+ * #4863 — JSON Schema for the extractor reply, sent as `responseSchema` on
+ * every chat() call. Only openai-compatible recipes that declare
+ * `supports_structured_outputs` (Ollama: server-side grammar-constrained
+ * decoding) receive it; every other lane ignores it. Mirrors RawExtracted:
+ * fact + kind carry data, the rest are nullable. `parseExtractorJsonDetailed`
+ * still validates the text — the schema removes the malformed-JSON class on
+ * small local models, it does not replace the parser. OpenAI-strict-safe:
+ * `@ai-sdk/openai-compatible` sends `strict: true` by default, and strict
+ * mode demands every property in `required` (nullable via type unions) plus
+ * `additionalProperties: false` on each object — so a proxied backend that
+ * honors strict accepts this schema instead of 400ing on it. The parser
+ * still tolerates absent keys for backends that ignore the schema.
+ */
+const FACTS_EXTRACTION_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    facts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          fact: { type: 'string' },
+          kind: { type: 'string', enum: [...ALL_EXTRACT_KINDS] },
+          entity: { type: ['string', 'null'] },
+          confidence: { type: ['number', 'null'] },
+          notability: { type: 'string', enum: ['high', 'medium', 'low'] },
+          metric: { type: ['string', 'null'] },
+          value: { type: ['number', 'null'] },
+          unit: { type: ['string', 'null'] },
+          period: { type: ['string', 'null'] },
+        },
+        required: ['fact', 'kind', 'entity', 'confidence', 'notability', 'metric', 'value', 'unit', 'period'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['facts'],
+  additionalProperties: false,
+};
+const FACTS_RESPONSE_SCHEMA = { name: 'facts_extraction', schema: FACTS_EXTRACTION_SCHEMA };
+
 export type ExtractFailureReason =
   | 'chat_unavailable'
   | 'provider_error'
@@ -348,6 +392,31 @@ export type ExtractFactsOutcome =
     };
 
 /**
+ * Bounded diagnostic breadcrumb for the message: the cause's CONSTRUCTOR name
+ * (validated as a plain identifier — never `.name`, never `.message`) plus
+ * the whole-run class `classifyGlobalLlmError` derives from the cause chain
+ * (`auth` / `billing` / `rate_limit`, the same vocabulary ingest_log uses).
+ * Both are closed vocabularies with no interpolated provider text, so a 4xx
+ * body echoing a key / org id cannot ride through. Defense-in-depth, not a
+ * hard boundary: anything unexpected is dropped (never substituted), and a
+ * throwing getter can never mask the real FactsExtractionError.
+ */
+function safeCauseLabel(cause: unknown): string | undefined {
+  try {
+    let ctorName: string | undefined;
+    if (cause instanceof Error) {
+      const ctor: unknown = cause.constructor;
+      const name: unknown = typeof ctor === 'function' ? ctor.name : undefined;
+      if (typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name)) ctorName = name;
+    }
+    const label = [ctorName, classifyGlobalLlmError(cause)].filter(Boolean).join(' ');
+    return label || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Typed carrier for extraction failures that must PROPAGATE (throw) rather
  * than collapse to zero counts — `truncated_output` has no underlying error
  * object to rethrow and `provider_error.error` is optional, so a synthesized
@@ -361,12 +430,16 @@ export class FactsExtractionError extends Error {
   readonly reason: ExtractFailureReason;
   readonly model?: string;
   constructor(reason: ExtractFailureReason, model?: string, cause?: unknown) {
-    // The MESSAGE deliberately carries only reason + model — never
-    // `cause.message`. This error's message flows to remote MCP callers
-    // (dispatch returns e.message) and into persisted logs (ingest_log,
-    // mcp_request_log), and provider 4xx bodies echo partially-redacted API
-    // keys / org ids. The full cause stays attached for local debugging.
-    super(`[facts-extract] ${reason}${model ? ` (model=${model})` : ''}`);
+    // The MESSAGE carries only reason + model + a bounded cause breadcrumb
+    // (see `safeCauseLabel`) — never `cause.message`. It flows to remote MCP
+    // callers (dispatch returns e.message) and into persisted logs
+    // (ingest_log, mcp_request_log, minion_jobs.error_text), and provider 4xx
+    // bodies echo partially-redacted API keys / org ids. The breadcrumb is
+    // what lets a dead durable job's error_text — all that survives once the
+    // in-process `cause` is gone — tell an auth failure from a transient one.
+    // The full cause stays attached for local debugging.
+    const causeLabel = safeCauseLabel(cause);
+    super(`[facts-extract] ${reason}${model ? ` (model=${model})` : ''}${causeLabel ? ` (cause=${causeLabel})` : ''}`);
     this.name = 'FactsExtractionError';
     this.reason = reason;
     this.model = model;
@@ -445,6 +518,7 @@ export async function extractFactsFromTurnWithOutcome(
       messages: [{ role: 'user', content: userContent }],
       maxTokens,
       abortSignal: input.abortSignal,
+      responseSchema: FACTS_RESPONSE_SCHEMA,
     });
     // #2113: never checked pre-fix — a truncated response (stopReason
     // 'length', e.g. reasoning tokens eating the cap on mandatory-reasoning
@@ -462,6 +536,7 @@ export async function extractFactsFromTurnWithOutcome(
         messages: [{ role: 'user', content: userContent }],
         maxTokens: effectiveMaxTokens,
         abortSignal: input.abortSignal,
+        responseSchema: FACTS_RESPONSE_SCHEMA,
       });
       if (result.stopReason === 'length') {
         process.stderr.write(
@@ -502,6 +577,7 @@ export async function extractFactsFromTurnWithOutcome(
         messages: [{ role: 'user', content: userContent }],
         maxTokens: effectiveMaxTokens,
         abortSignal: input.abortSignal,
+        responseSchema: FACTS_RESPONSE_SCHEMA,
       });
     } catch (err) {
       if (isAbort(err)) throw err;
@@ -593,7 +669,13 @@ export async function extractFactsFromTurnWithOutcome(
       // as the entity (self-attribution of a first-person claim from a speaker
       // we cannot identify), drop the attribution but KEEP the fact. Third-person
       // entities (e.g. "acme") never match this predicate and pass through.
-      entity_slug: isUnknownSpeakerLabel(candidate.entity) ? null : (candidate.entity ?? null),
+      // #4755: same for a null-like placeholder STRING ("null", "None", "n/a")
+      // where the prompt asked for JSON null — otherwise the resolver's
+      // fallback adopts the token as the slug and the facts land unreachable
+      // under entity_slug='null'. Same token set the `remember` verb applies.
+      entity_slug: isUnknownSpeakerLabel(candidate.entity) || isNullLikeEntity(candidate.entity)
+        ? null
+        : (candidate.entity ?? null),
       source: input.source,
       source_session: input.sessionId ?? null,
       confidence,

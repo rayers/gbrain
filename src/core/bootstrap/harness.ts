@@ -55,6 +55,8 @@ import {
   stripAmbientWritebackBlockAt,
 } from './instructions-block.ts';
 import { createEngine } from '../engine-factory.ts';
+import { isValidSourceId } from '../source-id.ts';
+import { ALL_SOURCES, isResolverUserError, localFederatedSourceIds, resolveSourceWithTier } from '../source-resolver.ts';
 import { probeBrainIdentity, type ConnectProbeResult } from '../connect-probe.ts';
 import {
   buildClaudeMcpAddArgv,
@@ -201,7 +203,15 @@ export function parseHarnessArgs(rest: string[]): HarnessFlags {
     out.port = n;
   }
   const source = value('--source');
-  if (source !== undefined) out.source = source;
+  if (source !== undefined) {
+    // Every other flag is validated here; a typo'd id would otherwise mint a
+    // token and wire hooks to a phantom scope (reads return nothing).
+    if (!isValidSourceId(source)) {
+      out.error = `invalid --source '${source}' (a source id matches [a-z0-9-]{1,32}; '${ALL_SOURCES}' is not a hook scope)`;
+      return out;
+    }
+    out.source = source;
+  }
   out.tokenName = value('--token-name') ?? out.tokenName;
   const token = value('--token');
   if (token !== undefined) out.token = token;
@@ -284,6 +294,14 @@ export interface HarnessDeps {
     sourceGrant?: string[];
   }) => Promise<MintedLegacyToken>;
   revokeById?: (id: string) => Promise<boolean>;
+  /** Resolve the source the hooks + token bind to, through the SAME resolver
+   * the serve's resolve-IPC binding uses (resolveSourceWithTier: env →
+   * dotfile → local_path → sources.default → sole non-default → seed
+   * default), plus that source's local federated read set, so the hook lane
+   * reads what search/think read (#4897). `explicit` = --source (validated +
+   * asserted to exist). Throws on an unknown id or an unopenable engine — the
+   * caller decides fail-open vs fail-closed. Tests inject a fake. */
+  resolveHookSource?: (explicit: string | null) => Promise<HookSourceBinding>;
   /** Live-PGLite-serve pre-probe for the revoke lane [C9]. */
   pgliteLiveServe?: () => boolean;
   detectClaude?: () => boolean;
@@ -322,6 +340,7 @@ function resolveDeps(deps: HarnessDeps): Required<Omit<HarnessDeps, 'gbrainBin'>
     loadFileConfig: deps.loadFileConfig ?? loadConfigFileOnly,
     mint: deps.mint ?? defaultMint,
     revokeById: deps.revokeById ?? defaultRevokeById,
+    resolveHookSource: deps.resolveHookSource ?? defaultResolveHookSource,
     pgliteLiveServe: deps.pgliteLiveServe ?? defaultPgliteLiveServe,
     // #4325: config-dir fallback mirrors detectCodex/detectOpencode below —
     // CI runners and alias-only shells don't expose a `claude` binary on the
@@ -406,6 +425,35 @@ async function defaultMint(opts: { name: string; scopes: string[]; sourceGrant?:
       scopes: opts.scopes,
       ...(sourceGrant && sourceGrant.length > 0 ? { sourceGrant } : {}),
     });
+  } finally {
+    await engine.disconnect();
+  }
+}
+
+/** The source the hooks + token bind to, and the read grant the token carries. */
+export interface HookSourceBinding {
+  source_id: string;
+  /** The federated read set for an ambient tier (what search/think read);
+   * `[source_id]` for an explicit --source or a non-federated source. */
+  grant: string[];
+}
+
+/** Production hook-source lookup: the SAME resolver the serve's resolve-IPC
+ * binding runs (`resolveSourceWithTier(engine, null)`), so the hooks claim
+ * exactly the source the serve resolves; an explicit --source goes through
+ * tier 1 (shape + existence). NOT fail-open: on a PGLite brain under a live
+ * serve the engine cannot open, and applyHarness decides what that means
+ * (refuse without --source; bind an explicit --source unverified). */
+async function defaultResolveHookSource(explicit: string | null): Promise<HookSourceBinding> {
+  const cfg = loadConfig();
+  if (!cfg) throw new Error('no brain configured (run `gbrain init` first)');
+  const engineConfig = toEngineConfig(cfg);
+  const engine = await createEngine(engineConfig);
+  await engine.connect(engineConfig);
+  try {
+    const resolved = await resolveSourceWithTier(engine, explicit);
+    const grant = (await localFederatedSourceIds(engine, resolved.source_id, resolved.tier)) ?? [resolved.source_id];
+    return { source_id: resolved.source_id, grant };
   } finally {
     await engine.disconnect();
   }
@@ -668,6 +716,22 @@ async function cleanupStalePriorTargets(
   }
 }
 
+/** A live `gbrain serve` holds this PGLite brain: the two documented escape hatches. */
+function liveServeRefusal(): BootstrapError {
+  return new BootstrapError(
+    'LIVE_SERVE',
+    'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token — either ' +
+      'pre-mint one while the serve is stopped (`gbrain auth create bootstrap-harness --scopes read,write`) ' +
+      'and re-run with --token <value>, or stop the serve, re-run this command, and restart it. ' +
+      '(Postgres brains mint fine while the serve runs.)',
+  );
+}
+
+/** The engine could not open because a live serve holds the PGLite brain (vs any other failure). */
+function isLiveServeFailure(msg: string, d: Pick<Required<HarnessDeps>, 'pgliteLiveServe'>): boolean {
+  return /already open through `gbrain serve`|LiveServeLockError/i.test(msg) || d.pgliteLiveServe();
+}
+
 export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): Promise<number> {
   const d = resolveDeps(rawDeps);
   // stdout-for-data discipline: under --json, stdout carries ONLY the final
@@ -862,6 +926,66 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
   // 4. Plan targets + WRITE-AHEAD receipt [F1/X6] — BEFORE the mint, so a
   // crash (or a newer-format receipt refusal) can never leave a live token
   // no receipt records.
+  // #4897: without --source the hooks must claim the source the serve's
+  // resolve-IPC listener is bound to — resolved through the SAME chain the
+  // serve runs (env → dotfile → local_path → sources.default → sole
+  // non-default → seed default), or every turn_context is `source_mismatch`.
+  // The token floors on that source's federated read set (what search/think
+  // read): the federated-default mint cannot read a sole non-federated
+  // source (page_count 0). A resolution that lands on the seeded 'default'
+  // (or a `__all__` env) is the federated floor, not a scalar grant (same
+  // guard as dream.ts).
+  let bound: HookSourceBinding;
+  // Live PGLite serve + --token, no --source: the hooks carry NO source pin
+  // (a claim-free request resolves through the serve's own binding).
+  let unpinnedHooks = false;
+  try {
+    bound = await d.resolveHookSource(flags.source ?? null);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (isResolverUserError(e)) {
+      // A typo'd --source / stale GBRAIN_SOURCE or dotfile: minting a token
+      // to a phantom scope would "succeed" and then read nothing.
+      throw new BootstrapError('SOURCE_UNRESOLVED', msg);
+    }
+    if (flags.source) {
+      // The engine could not open (a live PGLite serve + --token is the
+      // documented path here); the explicit id is the operator's word.
+      d.logError(`WARNING: could not verify --source '${flags.source}' against the brain (${msg}); binding to it unverified.`);
+      bound = { source_id: flags.source, grant: [flags.source] };
+    } else if (isLiveServeFailure(msg, d)) {
+      // A live PGLite serve holds the brain. Without a token the mint below
+      // would refuse anyway — refuse HERE with the same two escape hatches, so
+      // the operator never sees a source-resolution error for a lock problem.
+      if (flags.token === undefined) throw liveServeRefusal();
+      // --token lane (the documented PGLite path): nothing is minted, so the
+      // grant is the operator's own token. Leave the hooks UNPINNED — a hook
+      // request that names no source resolves through the live serve's own
+      // binding, which is exactly the source the serve resolves (#4897). Say
+      // so, and name the override.
+      d.logError(
+        'WARNING: a live `gbrain serve` holds this PGLite brain, so the harness could not read which source it ' +
+          "serves; wiring the hooks unpinned (they resolve through the live serve). If `gbrain sources list` " +
+          "shows a default other than 'default', re-run with --source <id>.",
+      );
+      bound = { source_id: 'default', grant: ['default'] };
+      unpinnedHooks = true;
+    } else {
+      // Silently binding 'default' here is the #4897 bug reopened: the serve
+      // may resolve a different source and every hook turn would mismatch.
+      throw new BootstrapError(
+        'SOURCE_UNRESOLVED',
+        `could not resolve the source the serve binds its hooks to (${msg}) — pass --source <id> ` +
+          '(`gbrain sources list` shows the registered ids) and re-run.',
+      );
+    }
+  }
+  const implicitSource =
+    flags.source || bound.source_id === 'default' || bound.source_id === ALL_SOURCES ? null : bound.source_id;
+  const hookSource: string | null = unpinnedHooks ? null : (flags.source ?? implicitSource ?? 'default');
+  if (implicitSource) {
+    d.log(`binding hooks + token to source '${implicitSource}' (the serve's resolved default; pass --source to override).`);
+  }
   const guard = guardHarnessReceiptOverwrite(d.gbrainHome);
   if (guard.brokenBackupPath) {
     d.logError(`WARNING: the harness receipt was unreadable; backed it up to ${guard.brokenBackupPath}.`);
@@ -956,7 +1080,8 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
     url,
     ...(health.engine ? { engine: health.engine } : {}),
     ...(health.version ? { serve_version: health.version } : {}),
-    source_id: flags.source ?? 'default',
+    source_id: hookSource ?? 'default',
+    ...(unpinnedHooks ? { source_pinned: false as const } : {}),
     token: {
       name: flags.tokenName,
       minted: flags.token === undefined,
@@ -983,20 +1108,15 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
         name: flags.tokenName,
         scopes: ['read', 'write'],
         // [X2] --source is the write floor — a scalar grant, the stdio
-        // env-tier mirror. Without it the default mint federates.
-        ...(flags.source ? { sourceGrant: [flags.source] } : {}),
+        // env-tier mirror. An implicit non-default source carries its
+        // federated read set (#4897 — the same set search/think read, not a
+        // scalar that would hide every federated sibling). Neither → the
+        // default mint federates.
+        ...(flags.source || implicitSource ? { sourceGrant: bound.grant } : {}),
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (/already open through `gbrain serve`|LiveServeLockError/i.test(msg) || d.pgliteLiveServe()) {
-        throw new BootstrapError(
-          'LIVE_SERVE',
-          'a live `gbrain serve` holds this PGLite brain, so the harness cannot mint a token — either ' +
-            'pre-mint one while the serve is stopped (`gbrain auth create bootstrap-harness --scopes read,write`) ' +
-            'and re-run with --token <value>, or stop the serve, re-run this command, and restart it. ' +
-            '(Postgres brains mint fine while the serve runs.)',
-        );
-      }
+      if (isLiveServeFailure(msg, d)) throw liveServeRefusal();
       throw e;
     }
     token = minted.token;
@@ -1148,7 +1268,7 @@ export async function applyHarness(flags: HarnessFlags, rawDeps: HarnessDeps): P
       } else {
         const settingsPath = t.scope === 'user' ? d.userSettingsPath : t.path!;
         const env: ClaudeHookEnv = {
-          GBRAIN_SOURCE: flags.source ?? 'default',
+          ...(hookSource !== null ? { GBRAIN_SOURCE: hookSource } : {}),
           GBRAIN_HOOK_LANE: 'harness',
         };
         const bin = flags.gbrainBin ?? d.gbrainBin;
@@ -1988,6 +2108,12 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   // from the host registration or degrade honestly.
   let token: string | null = null;
   let tokenSource = '';
+  // #4586: the [C8] ownership probe doubles as the LIVE verdict for the
+  // claude-code mcp target. Positive evidence only — a URL that is not ours,
+  // or a non-HTTP transport at OUR (user) scope — flips the displayed state
+  // to 'failed'; not-found / unparseable stays the receipt's honest degrade.
+  // Status is read-only: the receipt itself is never rewritten here.
+  let claudeLiveError: string | null = null;
   const claudeMcp = receipt.targets.find((t) => t.host === 'claude-code' && t.kind === 'mcp');
   if (claudeMcp) {
     try {
@@ -2002,12 +2128,29 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
         if (info.found && info.url === receipt.url) {
           token = parseClaudeMcpGetBearer(out);
           if (token) tokenSource = 'claude registration';
+        } else if (info.found && info.url) {
+          claudeLiveError =
+            `registration now points at ${info.url}, not ${receipt.url} — owned by another install; ` +
+            're-run `gbrain bootstrap harness --force` to reclaim, or --remove';
+        } else if (info.found) {
+          // No URL line: a stdio (or other non-HTTP) launch. Only a same-scope
+          // entry is a replacement; a project-scope one merely shadows ours
+          // from that cwd, which re-running the harness cannot undo.
+          const type = out.match(/^\s*Type:\s*(\S+)/m)?.[1];
+          if (type && type.toLowerCase() !== 'http' && /^\s*Scope:\s*User\b/im.test(out)) {
+            claudeLiveError =
+              `registration at user scope is now a ${type} serve (a \`claude mcp add\` or ` +
+              '`bootstrap hooks --scope user` replaced the HTTP wiring) — re-run `gbrain bootstrap harness` to reclaim';
+          }
         }
       }
     } catch {
       /* degrade */
     }
   }
+  const liveTargets = receipt.targets.map((t) =>
+    t === claudeMcp && claudeLiveError ? { ...t, state: 'failed' as const, error: claudeLiveError } : t,
+  );
   if (!token) {
     const codexMcp = receipt.targets.find((t) => t.host === 'codex' && t.kind === 'mcp');
     if (codexMcp?.path && existsSync(codexMcp.path)) {
@@ -2096,7 +2239,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
           token_name: receipt.token.name,
           token_verified: tokenVerified,
           degraded_per_turn: degraded,
-          targets: receipt.targets,
+          targets: liveTargets,
           ...(instructionsProbes.length > 0 ? { instructions_blocks: instructionsProbes } : {}),
           pending_previous_tokens: receipt.token.previous_ids ?? [],
           receipt_path: harnessReceiptPath(d.gbrainHome),
@@ -2108,7 +2251,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   } else {
     d.log(serveLine);
     d.log(tokenLine);
-    for (const t of receipt.targets) {
+    for (const t of liveTargets) {
       d.log(`  ${t.host}/${t.kind} (${t.scope}): ${t.state}${t.error ? ` — ${t.error}` : ''}`);
     }
     for (const p of instructionsProbes) {
@@ -2131,7 +2274,7 @@ export async function statusHarness(flags: HarnessFlags, rawDeps: HarnessDeps): 
   // crashed apply's pending/failed targets and an unconverged rotation are
   // NOT success just because /health answers (ship-review P2). The
   // token-unrecoverable honest degrade stays 0 per the documented contract.
-  const allTargetsConfirmed = receipt.targets.every((t) => t.state === 'confirmed');
+  const allTargetsConfirmed = liveTargets.every((t) => t.state === 'confirmed');
   const rotationConverged = (receipt.token.previous_ids?.length ?? 0) === 0;
   // Half-removed state (red-team CRITICAL): --remove under a live PGLite
   // serve strips every host target but defers the revoke, leaving a

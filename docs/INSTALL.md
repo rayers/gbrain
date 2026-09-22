@@ -1,12 +1,16 @@
 # Install
 
-**Recommended door: the agent bootstrap.** Open your agent (Codex, Claude Code,
-or any harness) in the folder that will become its home and paste the block
-from the [README's install section](../README.md) — the agent fetches
-`BOOTSTRAP_FOR_AGENTS.md` from the `latest-stable` tag, installs the CLI,
-initializes a local PGLite brain, wires MCP, and isn't done until
-`gbrain bootstrap verify` exits 0. Full contract, security posture, and
-uninstall: [docs/guides/bootstrap.md](guides/bootstrap.md).
+Start by choosing the setup you need:
+
+- **Add memory to the agent you already use (recommended):** [Grok Bot](guides/grok-bot.md), [Muse](guides/muse.md), or [Codex / Claude Code](tutorials/connect-coding-agent.md). Keep the existing identity; start keyless, without a personal-agent repository.
+- **Connect to your existing hosted brain:** [private handoff and harness access](guides/hosted-harness-access.md). Provision on the host, install in the client environment.
+
+
+**Optional: create a new persistent personal agent.** If you want identity
+files and a private repository, use the separate
+[bootstrap guide](guides/bootstrap.md) in a supported harness. The recommended
+memory-only setup above preserves your existing agent's identity and needs
+neither a bootstrap interview nor a private repository.
 
 The paths below are the manual equivalents and deep-dive detail. Pick one.
 Mix later if needed.
@@ -100,7 +104,15 @@ The agent spawns `gbrain serve` as a stdio subprocess against your local brain. 
 gbrain serve                      # stdio MCP (Claude Desktop / Code / Cursor)
 gbrain serve --surface verbs      # stdio MCP, just the 7 memory verbs (quickstart)
 gbrain serve --http               # HTTP MCP with OAuth 2.1 + admin dashboard
+gbrain mcp expose                 # publish serve --http on your Tailscale tailnet (HTTPS + user service)
 ```
+
+To reach the brain on this computer from your other devices, desktop apps or
+cloud agents, `gbrain mcp expose` publishes the HTTP server on your Tailscale
+tailnet and keeps it running as a user service (`--funnel` is the explicit
+opt-in for agents that run in a vendor's cloud). Guide:
+[use your brain from anywhere over MCP](guides/remote-mcp.md).
+**Say to your agent:** *"use my brain over mcp"* — *"put my brain on tailscale"*.
 
 **Wire a coding agent to a remote brain in one command** (when you have an HTTP
 server + a bearer token): `gbrain connect` prints a paste-ready setup block, or

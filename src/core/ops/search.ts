@@ -1,3 +1,4 @@
+import { readHolders } from './context.ts';
 /**
  * Search operation cluster (search + query) — pure move from operations.ts
  * (v0.46.x tranche 1). search_by_image stays in operations.ts (v0.36 Phase 2
@@ -23,10 +24,12 @@ import type { HybridSearchMeta } from '../types.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-cap.ts';
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
+import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import {
+  assertExplicitSourceLive,
   federatedSearchScope,
   parseSourceIdParam,
   resolvePerCallMode,
@@ -54,6 +57,44 @@ async function resolveEffectiveLimit(ctx: OperationContext, p: Record<string, un
 
 // --- Search ---
 
+type SourceScope = { sourceId?: string; sourceIds?: string[] };
+
+/**
+ * #5004: does the caller's read scope still hold markdown pages below the
+ * safe-chunk index version? Every remote chunk read withholds them (the
+ * `requireSafeChunks` predicate in each engine leg) until
+ * `gbrain reindex --markdown` seals them, so an empty remote result on such
+ * a brain is a policy gap, not a clean miss. Same scope precedence as
+ * sourceScopeOpts (federated array > scalar > brain-wide); indexed LIMIT 1
+ * probe, portable SQL on both engines, fail-open.
+ *
+ * The predicate is the plain range `chunker_version < N` (the column is
+ * SMALLINT NOT NULL, so it is the same set as `NOT safeChunksFilter`), NOT
+ * the COALESCE form the read legs use: only the range is sargable, and this
+ * runs on every empty remote result — on a fully sealed brain the COALESCE
+ * form walked every markdown page. The probe deliberately ignores the call's
+ * `types` / `excludePrivate` filters: it answers "is the fence withholding
+ * anything in scope", not "would this exact query have matched".
+ */
+async function hasUnsealedPagesInScope(ctx: OperationContext, scope: SourceScope): Promise<boolean> {
+  const [sourceClause, params] = scope.sourceIds?.length
+    ? ['AND p.source_id = ANY($1::text[])', [scope.sourceIds]]
+    : scope.sourceId
+      ? ['AND p.source_id = $1', [scope.sourceId]]
+      : ['', []];
+  try {
+    const rows = await ctx.engine.executeRaw(
+      `SELECT 1 FROM pages p JOIN sources s ON s.id = p.source_id
+       WHERE p.page_kind = 'markdown' AND p.deleted_at IS NULL AND NOT s.archived
+         AND p.chunker_version < ${SAFE_FENCE_CHUNKER_VERSION} ${sourceClause} LIMIT 1`,
+      params,
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * WP2/D3 + E1: the `retrieval` response-meta payload for the search/query
  * ops. Carries the already-computed HybridSearchMeta signal (vector arm,
@@ -61,18 +102,30 @@ async function resolveEffectiveLimit(ctx: OperationContext, p: Record<string, un
  * the concept-shaped hint, so an MCP caller can distinguish "clean miss"
  * from "the pipeline degraded" without a second call. The `hint` is
  * non-contractual prose (agents read it; nothing should parse it).
+ *
+ * #5004: this is the ONE producer of the channel (keyword-only path included,
+ * which never runs hybridSearch), so the safe-chunk fence is disclosed here:
+ * an empty result for a remote caller whose scope still holds unsealed pages
+ * gets `safe_index_pending` appended. The withholding itself is unchanged.
  */
-function buildRetrievalResponseMeta(
+async function buildRetrievalResponseMeta(
+  ctx: OperationContext,
+  scope: SourceScope,
   queryText: string,
   results: unknown[],
   meta: HybridSearchMeta | null,
   opts: { conceptHint?: boolean } = {},
-): Record<string, unknown> {
-  const m = meta as (HybridSearchMeta & { degraded?: unknown; retrieved_count?: number }) | null;
+): Promise<Record<string, unknown>> {
+  const m = meta as (HybridSearchMeta & { degraded?: unknown[]; retrieved_count?: number }) | null;
   const hint = opts.conceptHint && looksConceptShaped(queryText)
     ? "concept-shaped question — the 'query' tool adds multi-query expansion and recovers " +
       'synonym-phrased matches this keyword-leaning search can miss.'
     : undefined;
+  const safeIndexPending = results.length === 0 && ctx.remote !== false
+    && await hasUnsealedPagesInScope(ctx, scope);
+  const degraded = safeIndexPending
+    ? [...(m?.degraded ?? []), { stage: 'safe_index_pending' }]
+    : m?.degraded;
   return {
     returned_count: results.length,
     retrieved_count: m?.retrieved_count ?? results.length,
@@ -81,8 +134,8 @@ function buildRetrievalResponseMeta(
       expansion_applied: m.expansion_applied,
       ...(m.cache ? { cache: m.cache.status } : {}),
       ...(m.token_budget ? { token_budget: m.token_budget } : {}),
-      ...(m.degraded !== undefined ? { degraded: m.degraded } : {}),
     } : {}),
+    ...(degraded !== undefined ? { degraded } : {}),
     ...(hint ? { hint } : {}),
   };
 }
@@ -205,6 +258,8 @@ const search: Operation = {
     // trusted-local federated span is unchanged.
     const sourceIdParam = parseSourceIdParam(p.source_id, 'search', { allowAll: true });
     const scope = federatedSearchScope(ctx, sourceIdParam);
+    // #4620: an explicit source_id must name a live source (after the grant check).
+    await assertExplicitSourceLive(ctx, sourceIdParam);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -220,7 +275,7 @@ const search: Operation = {
     const keywordOnly = (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
 
     if (keywordOnly) {
-      const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, ...(types ? { types } : {}), ...scope });
+      const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, requireSafeChunks: ctx.remote !== false, ...(types ? { types } : {}), ...scope });
       const results = dedupResults(raw);
       // #3783 — every row here IS a keyword hit (direct FTS path); mark
       // before stamping so evidence still reads keyword_exact.
@@ -230,14 +285,14 @@ const search: Operation = {
       // #1699: the keyword-only opt-out must STILL surface the content_flag
       // agent-warning channel (hybridSearch stamps it; this branch bypasses
       // hybridSearch, so stamp explicitly). Fail-open inside the helper.
-      await stampContentFlags(ctx.engine, results);
+      await stampContentFlags(ctx.engine, results, { ...scope, excludePrivate });
       // #160: same for the unverified auto-extracted stub marker (no boost
       // to cancel on this path — keyword-only never applies the compiled-
       // truth boost — but the provenance marker must still surface).
-      await stampUnverifiedExtractions(ctx.engine, results);
+      await stampUnverifiedExtractions(ctx.engine, results, { ...scope, excludePrivate });
       bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
       maybeCaptureSearch(ctx, queryText, results, Date.now() - startedAt, false);
-      ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, null, { conceptHint: true }));
+      ctx.emitResponseMeta?.('retrieval', await buildRetrievalResponseMeta(ctx, scope, queryText, results, null, { conceptHint: true }));
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return applySnippetCap(results, snippetCap);
     }
@@ -250,6 +305,8 @@ const search: Operation = {
       offset,
       expansion: false,
       excludePrivate,
+      requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx),
       ...(types ? { types } : {}),
       ...scope,
       ...(perCallMode ? { mode: perCallMode } : {}),
@@ -262,7 +319,7 @@ const search: Operation = {
     const latency_ms = Date.now() - startedAt;
     bumpLastRetrievedAt(ctx.engine, results.map((r) => r.page_id));
     maybeCaptureSearch(ctx, queryText, results, latency_ms, true, capturedMeta);
-    ctx.emitResponseMeta?.('retrieval', buildRetrievalResponseMeta(queryText, results, capturedMeta, { conceptHint: true }));
+    ctx.emitResponseMeta?.('retrieval', await buildRetrievalResponseMeta(ctx, scope, queryText, results, capturedMeta, { conceptHint: true }));
     // #3800: cap AFTER capture/meta so eval + cache see the real payload.
     return applySnippetCap(results, snippetCap);
   },
@@ -415,6 +472,8 @@ const query: Operation = {
     // #2561: unqualified trusted-local query spans federated sources (per-call
     // source_id / remote grants still resolve through resolveRequestedScope).
     const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
+    // #4620: an explicit source_id must name a live source (after the grant check).
+    await assertExplicitSourceLive(ctx, sourceIdParam);
     // #4352 — same enforcement for the full-control query op (both the image
     // searchVector branch and the text hybrid path below).
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
@@ -440,6 +499,8 @@ const query: Operation = {
         offset: (p.offset as number) || 0,
         embeddingColumn: 'embedding_image',
         excludePrivate,
+        requireSafeChunks: ctx.remote !== false,
+        takesHoldersAllowList: readHolders(ctx),
         ...(types ? { types } : {}),
         ...querySourceScope,
       });
@@ -467,8 +528,8 @@ const query: Operation = {
     // cross-source mode (matches SearchOpts.sourceId contract).
     let capturedMeta: HybridSearchMeta | null = null;
     // v0.32.x search-lite: route the query op through hybridSearchCached so
-    // semantic cache + token budget + intent weighting fire automatically.
-    // Plain hybridSearch remains the bare API for callers that opt out.
+    // token budget and intent weighting apply at the operation boundary.
+    // Semantic cache reuse is suspended in the wrapper.
     // (#1663: `let` — the CRAG gate below may swap in an escalated run.)
     let results = await hybridSearchCached(ctx.engine, queryText, {
       // #4356 — was a hard `|| 20`, independent of the mode-resolution
@@ -482,6 +543,8 @@ const query: Operation = {
       limit: (p.limit as number) || undefined,
       offset: (p.offset as number) || 0,
       excludePrivate,
+      requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx),
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
       // T4/D5 — per-call mode (local/trusted only; remote ignored).
@@ -513,9 +576,8 @@ const query: Operation = {
       // (master's #1182 cleanup of the duplicate sourceScopeOpts spread).
       embeddingColumn: embeddingColumnParam,
       // v0.41.33 — agent-explicit adaptive return-sizing. Omitted = off
-      // (config default applies). 2026-08 wave (E5b): adaptive-on calls now
-      // CACHE — the gate params + resolved intent class key the semantic
-      // cache via the KNOBS_HASH v=27 fold (the old skip-when-on is gone).
+      // (config default applies). The wrapper still applies adaptive sizing
+      // while semantic cache reuse is suspended.
       adaptiveReturn: typeof p.adaptive_return === 'boolean' ? (p.adaptive_return as boolean) : undefined,
       // v0.42.3.0 — autocut ceiling override. Omitted = smart default (ON in
       // reranked modes). `false` forces the full top-K.
@@ -564,6 +626,9 @@ const query: Operation = {
           const effectiveLimit = await resolveEffectiveLimit(ctx, p);
           let escalatedMeta: HybridSearchMeta | null = null;
           const escalated = await hybridSearchCached(ctx.engine, queryText, {
+            excludePrivate,
+            requireSafeChunks: ctx.remote !== false,
+            takesHoldersAllowList: readHolders(ctx),
             limit: Math.max(effectiveLimit, 50),
             offset: (p.offset as number) || 0,
             expansion: true,
@@ -680,7 +745,7 @@ const query: Operation = {
     // WP2/D3: query never nudges toward itself — no concept hint here.
     // #1663: the CRAG grade rides the same retrieval meta channel.
     ctx.emitResponseMeta?.('retrieval', {
-      ...buildRetrievalResponseMeta(queryText, results, capturedMeta),
+      ...(await buildRetrievalResponseMeta(ctx, querySourceScope, queryText, results, capturedMeta)),
       crag,
     });
     // #3800: cap AFTER capture/meta/CRAG so every internal consumer graded
@@ -794,13 +859,13 @@ const cache_stats: Operation = {
   handler: async (ctx) => {
     const { withRelationGuard } = await import('./contract.ts');
     return withRelationGuard(async () => {
-      const { SemanticQueryCache, loadCacheConfig } = await import('../search/query-cache.ts');
+      const { SemanticQueryCache, loadCacheConfig, semanticResultCacheAvailable } = await import('../search/query-cache.ts');
       const config = await loadCacheConfig(ctx.engine);
       const cache = new SemanticQueryCache(ctx.engine, config);
       const stats = await cache.stats();
       return {
         schema_version: 1,
-        enabled: config.enabled ?? true,
+        enabled: semanticResultCacheAvailable() && (config.enabled ?? true),
         similarity_threshold: config.similarityThreshold,
         ttl_seconds: config.ttlSeconds,
         ...stats,

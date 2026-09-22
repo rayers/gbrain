@@ -301,8 +301,13 @@ Reports (JSON `schema_version: 1`): the effective engine vs the config-file
 engine (they can differ under a transient env URL), `db_url_source`, an
 env-shadow note when a cwd-.env `DATABASE_URL` is being excluded by the
 cwd-.env guard (gbrain never adopts a `DATABASE_URL` that Bun auto-loaded
-from the working directory's `.env`; with the precedence note when both `GBRAIN_DATABASE_URL` and
-`DATABASE_URL` are set), redacted URLs only, and — on Postgres — a
+from the working directory's `.env` family: `.env`, `.env.local`, and the
+`.env.<NODE_ENV>` / `.env.<NODE_ENV>.local` variants for `development`,
+`production` and `test`; with the precedence note when both `GBRAIN_DATABASE_URL` and
+`DATABASE_URL` are set — this `DATABASE_URL` guard matches the file's VALUE; the
+security-relevant `GBRAIN_*` variables get the stricter key-presence quarantine
+described under "Environment variables and cwd `.env` files" in `SECURITY.md`),
+redacted URLs only, and — on Postgres — a
 zero-round-trip pooler block (Supabase pooler detection, prepared-statement
 resolution, pool sizes, direct/session-pooler derivability). `--brain <id>`
 resolves a mounted brain and reports the MOUNT's engine and URL source, never

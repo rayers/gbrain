@@ -9,11 +9,18 @@ map of the same routing: one place to scan every skill and its trigger
 phrases. If a row here and a skill's frontmatter disagree, the frontmatter
 wins; fix the row.
 
-## Always-on (every message)
+## Memory defaults
+
+Preserve the existing agent's identity and instructions. Ordinary setup adds
+keyless memory; personal-agent bootstrap requires an explicit request. Recall
+and explicit remembering do not require automatic capture. Ambient capture is
+off until the user opts in, and paid enrichment is a separate choice.
+
+## Always-on recall and opt-in capture
 
 | Trigger | Skill |
 |---------|-------|
-| Every inbound message (spawn parallel, don't block) | `skills/signal-detector/SKILL.md` |
+| Every substantive inbound message, only after automatic-capture opt-in | `skills/signal-detector/SKILL.md` (delegation additionally requires authorization) |
 | Any brain read/write/lookup/citation | `skills/brain-ops/SKILL.md` |
 
 ## Brain operations
@@ -103,11 +110,13 @@ wins; fix the row.
 
 | Trigger | Skill |
 |---------|-------|
-| "Set up GBrain", first boot | `skills/setup/SKILL.md` |
+| "Set up GBrain", "install gbrain into this agent workspace", "add gbrain to my agent", first boot | `skills/setup/SKILL.md` (existing identity, keyless memory by default) |
 | "Now what?", "fill my brain", "cold start", "bootstrap my data", "import my data", "what should I import first" | `skills/cold-start/SKILL.md` |
-| "agent workspace bootstrap", "install gbrain into this agent workspace", "gbrain bootstrap", "paste-in install", "set up the maintenance sweep" | Run `gbrain bootstrap` (paste-in workspace install: interview + identity files + hooks + sweep). See `docs/guides/bootstrap.md` |
+| Explicit request to create a new personal agent with identity and private repository, "gbrain bootstrap" | Run `gbrain bootstrap`; see `BOOTSTRAP_FOR_AGENTS.md`. A generic paste-in install request routes to `skills/setup/SKILL.md`. |
 | "wire this box's coding agents to the brain", "framework-spawned sessions need brain access", "wire gbrain hooks without a workspace", "hook Claude Code/Codex to the running serve" | Run `gbrain bootstrap harness --yes` (machine-level wiring to a running `serve --http`: scoped token + user-scope MCP + headless pre-approval + hooks; no agent.json). See the "Local harness mode" section of `docs/guides/bootstrap.md` |
 | "which gbrain engine", "pglite or postgres", "gbrain engine status", "upgrade to postgres", "switch gbrain to postgres", "install postgres for gbrain", "move my brain to supabase", "set up postgres for the brain" | `skills/postgres-adopt/SKILL.md` |
+| "use my brain over mcp", "serve my brain over mcp", "expose my brain over mcp", "gbrain mcp server", "remote mcp access to my brain", "put my brain on tailscale", "gbrain mcp expose" | `skills/remote-mcp/SKILL.md` (publish the local `serve --http` on the tailnet; Funnel only for cloud agents) |
+| "connect grok bot to my brain", "connect muse to my brain", "connect claude desktop to my brain", "reach my brain from my phone" | `skills/remote-mcp/SKILL.md` (host-side publish + per-client grant; the client-side install then follows `skills/setup/SKILL.md` / hosted access) |
 | "Migrate from Obsidian/Notion/Logseq" | `skills/migrate/SKILL.md` |
 | "Switch embedding provider" / "migrate my embeddings" / "switch reranker" / "ZeroEntropy" / "provider_sunset" / "search stopped working after a provider shutdown" | `skills/migrations/v0.46.3.0.md` |
 | Brain health check, maintenance run | `skills/maintain/SKILL.md` |
@@ -140,6 +149,7 @@ When multiple skills could match:
 6. Publication/feed URL or a whole blog archive → blog-ingest; a single article/tweet URL → idea-ingest; video/audio/PDF → media-ingest; AI-chat export FILE or session transcripts → conversation-archive; CONNECT an account for live/automatic sync ("connect my chatgpt", "keep synced") → chat-connectors
 7. Identity/personality content (who the agent is, voice, persona) → soul-audit; token/structure hygiene of the always-loaded context stack → context-audit
 8. "Why is X slow/stale" measurement-first ops triage → measure-before-you-fix; code debugging ("why is this function broken") → investigate (GStack)
+9. "connect <agent> to my brain" when the brain runs on the user's own machine → remote-mcp (publish over Tailscale + grant a scoped client), then the client-side install in setup / hosted access; when the brain is ALREADY served over HTTPS by other means or hosted elsewhere → hosted access only (grant a scoped client + the client-side install; no `gbrain mcp expose`); "connect my chatgpt" / "connect my claude account" (pull an account's chat history INTO the brain) → chat-connectors; "connect gmail" / "connect google" → google-loops
 
 ## Conventions (cross-cutting)
 
