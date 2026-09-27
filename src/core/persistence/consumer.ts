@@ -124,7 +124,13 @@ export class PersistenceConsumer {
     const code = (error as { code?: unknown })?.code;
     this.lastError = { code: typeof code === 'string' && /^[a-zA-Z0-9_]{1,64}$/.test(code) ? code : 'storage_error', at: new Date().toISOString() };
     if (this.opts.onError) this.opts.onError(error);
-    else process.stderr.write('[persistence] Consumer paused after a storage error; inspect writer status.\n');
+    else {
+      // local/integration: surface the underlying error instead of only the generic line.
+      const detail = error instanceof Error
+        ? `${error.name}: ${error.message}\n${(error.stack ?? '').split('\n').slice(1, 6).join('\n')}`
+        : String(error);
+      process.stderr.write(`[persistence] Consumer paused after a storage error (code=${this.lastError.code}); inspect writer status.\n${detail.slice(0, 2000)}\n`);
+    }
   }
   private async execute(row: WriteRequest): Promise<boolean> {
     let renewing: Promise<unknown> | undefined;

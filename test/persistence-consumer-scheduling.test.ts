@@ -210,3 +210,20 @@ test('a retryable root becomes eligible again after its backoff expires', async 
     await cancelWriteRequest(engine, { kind: 'local_cli', id: config.principalIds[0] }, row.request_id);
   }
 }), 15_000);
+
+test('default error reporter logs the underlying error, not only the generic line', () => {
+  const consumer = new PersistenceConsumer(engine, { engine: 'pglite' }, async () => { throw new Error('unused'); },
+    { hostId: config.hostId, pollMs: 60_000 });
+  const writes: string[] = [];
+  const original = process.stderr.write.bind(process.stderr);
+  (process.stderr as { write: unknown }).write = (chunk: string) => { writes.push(String(chunk)); return true; };
+  try {
+    const error = Object.assign(new Error('relation "persistence_worktrees" does not exist'), { code: '42P01' });
+    (consumer as unknown as { report(e: unknown): void }).report(error);
+  } finally {
+    (process.stderr as { write: unknown }).write = original;
+  }
+  const out = writes.join('');
+  expect(out).toContain('Consumer paused after a storage error (code=42P01)');
+  expect(out).toContain('relation "persistence_worktrees" does not exist');
+});
