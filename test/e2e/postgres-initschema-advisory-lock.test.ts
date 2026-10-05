@@ -1,33 +1,15 @@
 /**
- * E2E regression test for the v0.41.x initSchema advisory-lock leak fix.
+ * E2E: initSchema must release advisory lock 42 on the backend that took it.
  *
- * Pre-fix bug: `PostgresEngine.initSchema()` ran `pool`SELECT
- * pg_advisory_lock(42)`` to acquire the lock and `pool`SELECT
- * pg_advisory_unlock(42)`` in the finally block to release. postgres.js
- * pulls a fresh physical connection from the pool on each tag-template
- * call, so the acquire ran on backend A and the unlock fired on backend B.
- * Postgres returned `false` from the unlock (lock not held by current
- * session) and the lock stayed held on backend A's session indefinitely.
+ * pg_advisory_lock is session-scoped, but ConnectionManager.ddl() returns a
+ * POOL on plain Postgres (dual-pool routing inactive). Under concurrent pool
+ * traffic the acquire and the `pg_advisory_unlock(42)` land on different
+ * backends: the unlock returns false and the holder goes back to the pool
+ * still holding key 42, stalling every later initSchema until the deadlined
+ * acquire gives up. Idle-pool runs reuse one connection and hide the bug, so
+ * this test keeps the pool busy while initSchema runs.
  *
- * Symptom in production: CLI cold-start hangs ~5 min on every subsequent
- * `initSchema()` because `SELECT pg_advisory_lock(42)` blocks until
- * `statement_timeout` fires. Observed against a 440K-page brain where one
- * backend had been holding lock 42 idle for 14h since the autopilot
- * worker's first call.
- *
- * Fix: wrap the lock acquire + release pair in `pool.reserve()` so both
- * queries hit the same physical connection.
- *
- * This test:
- *   1. Connects + runs initSchema (acquires + releases lock 42 on backend A)
- *   2. Asserts lock 42 is NOT held after initSchema returns
- *   3. Connects a second engine + runs initSchema again
- *   4. Asserts the second initSchema completes promptly (no 5-min hang)
- *
- * Pre-fix this test would either hang on step 3 (until statement_timeout)
- * or show lock 42 still held in step 2's assertion. Either way: red.
- *
- * Run: DATABASE_URL=postgresql://... bun run test:e2e \
+ * Run: DATABASE_URL=postgresql://.../gbrain_test bun run test:e2e \
  *      test/e2e/postgres-initschema-advisory-lock.test.ts
  */
 
@@ -36,70 +18,43 @@ import postgres from '#postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;
-const skip = !DATABASE_URL;
 
-describe.skipIf(skip)('PostgresEngine.initSchema advisory-lock pair invariant (E2E)', () => {
-  let sql: postgres.Sql;
+describe.skipIf(!DATABASE_URL)('PostgresEngine.initSchema advisory lock 42 (E2E)', () => {
+  let observer: postgres.Sql;
+  let engine: PostgresEngine;
 
   beforeAll(async () => {
-    sql = postgres(DATABASE_URL!, { max: 2 });
+    observer = postgres(DATABASE_URL!, { max: 1 });
+    engine = new PostgresEngine();
+    await engine.connect({ database_url: DATABASE_URL! });
+    await engine.initSchema();
   });
 
   afterAll(async () => {
-    await sql.end();
+    await engine.disconnect();
+    await observer.end();
   });
 
-  test('initSchema does not leak advisory lock 42', async () => {
-    const engine = new PostgresEngine();
-    await engine.connect({ database_url: DATABASE_URL! });
+  test('lock 42 is not left held after initSchema under concurrent pool load', async () => {
+    let stop = false;
+    const noise = (async () => {
+      while (!stop) {
+        await Promise.all(Array.from({ length: 8 }, () => engine.executeRaw('SELECT pg_sleep(0.005)')));
+      }
+    })();
+    let leaked = 0;
     try {
-      await engine.initSchema();
-
-      // Lock 42 MUST be released by the time initSchema returns. Pre-fix
-      // this assertion failed because acquire + release fired on different
-      // pool connections; the original session retained the lock.
-      const held = await sql<{ pid: number }[]>`
-        SELECT pid FROM pg_locks
-        WHERE locktype = 'advisory'
-          AND objid = 42
-          AND granted = true
-      `;
-      expect(held.length).toBe(0);
-    } finally {
-      await engine.disconnect();
-    }
-  }, 60_000);
-
-  test('two consecutive initSchema calls do not block each other', async () => {
-    // Pre-fix: the FIRST initSchema would leak lock 42 (acquire on conn A,
-    // unlock on conn B). The SECOND initSchema would block on `SELECT
-    // pg_advisory_lock(42)` until statement_timeout fired (~5 min default).
-    // Post-fix: both calls complete in <1s typical, well under our 30s gate.
-    const e1 = new PostgresEngine();
-    await e1.connect({ database_url: DATABASE_URL! });
-    try {
-      const t0 = Date.now();
-      await e1.initSchema();
-      const firstCallMs = Date.now() - t0;
-
-      const e2 = new PostgresEngine();
-      await e2.connect({ database_url: DATABASE_URL! });
-      try {
-        const t1 = Date.now();
-        await e2.initSchema();
-        const secondCallMs = Date.now() - t1;
-
-        // Generous wall-clock gate: <30s on each call. Pre-fix the second
-        // call hung the full statement_timeout window (default 5 min) and
-        // failed loud. Post-fix typical wallclock is <1s; we leave headroom
-        // for CI machines + cold-cache effects.
-        expect(firstCallMs).toBeLessThan(30_000);
-        expect(secondCallMs).toBeLessThan(30_000);
-      } finally {
-        await e2.disconnect();
+      for (let i = 0; i < 5; i++) {
+        await engine.initSchema();
+        const [row] = await observer<{ n: number }[]>`
+          SELECT count(*)::int AS n FROM pg_locks
+           WHERE locktype = 'advisory' AND objid = 42 AND granted`;
+        if (row.n > 0) leaked++;
       }
     } finally {
-      await e1.disconnect();
+      stop = true;
+      await noise;
     }
-  }, 90_000);
+    expect(leaked).toBe(0);
+  }, 120_000);
 });
