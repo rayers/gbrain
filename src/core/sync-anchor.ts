@@ -230,30 +230,12 @@ export async function writeSyncAnchor(
   // dir). `repo_path` writes self-describe via `value`. Callers that omit
   // it on a legacy-path last_commit write keep pre-#2114 behavior.
   repoDir?: string,
-  // #1430 (fork): the upstream pull FAILED this run. Advance last_commit and
-  // newest_content_at — local import may still have succeeded against the
-  // stale checkout — but do NOT ADVANCE last_sync_at. doctor/autopilot read
-  // sync_freshness off it, and a source whose remote state we never observed
-  // (network partition, revoked credentials, diverged remote) must not read as
-  // fresh. Upstream's own `pullFailed` guards in sync.ts cover only the
-  // ZERO-import case; a failed pull that still imported local commits reaches
-  // this write and would otherwise stamp a fresh heartbeat. Operator-skipped
-  // offline modes (--no-pull, detached HEAD, no origin) are NOT failures and
-  // pass false. Re-ported here from src/commands/sync.ts when v0.46.9.1
-  // (#4173) peeled the anchor cluster into this module.
-  pullFailed = false,
 ): Promise<void> {
   return withCompanyBrainSource(engine, sourceId, async engine => {
   if (sourceId) {
     const col = which === 'repo_path' ? 'local_path' : 'last_commit';
-    // last_sync_at bookmarked on every last_commit advance — gated by #1430.
+    // last_sync_at bookmarked on every last_commit advance.
     if (which === 'last_commit') {
-      // COALESCE rather than omit: a failed pull must never ADVANCE the
-      // heartbeat, but a genuine first import still has to ESTABLISH it —
-      // leaving last_sync_at NULL forever would break first_sync just as badly.
-      const syncAt = pullFailed
-        ? ', last_sync_at = COALESCE(last_sync_at, now())'
-        : ', last_sync_at = now()';
       // Wave-D review (#4369 follow-up): guard the commit-anchor trio
       // (last_commit / last_sync_at / newest_content_at) too. A foreign
       // REPO's HEAD stamped here poisons the incremental anchor — every
@@ -279,12 +261,12 @@ export async function writeSyncAnchor(
           ? null
           : new Date(newestContentEpochMs).toISOString();
         await engine.executeRaw(
-          `UPDATE sources SET last_commit = $1${syncAt}, newest_content_at = $3 WHERE id = $2`,
+          `UPDATE sources SET last_commit = $1, last_sync_at = now(), newest_content_at = $3 WHERE id = $2`,
           [value, sourceId, iso],
         );
       } else {
         await engine.executeRaw(
-          `UPDATE sources SET last_commit = $1${syncAt} WHERE id = $2`,
+          `UPDATE sources SET last_commit = $1, last_sync_at = now() WHERE id = $2`,
           [value, sourceId],
         );
       }

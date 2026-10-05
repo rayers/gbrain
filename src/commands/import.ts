@@ -429,34 +429,6 @@ export async function runImport(
 
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
-  // Issue #767 fix: --strategy <markdown|code|auto> selects which file types
-  // are walked. Without this, full-sync via performFullSync silently does
-  // markdown-only even when strategy=code is requested, which means a fresh
-  // code source registers but no code pages are ever created.
-  //
-  // Accept both space-separated (`--strategy code`) and equals-separated
-  // (`--strategy=code`) forms — anything less and a user typing the equals
-  // form silently falls through to markdown, exactly the silent-drop the
-  // patch is meant to fix.
-  let strategyRaw: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (a === '--strategy') {
-      strategyRaw = args[i + 1];
-      break;
-    }
-    if (a && a.startsWith('--strategy=')) {
-      strategyRaw = a.slice('--strategy='.length);
-      break;
-    }
-  }
-  // PR #768 (#767): CLI strategy flag. Validated here; combined with
-  // opts.strategy below (opts wins for programmatic callers).
-  const cliStrategy = strategyRaw as SyncStrategy | undefined;
-  if (cliStrategy && !['markdown', 'code', 'auto'].includes(cliStrategy)) {
-    console.error(`Invalid --strategy ${cliStrategy}; expected markdown|code|auto`);
-    process.exit(1);
-  }
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
   // (--workers 0, -3, "foo") with a loud error instead of silently falling
   // through to 1. Mirrors sync.ts's flag handling.
@@ -472,20 +444,15 @@ export async function runImport(
     console.error(e instanceof Error ? e.message : String(e));
     throw new ImportAbortError('invalid --workers value');
   }
-  // Find dir: first non-flag arg that isn't a value for --workers / --strategy.
-  // Equals-separated flags (`--strategy=code`) are themselves `--`-prefixed so
-  // they're filtered automatically; only space-separated values need the index
-  // skip-set.
+  // Find dir: first non-flag arg that isn't a value for --workers
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
-  const spaceStrategyIdx = args.indexOf('--strategy');
-  if (spaceStrategyIdx !== -1) flagValues.add(spaceStrategyIdx + 1);
   if (sourceIdx !== -1) flagValues.add(sourceIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--strategy markdown|code|auto] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
     throw new ImportAbortError('no import directory given');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -556,8 +523,7 @@ export async function runImport(
   // collectMarkdownFiles unconditionally — code-strategy first sync
   // silently no-op'd because no code file ever made it through walker
   // enumeration (codex C11 confirms dispatch was correct; bug was here).
-  // Strategy: opts (programmatic caller) wins over CLI flag, both fall to 'markdown'.
-  const strategy: SyncStrategy = opts.strategy ?? cliStrategy ?? 'markdown';
+  const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
   const malformedExcluded: string[] = [];
