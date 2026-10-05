@@ -1,8 +1,9 @@
 import type { BrainEngine, FactRow } from '../engine.ts';
 import { verbError } from '../ops/contract.ts';
-import { isAvailable, embedOne } from '../ai/gateway.ts';
+import { isAvailable, embedOne, getEmbeddingModel } from '../ai/gateway.ts';
 import { cosineSimilarity } from './classify.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
+import { cosineVerdict } from './capture-dedup.ts';
 
 export type FactCandidate = FactRow & { source_markdown_slug: string | null; row_num: number | null };
 export interface FactDecision { status: 'inserted' | 'duplicate' | 'superseded'; candidate: FactCandidate | null; }
@@ -10,27 +11,34 @@ export interface SingleFactIntent {
   fact: string; kind: FactRow['kind']; visibility: FactRow['visibility']; entity_slug: string | null;
 }
 /** Provider work belongs to preparation, never to a page/source transaction. */
-export async function prepareFactEmbedding(fact: string): Promise<{ embedding: Float32Array | null; degraded: boolean }> {
+export async function prepareFactEmbedding(fact: string, signal?: AbortSignal): Promise<{ embedding: Float32Array | null; embedding_model: string | null; degraded: boolean }> {
+  signal?.throwIfAborted();
   if (isAvailable('embedding')) {
-    try { return { embedding: await embedOne(fact), degraded: false }; } catch { /* keyless-compatible fail soft */ }
+    try {
+      const model = getEmbeddingModel();
+      return { embedding: await embedOne(fact, { abortSignal: signal, embeddingModel: model, inputType: 'document' }), embedding_model: model, degraded: false };
+    } catch { signal?.throwIfAborted(); }
   }
-  return { embedding: null, degraded: true };
+  return { embedding: null, embedding_model: null, degraded: true };
 }
 export async function assertFactNotWithdrawn(engine: BrainEngine, sourceId: string, input: SingleFactIntent): Promise<void> {
-  if (await isFactWithdrawn(engine, sourceId, input.visibility, input.fact)) {
+  if (await isFactWithdrawn(engine, sourceId, input.visibility, input.fact, input.entity_slug)) {
     throw verbError('invalid_params', 'fact_withdrawn: this exact claim was explicitly forgotten in this source and visibility.',
       'Remember a corrected claim. Repeating the old claim does not restore withdrawn memory.');
   }
 }
-/** SQL-only, so publication can verify the semantic decision under its guard. */
-export async function decideSingleFact(engine: BrainEngine, sourceId: string, input: SingleFactIntent, embedding: Float32Array | null): Promise<FactDecision> {
+/**
+ * SQL-only, so publication can verify the semantic decision under its guard.
+ * `lane` is the writer's `facts.source`: capture lanes never drop by cosine (#5888).
+ */
+export async function decideSingleFact(engine: BrainEngine, sourceId: string, input: SingleFactIntent, embedding: Float32Array | null, embeddingModel?: string | null, lane?: string | null): Promise<FactDecision> {
   const [exact] = await engine.executeRaw<FactCandidate>(`SELECT * FROM facts WHERE source_id=$1
     AND entity_slug IS NOT DISTINCT FROM $2 AND visibility=$3 AND expired_at IS NULL
     AND (valid_until IS NULL OR valid_until>now()) AND gbrain_fact_fingerprint(fact)=gbrain_fact_fingerprint($4)
     ORDER BY id LIMIT 1`, [sourceId, input.entity_slug, input.visibility, input.fact]);
   if (exact) return { status: 'duplicate', candidate: { ...exact, id: Number(exact.id) } };
   if (embedding && input.entity_slug) {
-    const candidates = await engine.findCandidateDuplicates(sourceId, input.entity_slug, input.fact, { embedding, k: 5 });
+    const candidates = await engine.findCandidateDuplicates(sourceId, input.entity_slug, input.fact, { embedding, embeddingModel, k: 5 });
     const metadata = await engine.executeRaw<{ id: number; source_markdown_slug: string | null; row_num: number | null }>(
       'SELECT id,source_markdown_slug,row_num FROM facts WHERE source_id=$1 AND id=ANY($2::int[])',
       [sourceId, candidates.map(c => c.id)]);
@@ -48,7 +56,7 @@ export async function decideSingleFact(engine: BrainEngine, sourceId: string, in
       const next = cosineSimilarity(embedding, c.embedding);
       if (next > score) { score = next; candidate = c; }
     }
-    if (candidate && score >= 0.95) return {
+    if (candidate && cosineVerdict(lane, score, input.fact, candidate.fact) === 'duplicate') return {
       status: candidate.kind === input.kind ? 'superseded' : 'duplicate', candidate,
     };
   }

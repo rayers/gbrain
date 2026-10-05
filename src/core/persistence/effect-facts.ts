@@ -3,40 +3,46 @@ import type { ParsedPage } from '../import-file.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { MinionQueue } from '../minions/queue.ts';
-import { OperationError } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
 import { authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { completeEffect } from './effect-journal.ts';
 import { guardEffectSource } from './effect-recovery.ts';
+import { derivedExtractionSkip } from './derived-extraction-gate.ts';
 import type { PersistenceEffect } from './effect-model.ts';
 import type { WriteRequest } from './model.ts';
 
 export type FactsBackstopStatus = { queued: true } | { skipped: string };
 
-async function authorizeFactsBackstop(engine: BrainEngine, row: WriteRequest, lock = false): Promise<void> {
-  if (row.authority.restrictedNamespace || row.authority.delegated || row.authority.slugPrefixes != null) {
-    throw new OperationError('permission_denied', 'A confined writer cannot extract into unnamed entity pages.');
+export async function authorizeFactsBackstop(engine: BrainEngine, row: WriteRequest, lock = false): Promise<void> {
+  if (derivedExtractionSkip(row.authority) === 'slug_bound_client') {
+    throw opError('permission_denied', 'A confined writer cannot extract into unnamed entity pages.',
+      `The write of ${row.slug} came from a slug-bound client, so facts are not extracted into entity pages outside its prefixes; the page itself is written. Widening that client's grant is the brain host operator's decision.`);
   }
   await authorizeStoredRequest(engine, row, lock);
   await authorizeWrite(engine, row.authority, 'extract_facts', row.slug, lock);
   // A grant may have become confined while the page itself remains in scope.
   if (row.principal_kind === 'oauth_client') {
     const [current] = await engine.executeRaw<{ bound_slug_prefixes: unknown }>('SELECT bound_slug_prefixes FROM oauth_clients WHERE client_id=$1', [row.principal_id]);
-    if (current?.bound_slug_prefixes != null) throw new OperationError('permission_denied', 'The current writer grant is confined.');
+    if (current?.bound_slug_prefixes != null) throw opError('permission_denied', 'The current writer grant is confined.',
+      `OAuth client ${row.principal_id} is now bound to slug prefixes, so facts from ${row.slug} are not extracted; the page itself is written. Widening the grant is the brain host operator's decision.`,
+      { fix: readFix('Lists the OAuth clients with their bound slug prefixes, read-only.', { argv: ['gbrain', 'auth', 'clients', '--json'] }) });
   } else if (row.principal_kind === 'local_cli' || row.principal_kind === 'local_stdio') {
     const [current] = await engine.executeRaw<{ prefixes: unknown }>("SELECT grant_ceiling->'slugPrefixes' AS prefixes FROM persistence_local_writers WHERE id=$1::uuid", [row.principal_id]);
-    if (current?.prefixes != null) throw new OperationError('permission_denied', 'The current writer grant is confined.');
+    if (current?.prefixes != null) throw opError('permission_denied', 'The current writer grant is confined.',
+      `Local writer ${row.principal_id} now has slug prefixes, so facts from ${row.slug} are not extracted; the page itself is written. Replacing the grant is the user's decision.`,
+      { fix: readFix('Lists the local writer registrations and their grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
   }
 }
 
 /** Provider availability belongs to the durable job's execution process. */
 export async function prepareFactsBackstop(engine: BrainEngine, row: WriteRequest, page: ParsedPage): Promise<FactsBackstopStatus> {
-  if (row.authority.restrictedNamespace || row.authority.delegated || row.authority.slugPrefixes != null) return { skipped: 'slug_bound_client' };
-  if (row.authority.operations != null && !row.authority.operations.includes('extract_facts')) return { skipped: 'operation_bound_client' };
+  const confined = derivedExtractionSkip(row.authority);
+  if (confined) return { skipped: confined };
   if (!(await isFactsExtractionEnabled(engine))) return { skipped: 'extraction_disabled' };
   const eligible = isFactsBackstopEligible(row.slug, page);
   if (!eligible.ok) return { skipped: eligible.reason };
-  const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  return brain?.enabled ? { skipped: 'writer_coordinator_required' } : { queued: true };
+  return { queued: true };
 }
 
 /** Optional fence on new durable jobs; old jobs retain their established input contract. */
@@ -44,7 +50,7 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
   const slug = typeof data.slug === 'string' ? data.slug : '';
   const sourceId = typeof data.sourceId === 'string' ? data.sourceId : 'default';
   const [brain] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-  if (brain?.enabled) return { skipped: 'writer_coordinator_required' } as const;
+  if (brain?.enabled && data.persistence_request_id === undefined) return { skipped: 'missing_write_authority' } as const;
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { skipped: 'page_missing' } as const;
   if (data.persistence_request_id !== undefined) {
@@ -66,10 +72,9 @@ export async function readFactsBackstopJobPage(engine: BrainEngine, data: Record
 export async function dispatchFactsBackstopEffect(engine: BrainEngine, effect: PersistenceEffect, hostId: string): Promise<void> {
   await engine.transaction(async tx => {
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
-    const [brain] = await tx.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1 FOR SHARE');
     await guardEffectSource(tx, effect, hostId);
     const [row] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [effect.request_id]);
-    let skipped: string | undefined = brain?.enabled ? 'writer_coordinator_required' : undefined;
+    let skipped: string | undefined;
     if (!row || row.state !== 'committed') skipped = 'invalid_write_request';
     if (row && !skipped) {
       try { await authorizeFactsBackstop(tx, row, true); }

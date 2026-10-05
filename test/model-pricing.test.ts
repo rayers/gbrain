@@ -21,7 +21,7 @@ import {
   ANTHROPIC_CACHE_WRITE_5M_MULT,
 } from '../src/core/model-pricing.ts';
 import { ANTHROPIC_PRICING } from '../src/core/anthropic-pricing.ts';
-import { MODEL_PRICING } from '../src/core/takes-quality-eval/pricing.ts';
+import { getPricing as takesQualityPricing } from '../src/core/takes-quality-eval/pricing.ts';
 import { estimateAnthropicCost } from '../src/core/brain-score-recommendations.ts';
 
 describe('CANONICAL_PRICING — table integrity', () => {
@@ -50,8 +50,9 @@ describe('CANONICAL_PRICING — table integrity', () => {
     expect(CANONICAL_PRICING['anthropic:claude-opus-4-7']).toMatchObject({ input: 5.0, output: 25.0 });
   });
 
-  test('Sonnet 5 present at $3/$15 (standard rate, intro discount not modeled)', () => {
-    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 3.0, output: 15.0 });
+  test('Sonnet 5 and 5.5 present at $2/$10 (launch price became the standard rate)', () => {
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5']).toMatchObject({ input: 2.0, output: 10.0 });
+    expect(CANONICAL_PRICING['anthropic:claude-sonnet-5-5']).toMatchObject({ input: 2.0, output: 10.0, cache_read: 0.2 });
   });
 
   test('Fable 5 present at $10/$50', () => {
@@ -187,12 +188,9 @@ describe('DRIFT GUARD — derived views stay equal to canonical (re-hardcode tri
     }
   });
 
-  test('takes-quality MODEL_PRICING equals canonical for every allowlisted key', () => {
-    for (const [key, p] of Object.entries(MODEL_PRICING)) {
-      const c = canonicalLookup(key);
-      expect(c).toBeDefined();
-      expect(p.input_per_1m).toBe(c!.input);
-      expect(p.output_per_1m).toBe(c!.output);
+  test('takes-quality pricing equals canonical for every canonical key', () => {
+    for (const [key, c] of Object.entries(CANONICAL_PRICING)) {
+      expect({ key, p: takesQualityPricing(key) }).toEqual({ key, p: { input_per_1m: c.input, output_per_1m: c.output } });
     }
   });
 

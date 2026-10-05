@@ -18,7 +18,10 @@
  * not frontmatter) ∪ `listPages({updated_after: anchor−30d, sourceId,
  * limit})` for recency. The RESOLVED sourceId is passed into EVERY
  * listPages call and EVERY body read (`getPage(slug, {sourceId})`) —
- * unscoped reads are the cross-source-leak invariant class.
+ * unscoped reads are the cross-source-leak invariant class. Every arm also
+ * passes `excludePrivate: true`: the compiled file lands in AGENTS.md /
+ * CLAUDE.md imports, the same world-only injected-context posture as the
+ * turn hook, so `visibility: private` pages never become candidates.
  *
  * Score = recency-decay(vs anchor) × longest-prefix boost from
  * DEFAULT_SOURCE_BOOSTS, plus a fixed pin bonus for tag-pinned pages.
@@ -40,6 +43,7 @@
  * whenever any entry fits.
  */
 
+import { loadRelationshipNotes, relationshipNoteKey } from '../link-relationship-notes.ts';
 import { createHash } from 'crypto';
 import { estimateTokens, packToBudget } from '../search/token-budget.ts';
 import { DEFAULT_SOURCE_BOOSTS } from '../search/source-boost.ts';
@@ -93,6 +97,8 @@ export const COMPILED_CONTEXT_ENVELOPE =
 export interface CompileViewEngine {
   listPages(filters?: PageFilters): Promise<Page[]>;
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
+  /** Relationship notes (temporal typed edges); absent → entries render without them. */
+  executeRaw?<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<R[]>;
 }
 
 export interface CompileViewInput {
@@ -191,14 +197,14 @@ async function fetchCandidates(
   const [prefixResults, tagPages, probe] = await Promise.all([
     Promise.all(
       prefixes.map((slugPrefix) =>
-        engine.listPages({ slugPrefix, sourceId, sort: 'slug', limit: PREFIX_CANDIDATE_LIMIT }),
+        engine.listPages({ slugPrefix, sourceId, excludePrivate: true, sort: 'slug', limit: PREFIX_CANDIDATE_LIMIT }),
       ),
     ),
     // Tag arm — explicit pins (few by construction; slug sort for stable order).
-    engine.listPages({ tag: COMPILE_CONTEXT_TAG, sourceId, sort: 'slug' }),
+    engine.listPages({ tag: COMPILE_CONTEXT_TAG, sourceId, excludePrivate: true, sort: 'slug' }),
     // Recency-anchor probe: the newest updated_at in the source (ties share
     // the timestamp, so tie order cannot change the probed VALUE).
-    engine.listPages({ sourceId, sort: 'updated_desc', limit: 1 }),
+    engine.listPages({ sourceId, excludePrivate: true, sort: 'updated_desc', limit: 1 }),
   ]);
   for (const pages of prefixResults) add(pages, false);
   add(tagPages, true);
@@ -216,6 +222,7 @@ async function fetchCandidates(
     const recent = await engine.listPages({
       updated_after: windowStart,
       sourceId,
+      excludePrivate: true,
       sort: 'updated_desc',
       limit: RECENCY_CANDIDATE_LIMIT,
     });
@@ -248,7 +255,7 @@ interface RenderedEntry {
   rendered: string;
 }
 
-function renderEntry(page: Page): RenderedEntry {
+function renderEntry(page: Page, relationshipNote?: string): RenderedEntry {
   const date = updatedDate(page);
   const excerpt = safeSynopsis(
     {
@@ -268,6 +275,7 @@ function renderEntry(page: Page): RenderedEntry {
   const title = page.title.replace(/\s+/g, ' ').trim();
   const lines = [`## ${title} (brain://${page.slug})`, `updated: ${date}`];
   if (excerpt) lines.push('', excerpt);
+  if (relationshipNote) lines.push('', `relationships: ${relationshipNote}`);
   const block = lines.join('\n');
   return { slug: page.slug, date, block, rendered: `\n\n${block}` };
 }
@@ -314,6 +322,12 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
   // records the finding; a missing page (raced deletion) is a read error.
   const entries: RenderedEntry[] = [];
   const scanDrops: CompileViewScanDrop[] = [];
+  const raw = input.engine.executeRaw?.bind(input.engine);
+  const notes = !raw ? new Map<string, string>() : await loadRelationshipNotes(
+    { executeRaw: raw },
+    scored.map(({ c }) => ({ slug: c.page.slug, source_id: input.sourceId, summary: c.page.compiled_truth ?? '' })),
+    { excludePrivate: true },
+  ).catch(() => new Map<string, string>());
   for (const { c } of scored) {
     const page = await input.engine.getPage(c.page.slug, { sourceId: input.sourceId });
     if (!page) {
@@ -321,7 +335,7 @@ export async function compileView(input: CompileViewInput): Promise<CompileViewR
         `compile-context: page ${c.page.slug} vanished mid-run (source ${input.sourceId}) — aborting, no partial output`,
       );
     }
-    const entry = renderEntry(page);
+    const entry = renderEntry(page, notes.get(relationshipNoteKey(input.sourceId, page.slug)));
     const findings = scanSensitive(entry.rendered, input.scanConfig);
     if (findings.length > 0) {
       scanDrops.push({

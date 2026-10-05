@@ -32,7 +32,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import postgres from 'postgres';
+import postgres from '#postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL;

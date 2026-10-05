@@ -57,8 +57,10 @@ import {
   type WriteThroughResult,
 } from './write-through.ts';
 import { withPageLock } from './page-lock.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
 import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesystemLock } from './minions/source-filesystem.ts';
 import { findTimelineSplitIndex } from './markdown.ts';
+import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -269,6 +271,8 @@ export function spliceTimelineIntoFileText(fileText: string, date: string, block
     }
     if (before !== -1) {
       insertAt = before;
+      // #5567: a materialized marker belongs to the bullet below it; never split the pair.
+      while (insertAt > sentinel + 1 && isMaterializedMarkerLine(lines[insertAt - 1])) insertAt--;
     } else {
       // After the LAST bullet, past its indented continuation (detail) lines.
       insertAt = bullets[bullets.length - 1].index + 1;
@@ -386,22 +390,24 @@ export async function writeTimelineEntryThrough(
         const newTimeline = sanitizeForJsonb(
           spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
         );
-        await engine.executeRaw(
-          `UPDATE pages SET timeline = $1, chunker_version = ${bodyWriteChunkVersion('pages.compiled_truth', '$1')}, updated_at = now()
-            WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
-          [newTimeline, slug, sourceId],
-        );
+        await maintenanceTransaction(engine, async tx => {
+          await tx.executeRaw(
+            `UPDATE pages SET timeline = $1, chunker_version = ${bodyWriteChunkVersion('pages.compiled_truth', '$1')}, updated_at = now()
+              WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
+            [newTimeline, slug, sourceId],
+          );
 
-        // Store the tuple the FS extractor recovers from the bullet just
-        // spliced in, so every later sync/rebuild re-extraction
-        // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
-        // divergence).
-        await engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
-          date: rendered.canonical.date,
-          source: rendered.canonical.source,
-          summary: rendered.canonical.summary,
-          detail: entry.detail || '',
-        }, { sourceId, skipExistenceCheck: true });
+          // Store the tuple the FS extractor recovers from the bullet just
+          // spliced in, so every later sync/rebuild re-extraction
+          // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
+          // divergence).
+          await tx.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
+            date: rendered.canonical.date,
+            source: rendered.canonical.source,
+            summary: rendered.canonical.summary,
+            detail: entry.detail || '',
+          }, { sourceId, skipExistenceCheck: true });
+        });
 
         // #2426 mirror (writePageThrough): on a durability-hardened repo,
         // commit the artifact so it reaches git. Best-effort — a commit

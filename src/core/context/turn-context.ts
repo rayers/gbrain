@@ -6,7 +6,8 @@
  * existing, deterministic sources —
  *
  *   1. reflex pointers   — extractCandidatesFromWindow → resolveEntitiesToPointers
- *                          (slug-only suppression, the windowed contract)
+ *                          (slug-only suppression, the windowed contract;
+ *                          private pages excluded like remote search, N8-2)
  *   2. volunteered pages — volunteerContext (confidence-gated, ≤3, deduped
  *                          against section 1 via excludeSlugs)
  *   3. hot facts         — getBrainHotMemoryMeta's cache + shape [ENG-11], with
@@ -23,6 +24,7 @@
  * Postgres engines; nothing here touches engine-specific SQL.
  */
 
+import { appendRelationshipNotes } from '../link-relationship-notes.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { OperationContext } from '../operations.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -34,8 +36,10 @@ import {
 } from './retrieval-reflex.ts';
 import { volunteerContext, type VolunteeredPage } from './volunteer.ts';
 import { getBrainHotMemoryMeta } from '../facts/meta-hook.ts';
+import { collapseHotFacts } from '../facts/capture-dedup.ts';
 import { buildEntityCard, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
 import { estimateTokens } from '../search/token-budget.ts';
+import type { DecideSlotMeta } from '../search/decide-stage.ts';
 
 /**
  * v0.45.7 ambient recall (issue #1). The per-turn assembler is extended into the
@@ -72,6 +76,8 @@ export interface TurnContextFact {
   kind: string;
   notability?: string | null;
   entity_slug: string | null;
+  /** #5888: every entity of a collapsed duplicate group (representative first). */
+  entity_slugs?: string[];
   valid_from?: string;
   /** Recording time (v0.45.7) — delta's "new since" filter prefers this over valid_from. */
   created_at?: string;
@@ -133,6 +139,8 @@ export interface TurnContextResult {
    * request: the harvest was scheduled, or skipped with a reason code.
    */
   checkpointFlush?: { status: 'scheduled' | 'skipped'; reason?: string };
+  /** System One (turn mode): present only when S6 recall_needed is not off — what it did this turn. */
+  decide?: { recall_needed: DecideSlotMeta };
 }
 
 export interface AssembleTurnContextOpts {
@@ -206,6 +214,14 @@ export async function assembleTurnContext(
       ? Math.floor(opts.maxBytes)
       : TURN_CONTEXT_DEFAULT_MAX_BYTES;
   const window = Array.isArray(opts.window) ? opts.window : [];
+  // System One S6 runs concurrently with the reflex arms under its own
+  // deadline; the reflex block below is assembled first and stands unchanged
+  // unless S6 finishes in time and acts (src/core/context/recall-needed.ts,
+  // loaded lazily so pack/delta and envelope importers stay light).
+  const startedAt = Date.now();
+  const s6Module = import('./recall-needed.ts');
+  const recall = s6Module.then((m) => m.startRecallNeeded(engine, { sourceId: opts.sourceId, window, sessionId: opts.sessionId, startedAt }));
+  recall.catch(() => {});
 
   // Sections 1+2 form a dependent chain (volunteer dedupes against the
   // pointers surfaced THIS turn); section 3 is independent, so the two arms
@@ -229,6 +245,7 @@ export async function assembleTurnContext(
           suppression: 'slug-only',
           maxPointers: DEFAULT_MAX_POINTERS,
           lexicalArms: opts.lexicalArms,
+          excludePrivate: true,
         });
         pointers = block?.pointers ?? [];
       }
@@ -250,11 +267,13 @@ export async function assembleTurnContext(
           // v0.46.15+ lexical-arms kill switch rides the same threading as the
           // pointer arm above (ResolvePointersOpts.lexicalArms).
           lexicalArms: opts.lexicalArms,
+          excludePrivate: true,
         });
       }
     } catch {
       volunteered = [];
     }
+    await appendRelationshipNotes(engine, [...pointers, ...volunteered]);
     return { pointers, volunteered };
   })();
 
@@ -276,34 +295,27 @@ export async function assembleTurnContext(
       };
       const meta = await getBrainHotMemoryMeta('turn_context', metaCtx);
       const hot = meta?.brain_hot_memory as { facts?: TurnContextFact[] } | undefined;
-      return Array.isArray(hot?.facts) ? [...hot.facts] : [];
+      const all = Array.isArray(hot?.facts) ? [...hot.facts] : [];
+      // Cross-turn dedupe, same contract as volunteered pages: a fact already
+      // injected this session is not repeated. Matched without the trailing
+      // confidence, which drifts as facts age.
+      const prior = opts.priorContextText;
+      return prior ? all.filter((f) => !prior.includes(renderFactLine(f).replace(/ \([0-9.]+\)$/, ' ('))) : all;
     } catch {
       return [];
     }
   })();
 
-  const [{ pointers, volunteered }, facts] = await Promise.all([pointersVolunteerArm, factsArm]);
+  const [reflex, facts] = await Promise.all([pointersVolunteerArm, factsArm]);
+  let { pointers, volunteered } = reflex;
+  let { text, degradedReason } = renderWithinBudget(pointers, volunteered, facts, maxBytes);
 
-  // 4. Render + budget [ENG-1]: trim facts first, then volunteered pages,
-  //    then pointers — always lowest-confidence first.
-  let degradedReason: string | undefined;
-  let text = render(pointers, volunteered, facts);
-  if (byteLen(text) > maxBytes) {
-    degradedReason = 'budget_trimmed';
-    while (byteLen(text) > maxBytes && facts.length) {
-      dropLowestConfidence(facts);
-      text = render(pointers, volunteered, facts);
-    }
-    while (byteLen(text) > maxBytes && volunteered.length) {
-      dropLowestConfidence(volunteered);
-      text = render(pointers, volunteered, facts);
-    }
-    while (byteLen(text) > maxBytes && pointers.length) {
-      dropLowestConfidence(pointers);
-      text = render(pointers, volunteered, facts);
-    }
-    // Even the bare envelope exceeds an absurdly small budget → inject nothing.
-    if (byteLen(text) > maxBytes) text = '';
+  const s6 = await s6Module.then((m) => m.applyRecallNeeded(engine, recall, {
+    startedAt, prompt: window.at(-1)?.text ?? '', priorContextText: opts.priorContextText, pointers, volunteered,
+  })).catch(() => null);
+  if (s6?.window) {
+    ({ pointers, volunteered } = s6.window);
+    ({ text, degradedReason } = renderWithinBudget(pointers, volunteered, facts, maxBytes));
   }
 
   return {
@@ -315,7 +327,37 @@ export async function assembleTurnContext(
     volunteered,
     factsCount: facts.length,
     ...(degradedReason ? { degradedReason } : {}),
+    ...(s6 ? { decide: { recall_needed: s6.meta } } : {}),
   };
+}
+
+/**
+ * 4. Render + budget [ENG-1]: trim facts first, then volunteered pages, then
+ * pointers — always lowest-confidence first. Trims the arrays in place.
+ */
+function renderWithinBudget(
+  pointers: ReflexPointer[],
+  volunteered: VolunteeredPage[],
+  facts: TurnContextFact[],
+  maxBytes: number,
+): { text: string; degradedReason?: string } {
+  let text = render(pointers, volunteered, facts);
+  if (byteLen(text) <= maxBytes) return { text };
+  while (byteLen(text) > maxBytes && facts.length) {
+    dropLowestConfidence(facts);
+    text = render(pointers, volunteered, facts);
+  }
+  while (byteLen(text) > maxBytes && volunteered.length) {
+    dropLowestConfidence(volunteered);
+    text = render(pointers, volunteered, facts);
+  }
+  while (byteLen(text) > maxBytes && pointers.length) {
+    dropLowestConfidence(pointers);
+    text = render(pointers, volunteered, facts);
+  }
+  // Even the bare envelope exceeds an absurdly small budget → inject nothing.
+  if (byteLen(text) > maxBytes) text = '';
+  return { text, degradedReason: 'budget_trimmed' };
 }
 
 function byteLen(s: string): number {
@@ -517,7 +559,8 @@ async function assembleDelta(
     overflow: boolean;
     facts: TurnContextFact[];
     threads: EntityOpenThread[];
-  } = { pages: [], overflow: false, facts: [], threads: [] };
+    failedArms: ('pages' | 'facts')[];
+  } = { pages: [], overflow: false, facts: [], threads: [], failedArms: [] };
   const deadlineAt =
     typeof opts.deadlineMs === 'number' && opts.deadlineMs > 0 ? Date.now() + opts.deadlineMs : null;
 
@@ -554,6 +597,7 @@ async function assembleDelta(
         }));
       } catch {
         acc.pages = [];
+        acc.failedArms.push('pages');
       }
     }
     // Facts arm: query the store DIRECTLY by recording time (pre-landing
@@ -569,8 +613,10 @@ async function assembleDelta(
           activeOnly: true,
           limit: 50,
           visibility,
+          fingerprint: true,
         });
-        acc.facts = rows
+        // #5888: duplicates collapse to their newest representative, as in hot memory.
+        acc.facts = (await collapseHotFacts(engine, opts.sourceId, rows))
           .filter((r) => !since || isAfter(r.created_at.toISOString(), since))
           .map((r) => ({
             id: r.id,
@@ -578,6 +624,7 @@ async function assembleDelta(
             kind: r.kind,
             notability: r.notability,
             entity_slug: r.entity_slug,
+            ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}),
             valid_from: r.valid_from.toISOString(),
             created_at: r.created_at.toISOString(),
             // #4206: provenance context rides delta like the other projections.
@@ -586,6 +633,7 @@ async function assembleDelta(
           }));
       } catch {
         acc.facts = [];
+        acc.failedArms.push('facts');
       }
     }
 
@@ -607,7 +655,8 @@ async function assembleDelta(
     }
   })();
 
-  const degradedReason = await raceDeadline(build, opts.deadlineMs);
+  const deadlineReason = await raceDeadline(build, opts.deadlineMs);
+  const degradedReason = [deadlineReason, ...acc.failedArms].filter(Boolean).join(',') || undefined;
   // Snapshot copies — same post-deadline mutation hazard as assemblePack.
   const pages = [...acc.pages];
   const facts = [...acc.facts];
@@ -651,7 +700,7 @@ export const CHECKPOINT_LINKS_RENDER_CAP = 10;
 // packers in ops/facts.ts — the packer prices exactly the bytes the renderer
 // emits, so `text` honors budget_tokens instead of overshooting it.
 export const renderCardLine = (c: EntityCard): string =>
-  `- **${c.entity.title}** → \`${c.entity.slug}\`${c.summary ? ` — ${c.summary}` : ''} (use get_page/entity before relying on details)`;
+  `- **${c.entity.title}** → \`${c.entity.slug}\`${c.summary ? ` — ${c.summary}` : ''}${c.relationship_note ? ` [${c.relationship_note}]` : ''} (use get_page/entity before relying on details)`;
 export const renderThreadLine = (t: EntityOpenThread): string =>
   `- [${t.kind}] ${t.text}${t.date ? ` (${t.date})` : ''}`;
 export const renderFactLine = (f: TurnContextFact): string =>

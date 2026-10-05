@@ -33,6 +33,7 @@ import { resolve } from 'path';
 // v0.41.15.0 (T10, D9): per-batch parallel workers.
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
+import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -69,6 +70,8 @@ export interface ReindexResult {
   dryRun: boolean;
   chunkerVersion: number;
   type: string | null;
+  /** Parallel writers used for the run (#5181); absent when nothing ran. */
+  workers?: number;
 }
 
 // #3686: real usage, reachable via `gbrain reindex --help` (the generic
@@ -78,9 +81,10 @@ export interface ReindexResult {
 const REINDEX_HELP = `gbrain reindex — re-chunk / re-embed existing pages after a pipeline upgrade
 
 USAGE
-  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--dry-run] [--no-embed] [--json] [--repo PATH]
+  gbrain reindex --markdown   [--type PAGE_TYPE] [--limit N] [--workers N] [--dry-run] [--no-embed] [--json] [--repo PATH]
   gbrain reindex --multimodal [--limit N] [--workers N] [--dry-run] [--cost-estimate] [--no-embed] [--yes] [--json]
   gbrain reindex --aliases    [--limit N] [--dry-run] [--json] [--source <id>]
+  gbrain reindex --vectors    [--dry-run] [--json]
 
 TARGETS (exactly one required)
   --markdown        Re-chunk markdown pages whose chunker_version lags the
@@ -90,12 +94,16 @@ TARGETS (exactly one required)
                     embedding pipeline (Voyage batches).
   --aliases         Backfill the free-text alias layer (page_aliases) for
                     pages whose frontmatter aliases predate the projection.
+  --vectors         Rebuild every HNSW vector index from the stored vectors
+                    (no re-embedding, no cost). Run after a PGLite WAL repair.
 
 OPTIONS
   --type <t>        --markdown only: restrict to one page type
   --limit N         Cap pages/chunks processed this run
-  --workers N       --multimodal only: parallel UPDATEs per batch
-                    (--concurrency is an alias)
+  --workers N       --markdown and --multimodal: parallel writers per batch
+                    (--concurrency is an alias). --markdown on Postgres
+                    defaults to 4 when more than 100 pages are pending;
+                    PGLite always uses 1
   --dry-run         Report what would change; write nothing
   --cost-estimate   --multimodal only: print the embed cost estimate and stop
   --no-embed        Skip re-embedding (chunk-only reindex)
@@ -139,6 +147,8 @@ function pendingDriftPredicate(noEmbed: boolean): string {
 
 export function validateReindexModeScope(args: string[]): string | null {
   args = normalizeReindexArgs(args);
+  // #5937: --limit is validated for every mode (--multimodal/--aliases parsed it with parseInt).
+  if (invalidPositiveIntegerFlag(args, '--limit')) return 'invalid --limit: expected a positive integer';
   if (!args.includes('--type')) return null;
   if (args.includes('--multimodal')) return '--type is only supported with reindex --markdown, not --multimodal';
   if (args.includes('--aliases')) return '--type is only supported with reindex --markdown, not --aliases';
@@ -149,7 +159,8 @@ function invalidPositiveIntegerFlag(args: string[], flag: string): boolean {
   return args.some((arg, index) => {
     if (arg !== flag) return false;
     const raw = args[index + 1];
-    return raw == null || raw.startsWith('--') || !/^\d+$/.test(raw) || Number(raw) <= 0;
+    return raw == null || raw.startsWith('--') || !/^\d+$/.test(raw) ||
+      !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0;
   });
 }
 
@@ -363,6 +374,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let afterId: number | null = null;
   const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
+  // #5181: size the pool from the whole run, not one batch. A full batch is
+  // exactly the auto threshold (100), so batch length never enabled it.
+  const { workers } = resolveWorkersWithClamp(engine, opts.workers, 'reindex', target);
 
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
@@ -376,15 +390,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     // v0.41.15.0 (T10, D9): per-batch sliding pool. Counters are JS-
     // single-thread atomic so reindexed++ / failed++ are race-free
     // across workers.
-    const writersResolved = resolveWorkersWithClamp(
-      engine,
-      opts.workers,
-      'reindex',
-      batch.length,
-    );
     await runSlidingPool({
       items: batch,
-      workers: writersResolved.workers,
+      workers,
       failureLabel: (row) => row.slug,
       onItem: async (row) => {
         reporter.tick();
@@ -456,6 +464,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
 
   reporter.finish();
 
+  if (reindexed > 0) await refreshProjectionStatistics(engine);
   const pendingAfter = await countPending(engine, type, !!opts.noEmbed);
   if (failed > 0) setCliExitVerdict(1);
 
@@ -468,6 +477,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
     dryRun: false,
     chunkerVersion: MARKDOWN_CHUNKER_VERSION,
     type,
+    workers,
   };
 
   if (opts.json) {
@@ -475,10 +485,11 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
       pending, pending_after: pendingAfter, reindexed, skipped, failed,
       chunker_version: MARKDOWN_CHUNKER_VERSION,
       type,
+      workers,
     }) + '\n');
   } else {
     const scope = type ? ` type=${type}` : '';
-    process.stderr.write(`[reindex] Done.${scope} reindexed=${reindexed} skipped=${skipped} failed=${failed} pending_before=${pending} pending_after=${pendingAfter}\n`);
+    process.stderr.write(`[reindex] Done.${scope} reindexed=${reindexed} skipped=${skipped} failed=${failed} pending_before=${pending} pending_after=${pendingAfter} workers=${workers}\n`);
   }
 
   return result;

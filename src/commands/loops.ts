@@ -67,6 +67,9 @@ interface WaitingResult {
   count: number;
   stale: boolean;
   sources: Array<{ id: string; last_sync_at: string | null; stale: boolean }>;
+  /** Fix wave 4: `partial` when a held Gmail thread falls inside the window (listed in `held`). */
+  completeness?: 'complete' | 'partial';
+  held?: Array<{ source_id: string; key: string; sender: string | null; subject?: string | null; retry_command: string }>;
   text?: string;
 }
 
@@ -77,8 +80,9 @@ export async function runWaiting(engine: BrainEngine, args: string[]): Promise<v
         'gbrain waiting — who is waiting on you, what you promised, the context to respond',
         '  --top N        max counterparties (default 3)',
         '  --source <id>  scope to one source (default: every source in the brain)',
-        '  --json         agent envelope (groups, staleness, sources)',
+        '  --json         agent envelope (groups, staleness, completeness, held items, sources)',
         '  --stale-ok     show possibly-outdated loops even when google sources have not synced in 24h',
+        '  --as-of <iso>  rank and age loops as of this time (default: now), to reproduce an order',
         '',
         'Manage loops: gbrain loops --help · Setup: gbrain google setup · Docs: docs/guides/open-loops.md',
       ].join('\n') + '\n',
@@ -89,11 +93,12 @@ export async function runWaiting(engine: BrainEngine, args: string[]): Promise<v
   const staleOk = args.includes('--stale-ok');
   const topIdx = args.indexOf('--top');
   const top = topIdx !== -1 ? Number(args[topIdx + 1]) || 3 : 3;
+  const asOfIdx = args.indexOf('--as-of');
 
   const result = (await handleToolCall(
     engine,
     'open_loops',
-    { group_by: 'counterparty', limit: top, include_context: true },
+    { group_by: 'counterparty', limit: top, include_context: true, ...(asOfIdx !== -1 ? { as_of: args[asOfIdx + 1] } : {}) },
     { sourceId: sourceFlag(args) ?? ALL_SOURCES },
   )) as WaitingResult;
 
@@ -143,8 +148,8 @@ export async function runLoops(engine: BrainEngine, args: string[]): Promise<voi
         'gbrain loops — inspect and manage open loops',
         '  list  [--status open|done|dropped|stale] [--type <loop_type>] [--source <id>] [--json]',
         '  show  <id> [--json]',
-        '  done  <id>        mark handled',
-        '  drop  <id>        not going to do it',
+        '  done  <id> [--note <text>]   mark handled',
+        '  drop  <id> [--note <text>]   not going to do it',
         '  mute  sender <email> | thread <thread-id>   [--source <id>]',
         '  unmute sender <email> | thread <thread-id>  [--source <id>]   undo a mute',
         '',
@@ -209,10 +214,16 @@ export async function runLoops(engine: BrainEngine, args: string[]): Promise<voi
       console.error(`Usage: gbrain loops ${sub} <id>`);
       process.exit(2);
     }
+    const noteIdx = rest.indexOf('--note');
+    const note = noteIdx !== -1 ? rest[noteIdx + 1] : undefined;
     const result = (await handleToolCall(
       engine,
       'loops_close',
-      { id, status: sub === 'done' ? 'done' : 'dropped' },
+      {
+        id,
+        status: sub === 'done' ? 'done' : 'dropped',
+        ...(note !== undefined ? { note } : {}),
+      },
       { sourceId: ALL_SOURCES },
     )) as { closed: boolean; reason?: string; status?: string };
     if (json) {

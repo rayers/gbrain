@@ -16,7 +16,7 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { operations, OperationError } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
-import { resetGateway } from '../../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { withEnv } from '../helpers/with-env.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../../src/core/markdown.ts';
@@ -47,9 +47,9 @@ beforeEach(async () => {
   // CI fix: put_page's handler at src/core/operations.ts:622 computes
   // `noEmbed = !isAvailable('embedding')`. When the gateway has been
   // configured by a sibling test (or by the cli.ts module-load path
-  // reading .env.testing) with a fake/stale ZEROENTROPY_API_KEY,
+  // reading .env.testing) with a fake/stale VOYAGE_API_KEY,
   // isAvailable returns true → put_page tries to embed → the real
-  // ZeroEntropy API returns 401 in CI. This test exercises write-through
+  // Voyage API returns 401 in CI. This test exercises write-through
   // behavior, not embedding. Reset the gateway so isAvailable returns
   // false → noEmbed=true → no network call.
   resetGateway();
@@ -97,6 +97,31 @@ const putPage = { ...putPageOperation,
 };
 
 describe('put_page write-through — happy path', () => {
+  test('MCP writes commit before any embedding and queue it durably (#5100)', async () => {
+    let embedCalls = 0;
+    configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    __setEmbedTransportForTests(async ({ values }: { values: string[] }) => {
+      embedCalls++;
+      return { embeddings: values.map(() => new Array(1536).fill(0)), usage: { tokens: 1 } } as any;
+    });
+    try {
+      const ctx = makeCtx({ remote: true });
+      const result = (await putPage.handler(ctx, {
+        slug: 'inbox/mcp-deferred-embed',
+        content: '---\ntitle: Deferred\n---\n\nThis page must be durable before its embedding runs.',
+      })) as { embedding_state?: string; persistence?: { embedding_state?: string } };
+      expect(embedCalls).toBe(0);
+      expect(result.embedding_state ?? result.persistence?.embedding_state).toBe('queued');
+      expect(await engine.getPage('inbox/mcp-deferred-embed', { sourceId: 'default' })).not.toBeNull();
+      const [chunks] = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM content_chunks c JOIN pages p ON p.id = c.page_id WHERE p.slug = 'inbox/mcp-deferred-embed' AND c.embedding IS NULL`);
+      expect(Number(chunks.n)).toBeGreaterThan(0);
+    } finally {
+      __setEmbedTransportForTests(null);
+      resetGateway();
+    }
+  });
+
   test('writes the markdown file to disk at brainDir/<slug>.md', async () => {
     const ctx = makeCtx();
     const content = '---\ntitle: Test\n---\n\n# WT body';
@@ -110,6 +135,165 @@ describe('put_page write-through — happy path', () => {
     expect(fs.existsSync(expectedPath)).toBe(true);
     const onDisk = fs.readFileSync(expectedPath, 'utf8');
     expect(onDisk).toContain('WT body');
+  });
+
+  test("remote writes infer a custom type from the active pack through no-op and file checks", async () => {
+    const packDir = path.join(
+      tmpRoot,
+      "home",
+      ".gbrain",
+      "schema-packs",
+      "route-test",
+    );
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(packDir, "pack.yaml"),
+      `api_version: gbrain-schema-pack-v1
+name: route-test
+version: 1.0.0
+extends: gbrain-base-v2
+page_types:
+  - name: goal
+    primitive: concept
+    path_prefixes: [goals/]
+    aliases: []
+    extractable: false
+    expert_routing: false
+`,
+    );
+    await withEnv({ GBRAIN_SCHEMA_PACK: "route-test" }, async () => {
+      const ctx = makeCtx({ remote: true });
+      const slug = "goals/learn-guitar";
+      const content = "---\ntitle: Learn guitar\n---\n\nPractice regularly.";
+      const first = (await putPage.handler(ctx, { slug, content })) as {
+        revision: string;
+      };
+      const file = path.join(brainDir, `${slug}.md`);
+      expect(
+        (await engine.readPageSnapshot(slug, { sourceId: "default" }))?.page
+          .type,
+      ).toBe("goal");
+      expect(fs.readFileSync(file, "utf8")).toContain("type: goal");
+
+      const unchanged = await putPage.handler(ctx, {
+        slug,
+        content,
+        expected_revision: first.revision,
+      });
+      expect(unchanged).toMatchObject({
+        state: "committed",
+        noop: true,
+        revision: first.revision,
+      });
+
+      // A canonical file imported under the pack can omit type frontmatter.
+      fs.writeFileSync(
+        file,
+        fs.readFileSync(file, "utf8").replace(/^type: goal\n/m, ""),
+      );
+      const edited = await putPage.handler(ctx, {
+        slug,
+        content: content.replace("regularly", "daily"),
+        expected_revision: first.revision,
+      });
+      expect(edited).toMatchObject({ state: "committed" });
+      expect(
+        (await engine.readPageSnapshot(slug, { sourceId: "default" }))?.page
+          .type,
+      ).toBe("goal");
+    });
+  });
+
+  test('remote writes infer path subtypes and preserve explicit or stored subtypes', async () => {
+    const packDir = path.join(tmpRoot, 'home', '.gbrain', 'schema-packs', 'meeting-test');
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, 'pack.yaml'), `api_version: gbrain-schema-pack-v1
+name: meeting-test
+version: 1.0.0
+extends: gbrain-base-v2
+page_types:
+  - name: meeting
+    primitive: temporal
+    path_prefixes: [therapy-meetings/, meetings/]
+    aliases: []
+    extractable: false
+    expert_routing: false
+    subtypes:
+      - name: therapy
+        when:
+          path_pattern: '^therapy-meetings/'
+      - name: relationship
+        when:
+          path_pattern: '^relationship-meetings/'
+`);
+    await withEnv({ GBRAIN_SCHEMA_PACK: 'meeting-test' }, async () => {
+      const ctx = makeCtx({ remote: true });
+      const slug = 'therapy-meetings/session';
+      const content = '---\ntitle: Session\n---\n\nFirst discussion.';
+      const first = await putPage.handler(ctx, { slug, content }) as { revision: string };
+      const file = path.join(brainDir, `${slug}.md`);
+      expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page).toMatchObject({ type: 'meeting', frontmatter: { subtype: 'therapy' } });
+      expect(fs.readFileSync(file, 'utf8')).toContain('subtype: therapy');
+
+      const unchanged = await putPage.handler(ctx, { slug, content, expected_revision: first.revision });
+      expect(unchanged).toMatchObject({ state: 'committed', noop: true, revision: first.revision });
+
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^subtype: therapy\n/m, ''));
+      const edited = await putPage.handler(ctx, { slug, content: content.replace('First', 'Second'), expected_revision: first.revision }) as { revision: string };
+      expect(edited).toMatchObject({ state: 'committed' });
+      expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page.frontmatter.subtype).toBe('therapy');
+
+      const explicit = await putPage.handler(ctx, { slug, content: '---\ntitle: Session\nsubtype: relationship\n---\n\nThird discussion.', expected_revision: edited.revision }) as { revision: string };
+      expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page.frontmatter.subtype).toBe('relationship');
+      await putPage.handler(ctx, { slug, content: content.replace('First', 'Fourth'), expected_revision: explicit.revision });
+      expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page.frontmatter.subtype).toBe('relationship');
+
+      const legacySlug = 'therapy-meetings/legacy';
+      const legacy = await putPage.handler(ctx, { slug: legacySlug, content: '---\ntitle: Legacy\ntype: concept\n---\n\nExisting page.' }) as { revision: string };
+      await putPage.handler(ctx, { slug: legacySlug, content: '---\ntitle: Legacy\n---\n\nUpdated page.', expected_revision: legacy.revision });
+      expect((await engine.readPageSnapshot(legacySlug, { sourceId: 'default' }))?.page).toMatchObject({ type: 'concept' });
+      expect((await engine.readPageSnapshot(legacySlug, { sourceId: 'default' }))?.page.frontmatter.subtype).toBeUndefined();
+    });
+  });
+
+  test('a page stored before its pack subtype rule existed accepts edits and gains the subtype (#5928)', async () => {
+    const writePack = (name: string, subtypes: string) => {
+      const packDir = path.join(tmpRoot, 'home', '.gbrain', 'schema-packs', name);
+      fs.mkdirSync(packDir, { recursive: true });
+      fs.writeFileSync(path.join(packDir, 'pack.yaml'), `api_version: gbrain-schema-pack-v1
+name: ${name}
+version: 1.0.0
+extends: gbrain-base-v2
+page_types:
+  - name: meeting
+    primitive: temporal
+    path_prefixes: [therapy-meetings/, meetings/]
+    aliases: []
+    extractable: false
+    expert_routing: false
+${subtypes}`);
+    };
+    writePack('before-rule', '');
+    writePack('after-rule', `    subtypes:
+      - name: therapy
+        when:
+          path_pattern: '^therapy-meetings/'
+`);
+    const ctx = makeCtx({ remote: true });
+    const slug = 'therapy-meetings/session';
+    const file = path.join(brainDir, `${slug}.md`);
+    const content = '---\ntitle: Session\n---\n\nFirst discussion.';
+    const first = await withEnv({ GBRAIN_SCHEMA_PACK: 'before-rule' }, () => putPage.handler(ctx, { slug, content })) as { revision: string };
+    expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page.frontmatter).not.toHaveProperty('subtype');
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('subtype:');
+
+    // The canonical file is unchanged since that write; only the active pack gained a rule.
+    const edited = await withEnv({ GBRAIN_SCHEMA_PACK: 'after-rule' }, () =>
+      putPage.handler(ctx, { slug, content: content.replace('First', 'Second'), expected_revision: first.revision }));
+    expect(edited).toMatchObject({ state: 'committed' });
+    expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page).toMatchObject({
+      type: 'meeting', compiled_truth: 'Second discussion.', frontmatter: { subtype: 'therapy' } });
+    expect(fs.readFileSync(file, 'utf8')).toContain('subtype: therapy');
   });
 
   test('stamps provenance frontmatter (ingested_via=put_page for local CLI)', async () => {
@@ -315,6 +499,21 @@ describe('put_page write-through — config edge cases', () => {
     expect(result.write_through?.warning).toContain('wrote only to the database');
     expect(result.write_through?.warning).toContain("source 'default'");
     expect(result.write_through?.warning).toContain('no durable markdown file');
+  });
+
+  test('remote edit_page with no repo configured warns that the edit is DB-only too (#5616)', async () => {
+    await engine.executeRaw("DELETE FROM config WHERE key = 'sync.repo_path'");
+    const ctx = makeCtx({ remote: true });
+    await putPage.handler(ctx, { slug: 'inbox/no-repo-edit', content: '---\ntitle: Edit\n---\n\nalpha line' });
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPage = operations.find(op => op.name === 'get_page')!;
+    const editPage = operations.find(op => op.name === 'edit_page')!;
+    const read = await getPage.handler(ctx, { slug: 'inbox/no-repo-edit', include_content: true }) as { revision: string };
+    const result = (await editPage.handler(ctx, {
+      slug: 'inbox/no-repo-edit', expected_revision: read.revision, edits: [{ old_text: 'alpha line', new_text: 'beta line' }],
+    })) as { write_through?: { skipped?: string; warning?: string } };
+    expect(result.write_through?.skipped).toBe('no_repo_configured');
+    expect(result.write_through?.warning).toContain('edit_page wrote only to the database');
   });
 
   test.each([false, true])('missing directory returns a private typed error before admission (remote=%s)', async (remote) => {

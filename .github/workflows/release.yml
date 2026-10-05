@@ -74,7 +74,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-26
             target: bun-darwin-arm64
             artifact: gbrain-darwin-arm64
           - os: ubuntu-latest
@@ -90,13 +90,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.3.13
+          bun-version: 1.4.2
       - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock', 'admin/bun.lock') }}
           restore-keys: bun-cache-${{ runner.os }}-
-      - run: bun install --frozen-lockfile
+      - run: bun install --frozen-lockfile --ignore-scripts
       # Supply-chain: build the admin UI FRESH from admin/src so the compiled
       # binary embeds a bundle a reviewer can trace to source — not the committed
       # admin/dist bytes. `build:admin` runs `vite build` then regenerates
@@ -106,7 +106,7 @@ jobs:
       # not itself be non-reproducible).
       - name: Build admin UI fresh from source
         run: |
-          cd admin && bun install --frozen-lockfile && cd ..
+          cd admin && bun install --frozen-lockfile --ignore-scripts && cd ..
           bun run build:admin
       # No test re-run here: the Test workflow already gated this exact SHA at
       # merge (10 shards + E2E). Re-running the whole suite serially on the
@@ -114,6 +114,9 @@ jobs:
       # release on ambient-env tests (run 30698650484). The build job's gate
       # is the artifact itself: compile, then smoke-test the binary.
       - run: bun build --compile --no-compile-autoload-bunfig --target=${{ matrix.target }} --outfile bin/${{ matrix.artifact }} src/cli.ts
+      - name: Verify Darwin executable signature before execution
+        if: runner.os == 'macOS'
+        run: codesign --verify --strict --verbose=2 "bin/${{ matrix.artifact }}"
       - name: Verify embedded native writer locks and compiled process exclusion
         run: bun scripts/native/verify.ts && bun scripts/native/compiled-smoke.ts --binary bin/${{ matrix.artifact }}
       - name: Verify persistent writes with the actual release executable
@@ -218,19 +221,29 @@ jobs:
       - id: gate
         name: Gate on PAT + vendored template tree
         run: |
+          # A skip here is visible (warning + step summary), never a silent
+          # green: this release did not publish the agent template (D-10).
           if [ -z "$TEMPLATE_REPO_PAT" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: TEMPLATE_REPO_PAT secret not configured — template-repo publishing disabled."
+            echo "::warning::Agent template NOT published to $TEMPLATE_REPO — the TEMPLATE_REPO_PAT secret is empty. Why: only the repo owner can set secrets. Fix (owner-only): gh secret set TEMPLATE_REPO_PAT (fine-grained PAT with contents: write on $TEMPLATE_REPO), then re-run this release workflow."
+            {
+              echo "## Agent template not published"
+              echo "The TEMPLATE_REPO_PAT secret is empty, so \`$TEMPLATE_REPO\` did not get this release's \`templates/bootstrap/template-repo/\` tree."
+              echo ""
+              echo "- Why: only the repo owner can set secrets."
+              echo "- Fix (owner-only): \`gh secret set TEMPLATE_REPO_PAT\` (fine-grained PAT, contents: write on \`$TEMPLATE_REPO\`), then re-run this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
           elif [ ! -d templates/bootstrap/template-repo ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "SKIP: templates/bootstrap/template-repo/ not vendored yet — nothing to publish."
+            echo "::warning::Agent template NOT published — templates/bootstrap/template-repo/ is missing from this checkout. Fix: restore the vendored tree, then re-run this release workflow."
+            echo "## Agent template not published: templates/bootstrap/template-repo/ is missing" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
       - if: steps.gate.outputs.publish == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.3.13
+          bun-version: 1.4.2
       - if: steps.gate.outputs.publish == 'true'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
         with:
@@ -303,7 +316,7 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
-          bun-version: 1.3.13
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: Drift gate — committed plugin tree matches the generator
         run: bash scripts/check-plugin-tree.sh

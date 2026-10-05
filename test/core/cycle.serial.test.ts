@@ -315,6 +315,23 @@ describe('runCycle — cycle_already_running skip', () => {
     expect(report.status).not.toBe('skipped');
     expect(syncCalls.length).toBe(1); // cycle ran
   });
+
+  test('a held cycle lock expires 5 minutes out (crash recovery window)', async () => {
+    let ttlSeconds: number | null = null;
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain',
+      phases: ['lint'],
+      yieldBetweenPhases: async () => {
+        const { rows } = await (sharedEngine as any).db.query(
+          `SELECT EXTRACT(EPOCH FROM (ttl_expires_at - NOW()))::float AS s FROM gbrain_cycle_locks WHERE id = 'gbrain-cycle'`,
+        );
+        ttlSeconds = rows[0]?.s ?? null;
+      },
+    });
+    expect(ttlSeconds).not.toBeNull();
+    expect(ttlSeconds!).toBeGreaterThan(4 * 60);
+    expect(ttlSeconds!).toBeLessThanOrEqual(5 * 60);
+  });
 });
 
 // ─── Engine null path ─────────────────────────────────────────────
@@ -366,6 +383,19 @@ describe('runCycle — engine = null (filesystem-only mode)', () => {
     // None of the filesystem phases ran because the lock blocked entry.
     expect(lintCalls.length).toBe(0);
     expect(backlinksCalls.length).toBe(0);
+  });
+
+  test('a live holder whose lock file is older than 5 minutes is treated as stale', async () => {
+    const { writeFileSync, mkdirSync, utimesSync } = require('fs');
+    const path = require('path');
+    mkdirSync(path.dirname(lockFile), { recursive: true });
+    writeFileSync(lockFile, `1\n${new Date().toISOString()}\n`);
+    const sixMinutesAgo = new Date(Date.now() - 6 * 60 * 1000);
+    utimesSync(lockFile, sixMinutesAgo, sixMinutesAgo);
+
+    const report = await runCycle(null, { brainDir: '/tmp/brain' });
+    expect(report.reason).not.toBe('cycle_already_running');
+    expect(lintCalls.length).toBe(1);
   });
 });
 
@@ -432,8 +462,10 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.41.39 (#1700) + v0.42.0.0: 22 phases (added `enrich_thin` AND `skillopt`
     // between conversation_facts_backfill and embed — both landed in this merge).
     // #2653: 23 phases (added `drift` between calibration_profile and
-    // conversation_facts_backfill).
-    expect(hookCalls).toBe(23);
+    // conversation_facts_backfill). #5876: 24 (added `chronicle` after drift).
+    // GBRA-40 Lane D: 25 (added `facts_drain` after chronicle).
+    // Temporal typed edges: 26 (added `edge_contradictions` after calibration_profile).
+    expect(hookCalls).toBe(26);
   });
 
   test('hook exceptions do not abort the cycle', async () => {
@@ -448,8 +480,8 @@ describe('runCycle — yieldBetweenPhases hook', () => {
     // v0.39.0.0: 17 phases (T12 schema-suggest phase between orphans and purge).
     // v0.41.11.0: 20 phases (+extract_atoms, +synthesize_concepts, +conversation_facts_backfill).
     // v0.41.39 (#1700) + v0.42.0.0: 22 phases (+enrich_thin, +skillopt).
-    // #2653: 23 phases (+drift).
-    expect(report.phases.length).toBe(23);
+    // #2653: 23 phases (+drift). #5876: 24 (+chronicle). GBRA-40 Lane D: 25 (+facts_drain). Temporal typed edges: 26 (+edge_contradictions).
+    expect(report.phases.length).toBe(26);
   });
 });
 

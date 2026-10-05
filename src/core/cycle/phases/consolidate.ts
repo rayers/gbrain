@@ -25,7 +25,11 @@
 import type { BrainEngine, FactRow } from '../../engine.ts';
 import type { PhaseResult } from '../../cycle.ts';
 import { cosineSimilarity } from '../../facts/classify.ts';
+import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
+import { maintenancePreflight, submitMaintenanceConsolidation } from '../../persistence/prepared-maintenance.ts';
+import { managedPersistenceEnabled } from '../../persistence/ownership.ts';
+import { maintenanceTransaction } from '../../persistence/attribution.ts';
 
 export interface ConsolidatePhaseOpts {
   dryRun?: boolean;
@@ -43,6 +47,7 @@ export interface ConsolidatePhaseOpts {
   minFactsPerBucket?: number;
   /** Minimum age (ms) of the OLDEST fact in a bucket before consolidation. Default 24h. */
   minOldestAgeMs?: number;
+  sourceId?: string;
 }
 
 export async function runPhaseConsolidate(
@@ -50,6 +55,7 @@ export async function runPhaseConsolidate(
   opts: ConsolidatePhaseOpts = {},
 ): Promise<PhaseResult> {
   const dryRun = opts.dryRun === true;
+  const managed = await managedPersistenceEnabled(engine);
   const threshold = opts.clusterThreshold ?? 0.85;
   const minPerBucket = opts.minFactsPerBucket ?? 3;
   const minOldestAgeMs = opts.minOldestAgeMs ?? 24 * 60 * 60 * 1000;
@@ -58,6 +64,7 @@ export async function runPhaseConsolidate(
   let takesWritten = 0;
   let bucketsProcessed = 0;
   let bucketsSkipped = 0;
+  let clustersSkippedRetired = 0;
 
   // Pull every (source_id, entity_slug) bucket of unconsolidated facts.
   // Uses the partial idx_facts_unconsolidated index.
@@ -72,9 +79,11 @@ export async function runPhaseConsolidate(
         AND expired_at IS NULL
         AND (valid_until IS NULL OR valid_until > now())
         AND entity_slug IS NOT NULL
+        AND ($2::boolean=false OR visibility='world')
+        AND ($1::text IS NULL OR source_id=$1)
       GROUP BY source_id, entity_slug
-      HAVING COUNT(*) >= ${minPerBucket}
-    `);
+      HAVING COUNT(*) >= $3
+    `, [opts.sourceId ?? null, managed, minPerBucket]);
   } catch (err) {
     return {
       phase: 'consolidate',
@@ -100,11 +109,14 @@ export async function runPhaseConsolidate(
       try { await opts.yieldDuringPhase(); } catch { /* keepalive errors non-fatal */ }
     }
 
-    const unconsolidated = await engine.listFactsByEntity(b.source_id, b.entity_slug, {
+    const maintenance = managed && !dryRun ? await maintenancePreflight(engine, b.source_id) : null;
+    const candidates = await engine.listFactsByEntity(b.source_id, b.entity_slug, {
       activeOnly: true,
       unconsolidatedOnly: true,
+      visibility: managed ? ['world'] : undefined,
       limit: 100,
     });
+    const unconsolidated = managed ? candidates.filter(f => f.visibility === 'world') : candidates;
     if (unconsolidated.length < minPerBucket) {
       bucketsSkipped += 1;
       continue;
@@ -159,6 +171,15 @@ export async function runPhaseConsolidate(
         continue;
       }
 
+      if (maintenance) {
+        const receipt = await submitMaintenanceConsolidation(engine, maintenance, b.entity_slug, cluster,
+          { claim: best.fact, weight: clamp01(avgWeight), source: sources.slice(0, 200), since: sinceISO });
+        factsConsolidated += Number(receipt.facts_consolidated ?? 0);
+        takesWritten += Number(receipt.takes_written ?? 0);
+        if (receipt.reason === 'retired_take') clustersSkippedRetired++;
+        continue;
+      }
+
       // v0.35.4 (D-CDX-4) — semantic upsert. The full dream cycle runs
       // `extract_facts` BEFORE `consolidate`; `extract_facts` hard-deletes
       // and re-inserts page facts via deleteFactsForPage + insertFacts,
@@ -205,13 +226,13 @@ export async function runPhaseConsolidate(
         // would bypass that guard. Reuse its id so the facts still consolidate
         // into it, but leave the row untouched.
         if (existing[0].resolved_at === null) {
-          await engine.executeRaw(
+          await maintenanceTransaction(engine, tx => tx.executeRaw(
             `UPDATE takes SET source = $1, updated_at = now() WHERE id = $2`,
             [sources.slice(0, 200), takeId],
-          );
+          ));
         }
       } else {
-        const inserted = await engine.addTakesBatch([{
+        const inserted = await maintenanceTransaction(engine, tx => tx.addTakesBatch([{
           page_id: pageId,
           row_num: nextRowNum,
           claim: best.fact,
@@ -221,7 +242,7 @@ export async function runPhaseConsolidate(
           since_date: sinceISO,
           source: sources.slice(0, 200),
           active: true,
-        }]);
+        }]));
         if (inserted < 1) continue;
 
         const idRows = await engine.executeRaw<{ id: number }>(
@@ -238,10 +259,10 @@ export async function runPhaseConsolidate(
       }
 
       // Mark all contributing facts consolidated.
-      for (const f of cluster) {
-        await engine.consolidateFact(f.id, takeId);
-        factsConsolidated += 1;
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (const f of cluster) await tx.consolidateFact(f.id, takeId);
+      });
+      factsConsolidated += cluster.length;
 
       // v0.35.4 (D-CDX-4 part 2) — chronological valid_until writeback.
       // Sort the cluster by (valid_from ASC, id ASC); walk consecutive
@@ -259,36 +280,41 @@ export async function runPhaseConsolidate(
         if (t !== 0) return t;
         return a.id - b.id;
       });
-      for (let i = 0; i < chronological.length - 1; i++) {
-        const older = chronological[i];
-        const newer = chronological[i + 1];
-        await engine.executeRaw(
-          // Only UPDATE when the new value would actually change. Avoids
-          // touching updated_at on no-op rewrites and keeps idempotency
-          // observable in the DB (zero affected rows on stable re-run).
-          `UPDATE facts
-             SET valid_until = $1
-           WHERE id = $2
-             AND (valid_until IS DISTINCT FROM $1)`,
-          [newer.valid_from, older.id],
-        );
-      }
+      await maintenanceTransaction(engine, async tx => {
+        for (let i = 0; i < chronological.length - 1; i++) {
+          const older = chronological[i];
+          const newer = chronological[i + 1];
+          await tx.executeRaw(
+            // Only UPDATE when the new value would actually change. Avoids
+            // touching updated_at on no-op rewrites and keeps idempotency
+            // observable in the DB (zero affected rows on stable re-run).
+            `UPDATE facts
+               SET valid_until = $1
+             WHERE id = $2
+               AND (valid_until IS DISTINCT FROM $1)`,
+            [newer.valid_from, older.id],
+          );
+        }
+      });
     }
   }
 
   return {
     phase: 'consolidate',
-    status: factsConsolidated > 0 ? 'ok' : 'ok',
+    status: factsConsolidated === 0 && clustersSkippedRetired > 0 ? 'skipped' : 'ok',
     duration_ms: 0,
     summary: dryRun
       ? `(dry-run) would promote ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets`
-      : `promoted ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets`,
+      : `promoted ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets` +
+        (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : ''),
     details: {
       dryRun,
       facts_consolidated: factsConsolidated,
       takes_written: takesWritten,
       buckets_processed: bucketsProcessed,
       buckets_skipped: bucketsSkipped,
+      clusters_skipped_retired: clustersSkippedRetired,
+      ...(factsConsolidated === 0 && clustersSkippedRetired > 0 ? { reason: 'retired_take' } : {}),
     },
   };
 }
@@ -307,14 +333,16 @@ function clusterFacts(facts: FactRow[], threshold: number): FactRow[][] {
   const sorted = [...facts].sort((a, b) => b.valid_from.getTime() - a.valid_from.getTime());
   const clusters: FactRow[][] = [];
   for (const f of sorted) {
-    if (!f.embedding) {
+    if (!f.embedding || !f.embedding_model || f.embedded_text_hash !== createHash('md5').update(f.fact).digest('hex')) {
       clusters.push([f]);
       continue;
     }
     let placed = false;
     for (const c of clusters) {
       const head = c[0];
-      if (!head.embedding) continue;
+      if (!head.embedding || f.embedding_model !== head.embedding_model
+        || head.embedded_text_hash !== createHash('md5').update(head.fact).digest('hex')
+        || f.embedding.length !== head.embedding.length) continue;
       if (cosineSimilarity(f.embedding, head.embedding) >= threshold) {
         c.push(f);
         placed = true;

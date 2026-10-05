@@ -390,15 +390,16 @@ describe('extractPageLinks', () => {
       'Comparing [[Fast-Weigh]] vs [[Apex-AI]] (the latter has no page yet). Also see [[2026-05-07-cost-plan]].',
       {}, 'concept', fakeResolver, { globalBasename: true },
     );
-    const slugs = candidates.map(c => c.targetSlug).sort();
-    expect(slugs).toEqual([
+    // #4062 also emits a root-exact direct candidate per bare wikilink
+    // (`fast-weigh`, `apex-ai`, ...); downstream existence checks drop those
+    // when no root page exists. Only the resolver-backed edges are pinned here.
+    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
+    expect(resolved.map(c => c.targetSlug).sort()).toEqual([
       'topics/aggregate-scale-software/companies/fast-weigh',
       'topics/dragon-pilot/raw/notes/2026-05-07-cost-plan',
     ]);
-    // Apex-AI silently dropped (resolver returned no matches), no dangling row.
-    expect(candidates.find(c => c.targetSlug === 'Apex-AI')).toBeUndefined();
-    // Resolved wikilinks are tagged distinctly from raw markdown refs.
-    expect(candidates.every(c => c.linkSource === 'wikilink-resolved')).toBe(true);
+    // Apex-AI has no basename match, so no resolved edge for it.
+    expect(resolved.find(c => /apex-ai/i.test(c.targetSlug))).toBeUndefined();
   });
 
   // Opt-in gate: without globalBasename, bare wikilinks are dropped (the
@@ -988,6 +989,15 @@ describe('parseTimelineEntries', () => {
     expect(entries[0]).toEqual({ date: '2026-01-15', summary: 'Met with Alice', detail: '', source: 'markdown' });
   });
 
+  test('parses dates in years 0001-0099', () => {
+    expect(parseTimelineEntries('- **0099-01-01** | Event')).toEqual([{
+      date: '0099-01-01',
+      summary: 'Event',
+      detail: '',
+      source: 'markdown',
+    }]);
+  });
+
   test('parses dash variant: - **YYYY-MM-DD** -- summary', () => {
     const entries = parseTimelineEntries('- **2026-01-15** -- Met with Bob');
     expect(entries.length).toBe(1);
@@ -1013,6 +1023,44 @@ describe('parseTimelineEntries', () => {
     const entries = parseTimelineEntries(content);
     expect(entries.length).toBe(3);
     expect(entries.map(e => e.date)).toEqual(['2026-01-15', '2026-02-20', '2026-03-10']);
+  });
+
+  test('parses dated level-three headings used by compiled wiki pages', () => {
+    const entries = parseTimelineEntries(
+      '### 2026-08-07 — Example orchestration event',
+    );
+    expect(entries).toEqual([{
+      date: '2026-08-07',
+      summary: 'Example orchestration event',
+      detail: '',
+      source: 'markdown',
+    }]);
+  });
+
+  test('captures body text below a dated heading as timeline detail', () => {
+    const content = `## Evidence updates
+
+### 2026-08-07 — Example orchestration event
+- Evidence: [[sources/example-source|Example source]]
+- Interpretation: bounded implementation lanes.
+
+### 2026-08-08 — Follow-up review
+Review completed.`;
+    const entries = parseTimelineEntries(content);
+    expect(entries).toEqual([
+      {
+        date: '2026-08-07',
+        summary: 'Example orchestration event',
+        detail: '- Evidence: [[sources/example-source|Example source]] - Interpretation: bounded implementation lanes.',
+        source: 'markdown',
+      },
+      {
+        date: '2026-08-08',
+        summary: 'Follow-up review',
+        detail: 'Review completed.',
+        source: 'markdown',
+      },
+    ]);
   });
 
   test('skips invalid dates (2026-13-45)', () => {
@@ -1981,6 +2029,22 @@ describe('normalizeBasename — CJK + accent folding (#2367)', () => {
     const idx = buildBasenameIndex(['people/duc-example', 'people/lukasz-example']);
     expect(queryBasenameIndex(idx, 'Đức Example')).toEqual(['people/duc-example']);
     expect(queryBasenameIndex(idx, 'Łukasz Example')).toEqual(['people/lukasz-example']);
+  });
+
+  // A spaced separator ("Backlog - vault") keeps its hyphen AND gains one per
+  // space, so the key read "backlog---vault" while sync mints the slug tail
+  // "backlog-vault" (slugifySegment collapses hyphen runs). Every such wikilink
+  // missed the index in silence.
+  test('hyphen runs collapse like slugifySegment', () => {
+    expect(normalizeBasename('Backlog - vault')).toBe('backlog-vault');
+    expect(normalizeBasename('Implications - The Linchpin')).toBe('implications-the-linchpin');
+    expect(normalizeBasename('Releases -- v2')).toBe('releases-v2');
+    expect(normalizeBasename('- Draft -')).toBe('draft');
+  });
+
+  test('basename index: a spaced-dash display name hits its slug tail', () => {
+    const idx = buildBasenameIndex(['50-backlog/backlog-vault']);
+    expect(queryBasenameIndex(idx, 'Backlog - vault')).toEqual(['50-backlog/backlog-vault']);
   });
 
   test('index side folds too, so a stroke-letter slug stays reachable', () => {

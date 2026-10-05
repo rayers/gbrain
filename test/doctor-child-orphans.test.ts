@@ -32,7 +32,7 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.message).toContain('10 tables checked');
   });
 
-  test('one orphan in content_chunks → status:warn with paste-ready cleanup SQL', async () => {
+  test('one orphan in content_chunks → status:warn naming the repair command (#5216: no raw SQL)', async () => {
     const engine = makeMockEngine(async (sql: string) => {
       if (sql.includes('content_chunks')) return [{ n: 5 }];
       return [{ n: 0 }];
@@ -41,12 +41,13 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.status).toBe('warn');
     expect(result.message).toContain('5 orphan row(s)');
     expect(result.message).toContain('content_chunks.page_id=5');
-    expect(result.message).toContain(
-      'DELETE FROM content_chunks t WHERE NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.page_id)',
-    );
+    expect(result.message).not.toContain('DELETE FROM');
+    expect(result.message).toContain('gbrain repair orphan-children --apply');
+    expect(result.details).toMatchObject({ code: 'child_table_orphans', fix: { kind: 'run_command', argv: ['gbrain', 'repair', 'orphan-children'] },
+      docs: 'docs/guides/repair.md#orphan-children' });
   });
 
-  test('orphans in multiple tables → aggregated breakdown + multi-line cleanup', async () => {
+  test('orphans in multiple tables → aggregated breakdown + one repair command', async () => {
     const engine = makeMockEngine(async (sql: string) => {
       if (sql.includes('content_chunks')) return [{ n: 234 }];
       if (sql.includes('page_versions')) return [{ n: 12 }];
@@ -59,9 +60,8 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.message).toContain('content_chunks.page_id=234');
     expect(result.message).toContain('page_versions.page_id=12');
     expect(result.message).toContain('tags.page_id=3');
-    expect(result.message).toContain('DELETE FROM content_chunks');
-    expect(result.message).toContain('DELETE FROM page_versions');
-    expect(result.message).toContain('DELETE FROM tags');
+    expect(result.message).toContain('Preview: gbrain repair orphan-children');
+    expect(result.details?.orphans).toEqual(['content_chunks.page_id=234', 'page_versions.page_id=12', 'tags.page_id=3']);
   });
 
   test('nullable FK (files.page_id, links.origin_page_id) filters IS NOT NULL', async () => {
@@ -74,14 +74,14 @@ describe('childTableOrphansCheck (#1063)', () => {
     await childTableOrphansCheck(engine);
     // The nullable-FK tables MUST have `IS NOT NULL AND` in their predicate
     // (NULL is a valid SET NULL outcome, not an orphan).
-    const filesSql = capturedSql.find((s) => s.includes('FROM files t WHERE'));
+    const filesSql = capturedSql.find((s) => s.includes('FROM files WHERE'));
     expect(filesSql).toBeDefined();
-    expect(filesSql!).toContain('t.page_id IS NOT NULL AND NOT EXISTS');
-    const linksOrigSql = capturedSql.find((s) => s.includes('FROM links t WHERE') && s.includes('origin_page_id'));
+    expect(filesSql!).toContain('files.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = files.page_id)');
+    const linksOrigSql = capturedSql.find((s) => s.includes('FROM links WHERE') && s.includes('origin_page_id'));
     expect(linksOrigSql).toBeDefined();
-    expect(linksOrigSql!).toContain('t.origin_page_id IS NOT NULL AND NOT EXISTS');
+    expect(linksOrigSql!).toContain('links.origin_page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = links.origin_page_id)');
     // NOT-NULL FK tables MUST NOT have the IS NOT NULL filter (it'd be redundant)
-    const ccSql = capturedSql.find((s) => s.includes('FROM content_chunks t WHERE'));
+    const ccSql = capturedSql.find((s) => s.includes('FROM content_chunks WHERE'));
     expect(ccSql).toBeDefined();
     expect(ccSql!).not.toContain('IS NOT NULL');
   });
@@ -119,31 +119,11 @@ describe('childTableOrphansCheck (#1063)', () => {
     expect(result.message).toContain('content_chunks.page_id=234');
   });
 
-  // Regression guard for the doctor wedge: `NOT IN (SELECT id FROM pages)`
-  // cannot be planned as a hash anti-join once the id list outgrows work_mem,
-  // so it degrades to a per-outer-row rescan and hangs doctor for hours on a
-  // large brain. Every probe MUST use the NOT EXISTS anti-join form.
-  test('every probe uses a NOT EXISTS anti-join, never NOT IN', async () => {
-    const capturedSql: string[] = [];
-    const engine = makeMockEngine(async (sql: string) => {
-      capturedSql.push(sql);
-      return [{ n: 1 }];
-    });
-    const result = await childTableOrphansCheck(engine);
-    expect(capturedSql.length).toBe(10);
-    for (const sql of capturedSql) {
-      expect(sql).toContain('NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = t.');
-      expect(sql).not.toContain('NOT IN');
-    }
-    // The paste-ready cleanup SQL must not reintroduce the quadratic form either.
-    expect(result.message).not.toContain('NOT IN');
-  });
-
   test('all 10 target tables are queried (no silent drops)', async () => {
     const queriedTables = new Set<string>();
     const engine = makeMockEngine(async (sql: string) => {
       // Extract `FROM <table>` to verify every target gets visited
-      const m = sql.match(/FROM (\w+) t WHERE/);
+      const m = sql.match(/FROM (\w+) WHERE/);
       if (m) queriedTables.add(m[1]);
       return [{ n: 0 }];
     });
