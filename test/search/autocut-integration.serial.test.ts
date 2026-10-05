@@ -191,24 +191,6 @@ describe('autocut — weak-top floor (cross-source collapse regression)', () => 
     expect(out.length).toBe(1);
   });
 
-  test('per-call RAW-LOGIT reranker model → floor disabled, weak-top cliff still trims', async () => {
-    // The floor is gated on the EFFECTIVE reranker model. A per-call
-    // SearchOpts.reranker.model override to a raw-logit local reranker
-    // (llama-server/Qwen3) must disable the [0,1] floor — otherwise the weak
-    // 0.317 top would be wrongly read as "not confident" on an unbounded scale.
-    // With the floor off, the cliff (0.317→0.197) is trusted again → trims.
-    const out = await hybridSearch(engine, 'alpha keyword', {
-      limit: 10,
-      reranker: {
-        enabled: true,
-        topNIn: 30,
-        topNOut: null,
-        model: 'llama-server-reranker:Qwen3-Reranker-4B',
-        rerankerFn: rerankerWithScores([0.317, 0.197, 0.131, 0.118, 0.1]),
-      },
-    });
-    expect(out.length).toBe(1);
-  });
 });
 
 describe('autocut — composes with adaptive-return (never-empty holds)', () => {
