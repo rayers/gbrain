@@ -265,11 +265,11 @@ function verifyPinnedHead(run: SyncRun, plan: Pick<SyncPlan, 'company' | 'gitCon
 
 async function applyBookmarkGate(
   run: SyncRun,
-  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'ckpt' | 'filtered' | 'holds'>,
+  plan: Pick<SyncPlan, 'opts' | 'company' | 'gitContextRoot' | 'anchorPath' | 'lastCommit' | 'pin' | 'pullFailed' | 'ckpt' | 'filtered' | 'holds'>,
   headVerificationSucceeded: boolean,
 ): Promise<{ done: SyncResult } | { gate: Awaited<ReturnType<typeof applySyncFailureGate>> }> {
   const { engine, succeededPaths, failedFiles, pagesAffected } = run;
-  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, ckpt, filtered } = plan;
+  const { opts, company, gitContextRoot, anchorPath, lastCommit, pin, pullFailed, ckpt, filtered } = plan;
   // issue #1939 — gate the bookmark through the shared failure ledger.
   //   • Fresh failures still BLOCK (fail-closed): the next sync re-walks the
   //     diff and re-attempts. Escape hatch: --skip-failed.
@@ -288,7 +288,9 @@ async function applyBookmarkGate(
     // "fresh". The checkpoint rows clear here — CONVERGENCE CONTRACT: sync
     // convergence == IMPORT convergence; downstream extract/facts/embed is
     // decoupled (its own resumable stale sweeps).
-    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot);
+    // #1430 (fork): a failed pull that still imported local commits must not
+    // stamp a fresh last_sync_at — writeSyncAnchor holds it when pullFailed.
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', pin, commitTimeMs(gitContextRoot, pin), gitContextRoot, pullFailed);
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', anchorPath);
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
