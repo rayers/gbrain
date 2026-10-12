@@ -23,6 +23,7 @@
 
 import type { BrainEngine } from '../core/engine.ts';
 import { reindexCodeProjection } from '../core/persistence/projection-reindex.ts';
+import { projectionConflictLine } from '../core/agent-output.ts';
 import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
 import { estimateTokens } from '../core/chunkers/code.ts';
 import { getEmbeddingModelName, estimateEmbeddingCostUsd } from '../core/embedding.ts';
@@ -314,7 +315,7 @@ export async function runReindexCode(
               // per-page so the rest of the batch completes.
               if (e instanceof BudgetExhausted) throw e;
               failed++;
-              failures.push({ slug: row.slug, error: e instanceof Error ? e.message : String(e) });
+              failures.push({ slug: row.slug, error: projectionConflictLine(e, 'reindex-code') ?? (e instanceof Error ? e.message : String(e)) });
             }
             reporter.tick();
           },
@@ -343,7 +344,7 @@ export async function runReindexCode(
     }
   }
 
-  if (reindexed > 0) await refreshProjectionStatistics(engine);
+  if (reindexed > 0) await refreshProjectionStatistics(engine, reindexed);
   if (budgetExhausted) {
     // Partial-progress result: surfaces what got reindexed before the cap
     // fired. The CLI wrapper translates this into a clear user-facing

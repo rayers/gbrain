@@ -46,18 +46,21 @@ import { opError, OperationError, type OperationContext } from '../ops/contract.
 import { shellQuote, type Action } from '../agent-output.ts';
 import { autoFixFrontmatter, createFrontmatterBackup, makeFrontmatterBackupRunId, repairRecoverableFrontmatter } from '../brain-writer.ts';
 import { classifyImportHold, parseMarkdown, type ContentHold, type ParsedMarkdown } from '../markdown.ts';
+import { dataFrontmatter as matter } from '../data-frontmatter.ts';
 import { MAX_FILE_SIZE, type ContentRefusal } from '../import-screen.ts';
 import { importFromFile } from '../import-file.ts';
-import { resolveSlugForPath } from '../sync.ts';
+import { resolveSlugForPath, slugifyPath } from '../sync.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { digest, sha256 } from '../persistence/digest.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { clearGitHold, readGitSourceHolds, type GitHoldRecord } from '../persistence/sync-holds.ts';
+import { fenceWhere } from '../fence-repair/refusal.ts';
 import type { SyncRename } from '../persistence/sync-discovery.ts';
 import { canonicalRepairFields, confinedRepairTarget, managedRepairRoot, prepareRepairPublication, repairScreenConfig, submitManagedFileRepair } from '../persistence/file-repair.ts';
 import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, saveApprovedSet } from '../persistence/preview-approval.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { afterCursor, repairRequestId, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairListing, type RepairPlan, type RepairScope } from './core.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 type Mode = 'managed' | 'legacy';
 type RepairClass = 'safe' | 'interpretive';
@@ -163,13 +166,18 @@ export function frontmatterCandidates(content: string, path: string, ctx: SlugCo
 }
 
 /** The exact manual fix for a file no rule repairs. */
-function resolution(hold: Pick<ContentRefusal, 'code' | 'reason' | 'key' | 'line'> | null, path: string): string {
+function resolution(hold: Pick<ContentRefusal, 'code' | 'reason' | 'key' | 'line' | 'fence'> | null, path: string, sourceId: string): string {
   if (!hold) return `Edit the frontmatter of ${path} by hand (one line per key, the whole value quoted), then preview again.`;
   const where = `${hold.line !== undefined ? `line ${hold.line}` : 'the frontmatter'}${hold.key ? ` (key "${hold.key}")` : ''} of ${path}`;
   switch (hold.code) {
+    // #6188: frontmatter repair never rewrites a fence; the fence repair does.
+    case 'invalid_fence': return `${path}: ${fenceWhere(hold.fence)} is malformed (${hold.fence?.reason ?? hold.reason ?? 'invalid_fence'}), and frontmatter repair does not change fences. `
+      + `Preview its repair with gbrain repair fences --source ${sourceId} --only ${path} (read-only; it names the exact edit when gbrain will not repair it).`;
     case 'file_too_large': return `Split ${path} into files under ${MAX_FILE_SIZE} bytes and commit, or leave it out of the source with sync.exclude.`;
     case 'frontmatter_slug_conflict': return `Remove the slug: line of ${path} (the path decides the slug), or move the file to the path its slug names.`;
     case 'content_rejected': return `Remove the junk the content-sanity gate matched in ${path}, or ask the user whether junk_disposition should stay reject.`;
+    case 'purged_content': return `${path} carries purged page content; delete or edit it and commit, or the owner clears the tombstone with gbrain pages unpurge.`;
+    case 'write_gate_rejected': return `The write gate refused ${path} as external instruction-like content; ask the user whether to edit it or whether write_gate.external_mode should stay reject.`;
     case 'rename_held': return `Re-run the preview with --include-ambiguous to re-bind the rename of ${path} to the current page, or restore the old file name.`;
     case 'parser_regression': return `This is a gbrain bug: report the gbrain version, ${path} and the code; upgrade or pin the last good version.`;
     default: return hold.reason === 'ambiguous_protected_key' ? `Write ${where} on one line with one quoted value; gbrain never guesses who may read a page or where it came from.`
@@ -204,7 +212,7 @@ async function sourceRoots(engine: BrainEngine, scope: RepairScope, residuals: R
 function markdownFiles(root: string): string[] {
   let paths: string[];
   try {
-    paths = execFileSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] })
+    paths = execFileSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { env: gitChildEnv(), encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] })
       .split('\0').filter(Boolean);
   } catch {
     paths = (readdirSync(root, { recursive: true }) as string[]).map(path => path.split('\\').join('/'));
@@ -238,6 +246,26 @@ function pageDamage(page: PageRow | undefined, content: string): string | null {
   return null;
 }
 
+/**
+ * #5966 (W14 P1.7): a file an earlier gbrain rendered for a slug its path
+ * cannot derive (a doubled hyphen the path collapses to one) carries no `slug:`
+ * stamp, so every path-derived reader loses the page. The stamp is a SAFE
+ * candidate only when the file is the page's recorded `source_path` (one page
+ * records a path), the file declares no slug and the page slug is not the
+ * derived one; nothing is ever normalized or guessed. Inserted as
+ * `serializeMarkdown` would write it, right after the opening `---`.
+ */
+function slugStampCandidate(content: string, path: string, sourcePath: string, page: PageRow | undefined, parsed: ParsedMarkdown, ctx: SlugContext): { content: string; fixes: string[] } | null {
+  if (!page || page.source_path !== sourcePath || slugifyPath(sourcePath) === page.slug || parsed.slug === page.slug) return null;
+  const open = /^(\uFEFF?---[ \t]*\r?\n)/.exec(content);
+  if (!open) return null;
+  const eol = open[1].endsWith('\r\n') ? '\r\n' : '\n';
+  const line = matter.stringify('', { slug: page.slug }).split('\n')[1] ?? `slug: ${page.slug}`;
+  const stamped = open[1] + line + eol + content.slice(open[1].length);
+  if (!clean(stamped, path, ctx) || reading(stamped, path) !== reading(content, path) || parseMarkdown(stamped, path).slug !== page.slug) return null;
+  return { content: stamped, fixes: [`Stamp slug: ${page.slug} (the path ${sourcePath} derives ${slugifyPath(sourcePath)}, so readers lose the page without it)`] };
+}
+
 interface Analysis {
   proposal?: { content: string; fixes: string[]; class: RepairClass; rename_from?: SyncRename; reimport?: string };
   pending?: { content: string; fixes: string[] };
@@ -257,7 +285,7 @@ async function analyzeFile(ctx: FileContext, path: string, hold: GitHoldRecord |
     return hold ? review(hold.code, `${path} is a symlink, sits under one, or resolves outside the source root; gbrain never writes through one. Replace it with the real file, then preview again.`) : null;
   }
   const size = lstatSync(abs).size;
-  if (size > MAX_FILE_SIZE) return review('file_too_large', resolution({ code: 'file_too_large' }, path));
+  if (size > MAX_FILE_SIZE) return review('file_too_large', resolution({ code: 'file_too_large' }, path, src.sourceId));
   const bytes = readFileSync(abs);
   const content = bytes.toString('utf8');
   if (!Buffer.from(content, 'utf8').equals(bytes)) return review(hold?.code ?? 'invalid_frontmatter', `${path} is not valid UTF-8, so gbrain will not rewrite it; re-save it as UTF-8, then preview again.`);
@@ -276,6 +304,8 @@ async function analyzeFile(ctx: FileContext, path: string, hold: GitHoldRecord |
   }
   const problem = found.errors.length > 0 || found.hold !== null || found.recovered > 0 || found.comments > 0;
   const damage = !problem && !hold ? pageDamage(page, content) : null;
+  const stamp = !problem && !hold && !damage ? slugStampCandidate(content, path, sourcePath, page, found.parsed, slugCtx) : null;
+  if (stamp) return { proposal: { ...stamp, class: 'safe' } };
   if (!problem && !hold && !damage) return null;
   if (damage) {
     const body = parseMarkdown(content, path).compiled_truth;
@@ -287,7 +317,7 @@ async function analyzeFile(ctx: FileContext, path: string, hold: GitHoldRecord |
   const unchanged = found.hold === null && !found.errors.length ? { content, fixes: [] as string[] } : null;
   if (rebind) {
     const base = candidates.interpretive ?? candidates.safe ?? unchanged;
-    if (!base) return review(found.hold?.code ?? hold!.code, resolution(found.hold, path));
+    if (!base) return review(found.hold?.code ?? hold!.code, resolution(found.hold, path, src.sourceId));
     const proposal = { content: base.content, fixes: [...base.fixes, `Re-bind the rename of ${path} to page ${renameFrom!.slug} at its current revision`], class: 'interpretive' as const, rename_from: renameFrom };
     return includeAmbiguous ? { proposal } : { pending: proposal };
   }
@@ -297,8 +327,9 @@ async function analyzeFile(ctx: FileContext, path: string, hold: GitHoldRecord |
   if (candidates.interpretive) return { pending: candidates.interpretive };
   if (hold && unchanged) return { proposal: { content, fixes: [`Import ${path} as it is now`], class: 'safe', ...withRename } };
   if (!found.hold && !hold && !found.errors.length) return null;
-  const blocking = found.hold ?? (hold ? { code: hold.code as ContentHold['code'], reason: hold.meta.reason as ContentHold['reason'], key: hold.meta.key, line: hold.meta.line, message: hold.message } : null);
-  return review(blocking?.code ?? 'invalid_frontmatter', resolution(blocking, path), {
+  const blocking = found.hold ?? (hold ? { code: hold.code as ContentRefusal['code'], reason: hold.meta.reason as ContentRefusal['reason'], key: hold.meta.key, line: hold.meta.line,
+    fence: hold.meta.fence, message: hold.message } : null);
+  return review(blocking?.code ?? 'invalid_frontmatter', resolution(blocking, path, src.sourceId), {
     ...(blocking?.reason ? { reason: blocking.reason } : {}), ...(blocking?.key ? { key: blocking.key } : {}), ...(blocking?.line !== undefined ? { line: blocking.line } : {}), ...heldBefore });
 }
 
@@ -316,7 +347,7 @@ async function bindProposal(ctx: FileContext, path: string, hold: GitHoldRecord 
   const publication = await prepareRepairPublication(engine, { sourceId: src.sourceId, slug, sourcePath, path, root: src.root, content: proposal.content,
     snapshot, base, ...screenConfig });
   if (publication.status === 'refused') return { source_id: src.sourceId, path, code: publication.refusal.code, ...(publication.refusal.reason ? { reason: publication.refusal.reason } : {}),
-    ...(publication.refusal.line !== undefined ? { line: publication.refusal.line } : {}), resolution: resolution(publication.refusal, path) };
+    ...(publication.refusal.line !== undefined ? { line: publication.refusal.line } : {}), resolution: resolution(publication.refusal, path, src.sourceId) };
   if (publication.status === 'overlay') return { source_id: src.sourceId, path, code: 'canonical_overlay',
     resolution: `Importing the repaired ${path} would keep page data the file does not carry (tags added outside the file, a withdrawal or sanitized text), so it is not written. Edit the file by hand to carry them (gbrain get --source ${src.sourceId} -- ${slug} shows the page), then preview again.` };
   if (proposal.reimport && snapshot && digest(canonicalRepairFields(snapshot.page, snapshot.tags)) === publication.digest) {
@@ -392,7 +423,8 @@ export const frontmatterRepair: RepairHandler = {
         throw opError('invalid_params', 'gbrain repair frontmatter --apply writes only the set a preview printed.',
           `Preview first: ${shellQuote(preview)} — show the user the per-file diffs, then run the apply command it prints (with --yes --expect <preview-hash>).`);
       }
-      const approved = await loadApprovedSet<ApprovedSetItem>(engine, { command: 'frontmatter', hash: opts.expect, previewCommand: shellQuote(preview) });
+      const approved = await loadApprovedSet<ApprovedSetItem>(engine, { command: 'frontmatter', hash: opts.expect, previewCommand: shellQuote(preview),
+        emptyHash: async () => previewHash({ kind: 'frontmatter-v1', brain_id: scope.brain_id, sources: (await engine.executeRaw<{ id: string; incarnation: string }>('SELECT id, incarnation::text AS incarnation FROM sources WHERE id=ANY($1::text[]) ORDER BY id', [scope.source_ids])), selection, items: [] }) });
       if (approved.items.some(entry => !sameSelection(entry.selection, selection))) throw previewChangedError(opts.expect, shellQuote(preview));
       for (const sourceId of new Set(approved.items.map(entry => entry.source_id))) {
         const named = await unfinishedSyncPath(engine, sourceId, new Set(approved.items.filter(entry => entry.source_id === sourceId).flatMap(entry => [entry.path, entry.source_path])));
@@ -493,7 +525,8 @@ async function applyRepair(ctx: OperationContext, repair: ApprovedRepair, select
         committed: persistence?.git_state ?? 'not_requested' } };
     } catch (error) {
       if (error instanceof OperationError && ['changed_since_preview', 'revision_conflict', 'page_identity_changed'].includes(error.code)) return changed(error.message);
-      if (error instanceof OperationError && error.code === 'source_changed') return { applied: false, outcome: 'refused', reason: error.message, detail: { path: repair.path } };
+      // #6278: a sync that started since the preview and still names the file is refused at admission, not written.
+      if (error instanceof OperationError && (error.code === 'source_changed' || error.code === 'sync_in_progress')) return { applied: false, outcome: 'refused', reason: error.message, detail: { path: repair.path } };
       throw error;
     }
   }

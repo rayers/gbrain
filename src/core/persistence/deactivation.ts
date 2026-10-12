@@ -39,12 +39,13 @@ import { recordTopologyChange } from './topology-receipts.ts';
 import { lockTopologyPrincipal, topologyPrincipal } from './topology-locks.ts';
 import { canonicalFilesystemPath } from './root-registry.ts';
 import { carryHoldsToClassicState, holdCarryBlocked, planHoldCarry, type HoldCarry } from '../connectors/item-holds-store.ts';
-import { PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from './physical-root-record.ts';
+import { assertPhysicalRoot, assertPhysicalRootReservation, PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from './physical-root-record.ts';
+import { preActivationClaims, releasePreActivationClaims, type PreActivationClaim } from './pre-activation-release.ts';
 
 export const DEACTIVATE_DOCS = 'docs/architecture/topologies.md#deactivate-runbook';
 
 export interface DeactivationBlocker {
-  kind: 'writer_admin_lock' | 'request' | 'topology_recovery' | 'effect' | 'lease' | 'connector_holds';
+  kind: 'writer_admin_lock' | 'request' | 'topology_recovery' | 'effect' | 'lease' | 'connector_holds' | 'physical_root';
   id: string;
   source_id?: string;
   detail: string;
@@ -71,6 +72,8 @@ export interface DeactivationReport {
   blockers: DeactivationBlocker[];
   /** Held connector items copied (or, on a dry run, to be copied) into each source's classic state file. */
   carried_holds?: HoldCarry[];
+  /** #6122: on a never-activated brain, the claimed sources a deactivation releases (dry run) or released. */
+  pre_activation_claims?: PreActivationClaim[];
   local_markers?: LocalMarkerReport;
 }
 
@@ -142,6 +145,39 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
   return blockers;
 }
 
+/**
+ * #5914 [R9a]: the `physical_root` blockers of this host's owned checkouts, probed
+ * exactly as the real operation of each mode will: the managed run takes the
+ * strict worktree lock (inode and birth time compared), the classic release
+ * publishes nothing and checks only the reservation's worktree id and token.
+ * Each preview therefore lists what its own real run would refuse on.
+ */
+export async function physicalRootBlockers(engine: BrainEngine, mode: 'managed' | 'classic'): Promise<DeactivationBlocker[]> {
+  const hostId = existingLocalHostId();
+  const sources = mode === 'managed'
+    ? await engine.executeRaw<{ id: string }>('SELECT source_id AS id FROM persistence_source_bindings ORDER BY source_id')
+    : (await preActivationClaims(engine)).map(claim => ({ id: claim.source_id }));
+  const blockers: DeactivationBlocker[] = [];
+  const seen = new Set<string>();
+  for (const { id } of sources) {
+    const binding = await getWorktreeBinding(engine, id, hostId);
+    if (!binding || binding.owner_host_id !== hostId || !binding.local_path || !binding.coordination_path || seen.has(binding.worktree_id)) continue;
+    seen.add(binding.worktree_id);
+    const identity = { worktreeId: binding.worktree_id, coordinationPath: binding.coordination_path };
+    try { if (mode === 'managed') assertPhysicalRoot(binding.local_path, identity); else assertPhysicalRootReservation(binding.local_path, identity); }
+    catch (error) {
+      const detail = error instanceof OperationError ? error.message : String(error);
+      blockers.push({ kind: 'physical_root', id: binding.worktree_id, source_id: id, detail: `${binding.local_path}: ${detail}`,
+        exit: mode === 'managed'
+          ? `gbrain sources writer status ${id} --json, then (same path, directory recreated) gbrain sources writer transfer prepare ${id} --self-transfer --confirm-relocated-root --admin-intent writer_transfer_prepare --expected-state <admin_state> `
+            + `and gbrain sources writer transfer accept ${id} --path ${binding.local_path} --expected-epoch <owner_epoch> --manifest <digest> --self-transfer --confirm-relocated-root --admin-intent writer_transfer_accept --expected-state <admin_state>; `
+            + 'a checkout moved behind a symlink converges with gbrain sources set-path instead'
+          : `gbrain sources writer status ${id} --json; the reservation beside ${binding.local_path} must name this worktree and its stamp must carry the same token (docs/architecture/topologies.md#recreated-root)` });
+    }
+  }
+  return blockers;
+}
+
 function blockedError(blockers: DeactivationBlocker[]): OperationError {
   const locked = blockers.find(b => b.kind === 'writer_admin_lock');
   if (locked) return new OperationError('writer_admin_locked', 'Writer administration is locked; deactivation was not applied.',
@@ -175,11 +211,21 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
   const kept = await keptSettings(engine, brain);
   const base = { dry_run: opts.dryRun === true, retired_worktrees: topology.worktrees, source_bindings: topology.bindings, kept };
   if (!brain.enabled) {
-    // A disabled brain has nothing to convert; a rerun only clears this host's retired markers.
-    return { ...base, mode: 'classic', deactivated: false, mode_epoch: Number(brain.mode_epoch), retired_worktrees: [], source_bindings: 0, blockers: [],
-      ...(opts.dryRun ? {} : { local_markers: await cleanupRetiredManagedMarkers(engine) }) };
+    // #6122: a disabled brain has no managed mode to convert, but sources claimed before activation fence classic sync;
+    // deactivate releases them. Without claims a rerun only clears this host's retired markers.
+    const claims = await preActivationClaims(engine);
+    const classic = { ...base, mode: 'classic' as const, deactivated: false, mode_epoch: Number(brain.mode_epoch) };
+    if (!claims.length) return { ...classic, retired_worktrees: [], blockers: [], ...(opts.dryRun ? {} : { local_markers: await cleanupRetiredManagedMarkers(engine) }) };
+    const blockers = [...await deactivationBlockers(engine), ...await physicalRootBlockers(engine, 'classic')];
+    if (opts.dryRun) return { ...classic, retired_worktrees: [], blockers, pre_activation_claims: claims };
+    if (blockers.length) throw blockedError(blockers);
+    const released = await releasePreActivationClaims(engine, { expectedState: opts.expectedState, requestId: opts.requestId,
+      blocked: async tx => { const inside = await deactivationBlockers(tx); return inside.length ? blockedError(inside) : null; } });
+    const worktrees = [...new Set(released.map(claim => claim.worktree_id))];
+    return { ...classic, retired_worktrees: worktrees.map(id => ({ id, roots: [...new Set(released.filter(c => c.worktree_id === id).flatMap(c => c.roots))] })),
+      blockers: [], pre_activation_claims: released, local_markers: await cleanupRetiredManagedMarkers(engine) };
   }
-  const blockers = await deactivationBlockers(engine);
+  const blockers = [...await deactivationBlockers(engine), ...await physicalRootBlockers(engine, 'managed')];
   if (opts.dryRun) {
     const carried_holds = (await planHoldCarry(engine, existingLocalHostId())).filter(c => c.items > 0 && !holdCarryBlocked(c));
     return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers, carried_holds };
@@ -199,7 +245,7 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
       if (binding && binding.owner_host_id === hostId && binding.local_path) local.set(binding.worktree_id, binding);
     }
     for (const binding of [...local.values()].sort((a, b) => a!.worktree_id.localeCompare(b!.worktree_id))) {
-      const lock = await acquireWorktree(binding!);
+      const lock = await acquireWorktree(binding!, 0, undefined, undefined, { yieldLanes: true });
       if (!lock) throw new OperationError('writer_lock_unavailable', `A local process holds the canonical worktree lock of source '${binding!.source_id}'.`,
         'Stop the resident owner on this host (gbrain serve or autopilot), then rerun deactivate.');
       locks.push(lock);

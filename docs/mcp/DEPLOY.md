@@ -59,17 +59,38 @@ the OAuth request when issuing my owner login link."*
 ### Local stdio (zero setup)
 
 ```bash
-gbrain serve                  # full operation catalog (default)
-gbrain serve --surface verbs  # just the 7 memory verbs (quickstart surface)
+gbrain serve --surface full   # full operation catalog (what registrations pin; also the bare-serve default)
 ```
 
 Works with Claude Code, Cursor, Windsurf, and any MCP client that supports stdio.
-No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
-`--surface verbs` exposes exactly the seven-verb memory protocol (`recall`,
-`remember`, `entity`, `synthesize`, `forget`, `context_pack`, `delta` —
-[MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) instead of the full catalog;
-`--surface starter` sits between (~27 ops: the verbs plus the daily-driver set);
-omit the flag (default `full`) for every operation.
+On Claude Code, `gbrain setup claude-code` writes and verifies this registration
+for you ([setup guide](../guides/setup.md)). No server, no tunnel, no token needed. Works on both PGLite and Postgres engines.
+`--surface full` serves every operation. For a client that cannot hold the full
+catalog, `--surface verbs` exposes exactly the seven-verb memory protocol
+(`recall`, `remember`, `entity`, `synthesize`, `forget`, `context_pack`,
+`delta` — [MEMORY_VERBS v1](../protocol/MEMORY_VERBS_v1.md)) and `--surface
+starter` sits between (40 ops: the verbs plus the daily-driver set).
+
+`--surface` is the callable ceiling. To keep every operation callable while
+listing fewer tools to the agent, set `mcp.advertised_surface`:
+
+```bash
+gbrain config set mcp.advertised_surface verbs   # list the 7 verbs; everything else stays callable
+```
+
+Unset is the recommended default. In a held-out agent benchmark, listing only
+`starter` or `verbs` lowered task success by 8–10 points pooled across four
+frontier models, mostly on tasks that need an unlisted tool (agents rarely
+reached for `request_tools`), and saved no tokens. Narrow the list only for a
+client that cannot hold the full catalog.
+
+`tools/list` then shows the advertised surface, and the initialize
+instructions tell the agent how many more tools are callable. On stdio,
+`request_tools` with `tools: [names]` returns their schemas and adds them to
+that session's list (the server sends `tools/list_changed`). On the OAuth HTTP
+server, a client that set its own surface (`request_tools` with `surface`, or
+`gbrain auth rescope-client`) has that surface listed in full. Unset
+advertises the whole callable set.
 
 #### Stdio source binding
 
@@ -367,7 +388,12 @@ A self-registered client goes through three gates:
 2. **Owner approval on `/authorize`.** Every authorization-code connection
    redirects to the admin dashboard, where you see the client, its redirect
    URI, and the requested scopes, and approve or deny. No code is minted
-   until you approve. Consent never widens the registered scope.
+   until you approve. Consent never widens the registered scope. For a newly
+   self-registered client you also choose the source it reads and writes
+   (it registers on `default`); the choice is recorded in the grant audit
+   (`action: consent`), and the first approval ends the choice, so later
+   requests show the source read-only. A `client_credentials` client never
+   gets this choice and stays on `default`.
 3. **Per-request clamp.** Issued codes and tokens are re-intersected with the
    client's current registered scope, so a later `rescope-client` takes effect
    on the next request.
@@ -658,6 +684,13 @@ Retry-After: 5
 - Container health checks that probe `/health` treat the `503` as unhealthy and
   restart the container. Pass `--fail-fast` (or set `GBRAIN_SERVE_FAIL_FAST=1`)
   there so the process exits non-zero with the classified envelope on stderr.
+- A supervisor that should also catch a pool that accepts TCP but answers no
+  real request probes `/health?deep=1` instead: it runs `SELECT 1` through the
+  same pooled dispatch the MCP handlers use, returns the pool block
+  (`checked_out`, `waiters`, `inflight_oldest_ms`, `stuck_discards`, …) and
+  answers 503 when the probe times out or a statement is past the pool's
+  in-flight budget ([pool diagnostics](../ENGINES.md#pg-connection-stuck)). A
+  two-minute interval is fine; one deep probe runs at a time.
 - A second `gbrain serve --http` on a port another server already holds exits
   with `serve_port_in_use`. A Postgres connect failure keeps the degraded-engine
   path (`GBRAIN_DB_ACCESS` marker, `gbrain db-repair`).

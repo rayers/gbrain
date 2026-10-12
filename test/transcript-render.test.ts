@@ -5,12 +5,11 @@
  * embed-skip-driven part splitting with overlap.
  */
 import { describe, test, expect } from 'bun:test';
-import { safeLoad } from 'js-yaml';
+import { load } from 'js-yaml';
 
 import {
   escapeAnchorLines,
   MESSAGE_ANCHOR_RE,
-  MESSAGE_CHAR_CAP,
   OVERLAP_MESSAGES,
   PART_TARGET_BYTES,
   redactSession,
@@ -41,7 +40,7 @@ function splitBody(content: string): string {
 
 function frontmatter(content: string): Record<string, any> {
   const end = content.indexOf('---', 4);
-  return safeLoad(content.slice(4, end)) as Record<string, any>;
+  return load(content.slice(4, end)) as Record<string, any>;
 }
 
 const BASIC = session([
@@ -251,7 +250,7 @@ describe('redaction [fail-closed page lane]', () => {
 
 describe('part splitting [embed-skip is the binding limit]', () => {
   test('long sessions split at message boundaries with overlap; ids unique; base slug stable', () => {
-    const chunk = 'x'.repeat(MESSAGE_CHAR_CAP - 100);
+    const chunk = 'x'.repeat(3_900);
     const many = Array.from({ length: 150 }, (_, i) => ({
       role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
       timestamp: `2026-08-02T09:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`,
@@ -304,6 +303,20 @@ describe('part splitting [embed-skip is the binding limit]', () => {
     for (const p of r.parts) {
       expect(Buffer.byteLength(splitBody(p.content), 'utf8')).toBeLessThan(DEFAULT_BYTES_WARN);
     }
+  });
+
+  test('partTargetBytes overrides the part target and defaults to PART_TARGET_BYTES', () => {
+    const msgs = Array.from({ length: 40 }, (_, i) => ({
+      role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+      timestamp: `2026-08-02T09:00:${String(i).padStart(2, '0')}.000Z`,
+      text: `m${i} ${'y'.repeat(900)}`,
+    }));
+    const red = redactSession(session(msgs), { userPatternsPath: '/nonexistent' });
+    expect(renderSessionParts(red).parts.length).toBe(1);
+    expect(renderSessionParts(red, { sourcePath: '', partTargetBytes: PART_TARGET_BYTES }).parts.length).toBe(1);
+    const small = renderSessionParts(red, { sourcePath: '', partTargetBytes: 10_000 });
+    expect(small.parts.length).toBeGreaterThan(3);
+    for (const p of small.parts) expect(Buffer.byteLength(p.body, 'utf8')).toBeLessThan(10_000 + 2_000);
   });
 
   test('sessions with zero timestamps are refused (never fabricate provenance)', () => {

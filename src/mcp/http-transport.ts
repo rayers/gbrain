@@ -43,7 +43,7 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall, requestLogStatusForResult, errorResult } from './dispatch.ts';
 import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
-import { filterOpsForSurface, clampSurface, type McpSurface } from './surface.ts';
+import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
@@ -53,7 +53,8 @@ import { classifyPgAccessError } from '../core/pg-access-classify.ts';
 import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { redactUrlsInText } from '../core/url-redact.ts';
 import { authSourcesFromGrant } from '../core/grants/model.ts';
-import { resolveTokenGrant } from '../core/grants/legacy-token.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from '../core/grants/legacy-token.ts';
+import { storedMinTrust } from '../core/trust/tier.ts';
 export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
@@ -217,10 +218,10 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // config plane — this transport builds its tool list once, so a
   // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
   // serve-http path re-reads dual-plane per request). Dispatch-side
-  // enforcement still resolves per call.
+  // enforcement still resolves per call. mcp.advertised_surface (file plane) narrows the tool list only.
   const fileConfig = loadConfig();
   const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
-  const tools = buildToolDefs(surfacedOps, { strictParams });
+  const tools = buildToolDefs(advertisedOps(surfacedOps, surface, await resolveAdvertisedSurface(null, fileConfig)), { strictParams });
 
   /**
    * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
@@ -270,13 +271,8 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (!row) return { ok: false };
       const rowId = row.id as string;
       const rowName = row.name as string;
-      // Debounced last_used_at update — only writes once per token per 60s.
-      // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests;
-      // SKIP LOCKED keeps a row lock held elsewhere from parking a pool slot (#5730).
-      sql`UPDATE access_tokens SET last_used_at = now()
-          WHERE id IN (SELECT id FROM access_tokens WHERE id = ${rowId}
-            AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds') FOR UPDATE SKIP LOCKED)`
-        .catch(() => { /* fire-and-forget */ });
+      // Debounced fire-and-forget last_used_at update, shared with the OAuth provider.
+      void touchTokenLastUsed(sql, row);
       // One grant shape (grants/model.ts) shared with the OAuth provider
       // behind `serve --http`, so the two transports cannot drift; a row still
       // on the legacy shape is converted on this read. Takes holders fail safe
@@ -293,6 +289,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         sourceId,
         ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
         ...(allowedSources ? { allowedSources } : {}),
+        ...(storedMinTrust(row.min_trust) ? { minTrust: storedMinTrust(row.min_trust) } : {}),
       };
       return {
         ok: true,
@@ -513,7 +510,8 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
         const op = operationsByName[toolName];
-        if (op && !op.localOnly && !operationScopesAllowed(auth.auth!.scopes, op)) {
+        // #5575: cliOnly ops reach the dispatcher's trusted_local_only refusal (the host command), never a grant-widening scope fix.
+        if (op && !op.localOnly && !op.cliOnly && !operationScopesAllowed(auth.auth!.scopes, op)) {
           logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied_after_list', Date.now() - startedMs);
           // Frozen v1 pair: `error: permission_denied` stays; `code: insufficient_scope`.
           const denial = scopeDeniedError({ op: toolName, required: [op.scope ?? 'read', ...(op.requiredScopes ?? [])], auth: auth.auth,

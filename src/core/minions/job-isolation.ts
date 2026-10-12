@@ -35,7 +35,7 @@
 
 import { accessSync, constants, readdirSync, readFileSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
+import { spawnSync } from '../spawn.ts';
 import { JobDeferredError, UnrecoverableError } from './types.ts';
 import { RateLeaseUnavailableError } from './handlers/subagent.ts';
 import { SpendGroupRefusedError, type SpendRefusalEnvelope } from './spend-authorization.ts';
@@ -449,6 +449,29 @@ export function killProcessGroup(pid: number, signal: 'SIGTERM' | 'SIGKILL'): bo
       const sigName = signal.replace(/^SIG/, '');
       const res = spawnSync('/bin/kill', ['-s', sigName, '--', `-${pid}`], { stdio: 'ignore' });
       return res.status === 0;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * #5062: does any process remain in group `pgid`? Liveness, not
+ * `ChildProcess.killed` (which flips as soon as a signal is SENT), drives
+ * SIGTERM→SIGKILL escalation and confirmed termination. Same /bin/kill
+ * fallback as killProcessGroup for runtimes that reject negative pids.
+ */
+export function processGroupAlive(pgid: number): boolean {
+  if (!Number.isInteger(pgid) || pgid <= 1) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
+    try {
+      return spawnSync('/bin/kill', ['-s', '0', '--', `-${pgid}`], { stdio: 'ignore' }).status === 0;
     } catch {
       return false;
     }

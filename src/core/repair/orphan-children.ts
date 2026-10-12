@@ -31,8 +31,9 @@ export const PAGE_CHILD_FK_TARGETS: ReadonlyArray<{ table: string; col: string; 
 
 // NOT EXISTS (not `NOT IN (SELECT id FROM pages)`) so the planner can use a
 // hash anti-join: once the page-id list outgrows work_mem, NOT IN degrades to a
-// per-row rescan of pages and never finishes on a ~500K-page brain. pages.id is
-// the primary key (never NULL), so the semantics match NOT IN exactly.
+// per-row rescan of pages. pages.id is the primary key (never NULL), so the
+// semantics match NOT IN exactly. The column is table-qualified because the
+// predicate also runs inside the repair's UPDATE and DELETE statements.
 export function orphanPredicate(target: { table: string; col: string; allowNull: boolean }): string {
   const col = `${target.table}.${target.col}`;
   return `${target.allowNull ? `${col} IS NOT NULL AND ` : ''}NOT EXISTS (SELECT 1 FROM pages p WHERE p.id = ${col})`;

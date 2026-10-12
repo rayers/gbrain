@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { PoolStallWatch } from '../core/postgres-engine/pool-stall-watch.ts';
 import type { BrainEngine } from '../core/engine.ts';
 // C10: `--fail-fast` / GBRAIN_SERVE_FAIL_FAST=1 — exit with the classified envelope instead of status-only/degraded mode (decided in src/cli.ts's connect path; F4's status mode consults it too).
 export { serveFailFastRequested, writeServeFailFastEnvelope } from '../core/serve-fail-fast.ts';
@@ -8,6 +9,7 @@ import { VERB_NAMES } from '../core/verbs.ts';
 import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
+import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
@@ -141,6 +143,8 @@ export interface ServeOptions {
   runServeHttp?: (typeof import('./serve-http.ts'))['runServeHttp'];
   /** `--http` recovery from status-only mode: the listener the status server already bound (serve-http-status.ts). */
   adoptServer?: import('./serve-http-listen.ts').AdoptableServer;
+  // Test seam (X8): replaces armCorpusDrain on the --http lane.
+  armCorpusDrain?: (typeof import('../core/sweep.ts'))['armCorpusDrain'];
   // Test seam (#4281): replaces installLoopStallWatchdog.
   installStallWatchdog?: (o: LoopStallWatchdogOpts) => WatchdogHandle;
   // Test seam (#4281) for the loop-stall threshold in ms; 0 = off. Defaults
@@ -242,6 +246,8 @@ export async function runServe(
     console.error(`[gbrain serve] ignoring GBRAIN_SURFACE="${resolved.invalidEnv}" (use verbs | starter | full)`);
   }
   console.error(`[gbrain serve] surface=${surface} (source: ${SURFACE_SOURCE_LABEL[resolved.source]})`);
+  // #6383: the pool stall line (Postgres only; the watch reports nothing for an engine without pool numbers).
+  if (engine.kind === 'postgres') new PoolStallWatch(engine, (line) => console.error(line)).start();
   // #4768: stdio read-only access ceiling. HTTP refuses it: per-token grants
   // (auth rescope-token --operations / rescope-client) are its operation control.
   const access = parseAccessFlag(args);
@@ -272,7 +278,9 @@ export async function runServe(
     const port = portIdx >= 0 ? parseInt(args[portIdx + 1]) || 3131 : 3131;
 
     const ttlIdx = args.indexOf('--token-ttl');
-    const tokenTtl = ttlIdx >= 0 ? parseInt(args[ttlIdx + 1]) || 3600 : 3600;
+    // auth.ts reaches the whole operations graph; only --http needs it.
+    const { parseTokenTtl } = await import('./auth.ts');
+    const tokenTtl = ttlIdx >= 0 ? parseTokenTtl(args[ttlIdx + 1] ?? '', 'Omit the flag for the 3600-second default.') : 3600;
 
     // #1353: --enable-dcr-insecure opts into the consent-bypassing
     // client_credentials grant on the DCR path. It implies --enable-dcr (you
@@ -338,10 +346,17 @@ export async function runServe(
       }
     }
 
+    // X8 (D18): the HTTP serve's corpus drain — a stdio serve sweeps on idle,
+    // `--http` never did, so refused harvests and session-end corpus files
+    // waited for a hand-run sweep and then for retention GC.
+    const { armCorpusDrain } = await import('../core/sweep.ts');
+    const corpusDrain = (opts.armCorpusDrain ?? armCorpusDrain)(engine, { sourceId: process.env.GBRAIN_SOURCE || undefined });
+
     try {
       await runHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken, printAdminToken, surface, adoptServer: opts.adoptServer });
     } finally {
       stallWatchdog?.dispose();
+      corpusDrain?.cancel();
     }
 
     await finishHttpServe(engine, opts);
@@ -560,6 +575,18 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
   });
 }
 
+/**
+ * #6317 (B4): the facts drain plus the movement watch (one `[gbrain notice]`
+ * when a managed source's sync data stops moving; reader in
+ * persistence/sync-movement.ts), stopped together at shutdown.
+ */
+function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
+  const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
+  // The watch keeps its own unref'd timer: the injected lifecycle timers are the parent watchdog's and the idle sweep's, which tests count.
+  const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log });
+  return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
+}
+
 function installStdioLifecycle(
   engine: BrainEngine,
   args: string[],
@@ -580,7 +607,7 @@ function installStdioLifecycle(
   let parentWatchdog: unknown = null;
   let idleSweepTimer: unknown = null;
   let activateIdleActivityTracking = (): void => {};
-  let factsDrain: FactsDrainScheduler | null = null;
+  let factsDrain: { stop(): Promise<void> } | null = null;
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -841,8 +868,8 @@ function installStdioLifecycle(
     (idleSweepTimer as { unref?: () => void } | null)?.unref?.();
   }
 
-  // Automatic facts drain (Lane D): see installFactsDrain.
-  factsDrain = installFactsDrain(engine, opts, deps, () => shuttingDown);
+  // Automatic facts drain (Lane D) and the #6317 movement watch: see installResidentTickers.
+  factsDrain = installResidentTickers(engine, opts, deps, () => shuttingDown);
 
   // Optional idle-timeout safety net. Default OFF; opt-in via
   // `--stdio-idle-timeout <seconds>`. The flag is for the rare case where

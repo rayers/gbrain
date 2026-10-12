@@ -4,7 +4,7 @@
 <!-- Regenerate: bun run scripts/generate-tool-catalog.ts -->
 <!-- Freshness-guarded by scripts/check-tool-catalog-fresh.sh (bun run verify). -->
 
-Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **Starter** marks membership in the ~40-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
+Every non-localOnly operation on the MCP surface: 149 tools across 25 areas. **Starter** marks membership in the ~40-op `starter` surface (`src/mcp/surface.ts`); **Gate** names the config key that must be true before remote callers see/call the op (`gbrain config set <key> true`). What a given token actually sees is further filtered per request by scope, bound-client fence, publish gates, and the per-client surface — see `docs/operations/mcp-surface-runbook.md`. Area names are non-contractual groupings.
 
 ## admin
 
@@ -15,7 +15,7 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 | `get_status_snapshot` | Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle + queue depths + worker liveness. | admin |  |  |
 | `get_usage` | Aggregate chat usage + cost from the chat_usage_log ledger (per-model and per-phase token counts, cache reads/writes, USD estimates) with explicit coverage fields. | admin |  |  |
 | `get_write_attribution` | Admin read: who created and who last changed a page, or one of its facts, takes or timeline entries. | admin |  |  |
-| `mute_notice` | Stop a coaching or info notice (or first_run_decisions) from appearing for this client; muted: false unmutes. | write | yes |  |
+| `mute_notice` | Mute a coaching or info notice (or first_run_decisions) for this client; muted: false unmutes. | write | yes |  |
 | `quarantine_list` | List quarantined (hidden) and optionally content-flagged pages by scanning page frontmatter, newest-updated first. | admin |  |  |
 | `run_doctor` | Run brain health checks and return a structured DoctorReport (thin-client doctor surface). | admin |  |  |
 | `run_onboard` | Probe brain health + optionally submit onboard remediations. | admin |  |  |
@@ -52,7 +52,7 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `request_tools` | More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client; stdio: this session). | read | yes |  |
+| `request_tools` | More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client or stdio session). | read | yes |  |
 
 ## entities
 
@@ -61,6 +61,12 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 | `entity_identity_list` | List cross-source entity identity groups and their member pages. | read |  |  |
 | `extract_entities` | Extract entity names (people, companies) from text and create/update their brain stub pages. | write |  |  |
 | `extraction_pending` | List unverified auto-extracted entity stubs awaiting owner review (the quarantine lane from extract_entities). | read |  |  |
+
+## facts
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `purge_fact` | Owner-only, trusted local CLI on the brain host (`gbrain forget <id> --purge`). | admin |  |  |
 
 ## identity
 
@@ -117,6 +123,7 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 | `list_link_sources` | Link provenances in the brain (e.g. | read | yes |  |
 | `remove_link` | Remove a link between two pages (optionally only one link_type or link_source). | write |  |  |
 | `traverse_graph` | Walk the link graph from a page. | read | yes |  |
+| `wanted_pages` | Link targets that have no page yet, most-referenced first: each was written as a link but its page does not exist, so no edge exists. | read |  |  |
 
 ## loops
 
@@ -131,6 +138,7 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
+| `confirm_memory` | Owner only: mark a fact, take or page as confirmed by the user (trust tier user_confirmed). | write |  |  |
 | `extract_facts` | Extract personal-knowledge facts (events, preferences, commitments, beliefs, ideas, and plain facts) from a conversation turn into the per-source hot memory. | write |  |  |
 | `forget_fact` | Forget a fact by recording a durable withdrawal in its source and visibility. | write |  |  |
 
@@ -138,12 +146,12 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
-| `context_pack` | MEMORY VERB (v1): budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. | read | yes |  |
-| `delta` | MEMORY VERB (v1): what changed since a time (pages, facts, thread events), zero LLM. | read | yes |  |
+| `context_pack` | MEMORY VERB (v1): core memory, budget-packed cards, open threads and hot facts for up to 8 entities, zero LLM. | read | yes |  |
+| `delta` | MEMORY VERB (v1): pages, facts, thread events changed since a cursor, zero LLM. | read | yes |  |
 | `entity` | MEMORY VERB (v1): person/company/account card, zero LLM. | read | yes |  |
 | `forget` | MEMORY VERB (v1): expire a remembered fact by its fact_id (never a page slug). | write | yes |  |
 | `recall` | MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. | read | yes |  |
-| `remember` | MEMORY VERB (v1): save one fact; provenance required. | write | yes |  |
+| `remember` | MEMORY VERB (v1): save facts with provenance. | write | yes |  |
 | `synthesize` | [EXPENSIVE / SLOW: LLM calls, costs money] MEMORY VERB (v1): answer a broad question across pages with citations. | read | yes |  |
 
 ## ontology
@@ -160,23 +168,35 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 | Tool | Description | Scope | Starter | Gate |
 |---|---|---|---|---|
 | `cancel_write_request` | Cancel your accepted write before it publishes. | write | yes |  |
-| `capture` | Quick note ("just remember this"): auto-slugged under inbox/ by date + content hash, so recapturing is idempotent. | write | yes |  |
+| `capture` | Quick note ("just remember this"): slugged under inbox/ by date + content hash, so recapturing is idempotent. | write | yes |  |
 | `delete_page` | Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). | write |  |  |
 | `edit_page` | Change part of a page: prefer this over put_page for small changes. | write | yes |  |
 | `fetch` | Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). | read |  |  |
 | `get_chunks` | Return a page's indexed content chunks (the units search ranks). | read |  |  |
-| `get_page` | Read a page by slug (fuzzy optional; renamed slugs redirect). | read | yes |  |
+| `get_page` | Read a page by slug. | read | yes |  |
 | `get_raw_data` | Retrieve raw data for a page. | read |  |  |
-| `get_versions` | Page version history. | read |  |  |
+| `get_versions` | Page version history, newest snapshot first. | read |  |  |
 | `get_write_request` | Read your write's receipt by request_id (after write_pending or a lost reply). | write | yes |  |
+| `list_page_purges` | Owner-only (`gbrain pages purges list`). | admin |  |  |
 | `list_pages` | List pages with filters. | read | yes |  |
 | `list_write_requests` | List your write receipts in one source, newest first. | write | yes |  |
-| `put_page` | Replace a complete Markdown page: content REPLACES the whole page. | write | yes |  |
+| `put_page` | Complete content REPLACES the whole page: read get_page include_content:true; send its revision as expected_revision. | write | yes |  |
 | `put_pages` | Write up to 50 complete Markdown pages (8 MB total) in one call; use instead of put_page for more than 3 pages. | write |  |  |
 | `put_raw_data` | Store a raw provider payload (API response JSON) alongside a page, keyed by source. | write |  |  |
 | `resolve_slugs` | Fuzzy-match a partial slug or title to page slugs. | read | yes |  |
 | `restore_page` | Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). | write |  |  |
 | `revert_version` | Restore a page to an earlier version from its history (a new revision; history is kept). | write |  |  |
+| `unpurge_page` | Owner-only (`gbrain pages unpurge <slug>`). | admin |  |  |
+
+## questions
+
+| Tool | Description | Scope | Starter | Gate |
+|---|---|---|---|---|
+| `questions_list` | List pinned questions with freshness, blocked reason and next action, plus fresh/stale/pending counts. | read |  |  |
+| `questions_pin` | Pin a question: gbrain keeps a cited answer current from your notes and flags sentences whose evidence changed. | write |  |  |
+| `questions_refresh` | Refresh a pinned answer now (a paid model call): re-retrieves current evidence and edits the answer, or recomputes with full or after deletions. | write |  |  |
+| `questions_status` | One pinned question: the answer with per-sentence stale flags, evidence watermark, last refresh, blocked reason, next action and verify step. | read |  |  |
+| `questions_unpin` | Unpin a question: refreshes stop and its page is archived (your notes on it are kept). | write |  |  |
 
 ## schema
 
@@ -198,9 +218,9 @@ Every non-localOnly operation on the MCP surface: 139 tools across 23 areas. **S
 |---|---|---|---|---|
 | `assemble_evidence` | Deliver whole evidence for an ordered list of search hits (each {source_id, slug, chunk_id} from a prior search/query result): the same windows, sections or pages `query` returns with return_unit, packed into token_budget. | read |  |  |
 | `cache_stats` | Semantic query-cache introspection: resolved knobs (enabled, similarity threshold, TTL) plus row counts and total hits. | admin |  |  |
-| `query` | Hybrid search plus multi-query expansion for concept or landscape questions (expansion recovers synonym-phrased matches). | read | yes |  |
+| `query` | Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonyms). | read | yes |  |
 | `rate_answer` | Rate how useful an answer's retrieved evidence was, so this brain ranks better next time (zero LLM calls). | write |  |  |
-| `search` | Cheap hybrid search (vector + keyword), no LLM expansion, top 20: for exact tokens, names, field values. | read | yes |  |
+| `search` | Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. | read | yes |  |
 | `search_by_image` | Image-as-query retrieval. | read |  |  |
 | `search_modes` | Read-only search-mode dashboard: active mode, EVERY mode-bundle knob resolved with attribution (mode default vs config override), the three frozen bundles, and a reranker_readiness verdict (whether the resolved reranker will actually run; remote callers get the verdict without the host key inventory). | read |  |  |
 | `search_stats` | Search observability over a window: cache hit rate, intent/mode mix, budget drops, rank-1 score drift, graph-signals failure counts. | admin |  |  |

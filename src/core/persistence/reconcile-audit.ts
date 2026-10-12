@@ -1,10 +1,11 @@
-import { statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError, opError, type OperationContext } from '../ops/contract.ts';
 import { isValidSourceId } from '../source-id.ts';
 import { validateSlug } from '../utils.ts';
 import { resolveSourceLocalFilePath } from '../markdown.ts';
+import { slugifyPath } from '../sync.ts';
 import { recordedPathFromFileUri, scannerSlugRootMode } from '../write-through.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { submissionAuthority } from './authority.ts';
@@ -15,12 +16,14 @@ import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import { readReconcileState } from './reconcile-state.ts';
 import { reconcileCanonical } from './reconcile-merge.ts';
 import { classifyDrift } from './reconcile-additive.ts';
+import { isDatabaseOnlyPage, slugDerivedOrigin } from './unbound-pages.ts';
 
 export interface ReconcileAuditReport extends Record<string, unknown> {
   source_id: string;
   inspected: number;
   drifted: number;
   errors: number;
+  database_only: number;
   findings: Array<{ slug: string; reason: string; suggestion: string; classification?: string;
     drift_paths?: Array<{ path: string; class: string; reason: string }>; file_modified_after_database?: boolean }>;
   classified?: Record<string, number>;
@@ -53,16 +56,26 @@ export async function auditCanonicalSource(engine: BrainEngine, sourceId: string
       { fix: readFix('Shows the canonical binding and owner host of this source.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] }) });
   }
   const root = join(binding.local_path, binding.relative_path);
-  const rows = await engine.executeRaw<{ slug: string; bytes: number }>(`SELECT slug,
+  const rows = await engine.executeRaw<{ slug: string; bytes: number; source_path: string | null; source_uri: string | null; database_only_reason: string | null }>(
+    `SELECT slug, source_path, source_uri, database_only_reason,
     octet_length(compiled_truth)+octet_length(COALESCE(timeline,''))+octet_length(frontmatter::text) AS bytes
     FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND page_kind='markdown' AND slug>$2
     ORDER BY slug LIMIT $3`, [sourceId, options.after ?? '', limit + 1]);
-  const report: ReconcileAuditReport = { source_id: sourceId, inspected: 0, drifted: 0, errors: 0, findings: [],
+  const report: ReconcileAuditReport = { source_id: sourceId, inspected: 0, drifted: 0, errors: 0, database_only: 0, findings: [],
     next_after: rows.length > limit ? rows[limit - 1].slug : null, complete: rows.length <= limit, snapshot_only: true,
-    ...(options.classify ? { classified: { structurally_additive: 0, additive_with_suggestions: 0, review_required: 0, formatting_only: 0, error: 0 } } : {}) };
+    ...(options.classify ? { classified: { structurally_additive: 0, additive_with_suggestions: 0, review_required: 0, formatting_only: 0, slug_rule_mismatch: 0, error: 0 } } : {}) };
   const mode = await scannerSlugRootMode(engine, sourceId, root);
   for (const candidate of rows.slice(0, limit)) {
     report.inspected++;
+    if (isDatabaseOnlyPage(candidate)) {
+      const origin = slugDerivedOrigin(root, candidate.slug, mode);
+      if (!origin || !existsSync(origin.path)) {
+        report.database_only++;
+        report.findings.push({ slug: candidate.slug, reason: 'database_only',
+          suggestion: 'The page is database-only (written while the source had no canonical owner) and no file exists at its slug-derived path, so there is no file to reconcile; no action is needed.' });
+        continue;
+      }
+    }
     try {
       if (Number(candidate.bytes) > 5_000_000) throw opError('invalid_params', 'The page exceeds the bounded audit size.',
         `Page ${candidate.slug} is over 5 MB in the database, so the audit skipped it; inspect it on the canonical host.`);
@@ -112,7 +125,14 @@ async function classifyFinding(engine: BrainEngine, sourceId: string, slug: stri
       : `Preview gbrain sources reconcile ${sourceId} ${slug} --brain <brain> --preview --auto-additive --out <new file>${verdict === 'additive_with_suggestions' ? ', read the inserted lines, then add --accept-suggested' : ''}; apply it with a new request ID.`;
     return { classification: verdict, suggestion, drift_paths: classification.paths.map(({ path, class: kind, reason }) => ({ path, class: kind, reason })),
       ...(Number.isFinite(updated) ? { file_modified_after_database: statSync(state.path).mtimeMs > updated } : {}) };
-  } catch {
+  } catch (error) {
+    // #5966 (W14 P1.7): a legacy render of a slug the path cannot derive, with no slug stamp; the frontmatter repair is the fix.
+    const slugRule = error instanceof OperationError && (error.detail === 'slug_rule_mismatch' || (error.code === 'invalid_params' && slugifyPath(slug + '.md') !== slug));
+    if (slugRule) {
+      counts.slug_rule_mismatch++;
+      return { classification: 'slug_rule_mismatch',
+        suggestion: `The canonical file carries no slug stamp, so its path derives ${slugifyPath(slug + '.md')} instead of ${slug}. Preview gbrain repair frontmatter --source ${sourceId} (a safe repair stamps slug: ${slug}), apply it, then audit again.` };
+    }
     counts.error++;
     return { classification: 'error' };
   }

@@ -14,6 +14,7 @@ import { redactSourceConfig } from '../source-config-redact.ts';
 import { discoverGitRoot } from '../sync-git.ts';
 import { isInsideGitRepo, hasTrackedContent } from '../git-remote.ts';
 import { containsPath, getWorktreeBinding, humanManifestProgress, type WorktreeBinding, type WorktreeManifest, worktreeManifest } from './ownership.ts';
+import { manifestDifferences, storedManifestScope, type WorktreeManifestScope } from './worktree-manifest.ts';
 import { localHostId } from './identity.ts';
 import { advanceTopology, lockTopologyPrincipal, lockTopologyRows, settleTopologyRequests, topologyCanonicalStamp, topologyPrincipal, withTopologyLocks } from './topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange, topologyReceipt } from './topology-receipts.ts';
@@ -24,6 +25,7 @@ import { managedFilesystemDatastorePath, refreshManagedFilesystemRoots } from '.
 import { canonicalFilesystemPath, nativeFilesystemPath } from './root-registry.ts';
 import { flushTopologyDirectory } from './topology-filesystem.ts';
 import { claimPhysicalRoot } from './physical-root.ts';
+import { inspectRelocatedPhysicalRoot, relocatePhysicalRoot } from './physical-root-record.ts';
 import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
 
@@ -144,7 +146,16 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   if(input.expectedIncarnation&&input.expectedIncarnation!==before?.incarnation) throw opError('source_changed','The source was replaced.',
     `Source '${input.sourceId}' was removed and re-added after expected_incarnation was read, so nothing was changed. Read its current incarnation with the command in fix and confirm the ${input.operation} still applies before running it again.`,
     {fix:ownerStatusFix(input.sourceId)});
-  if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null};
+  // #5200 (W14 P1.4): only an operation that compares or records checkout bytes hashes the manifest (add at an existing
+  // root, claim, rebind, restore; reclone hashes in topology-clone.ts). Retiring a source (archive, remove, purge) compares
+  // nothing, so when every binding already carries a verified digest it skips the walk and refreshes the stored manifest's
+  // canonical_stamp in place; a symlink that appeared in the checkout after the claim no longer refuses a retire its dry
+  // run said would succeed. A binding claimed before activation has no digest yet, and the retire records that first
+  // manifest (clone recovery needs it), so its dry run says so.
+  const retire=['archive','remove','purge'].includes(input.operation);
+  const manifestRequired=!retire||(await engine.executeRaw<{digest:string|null}>(
+    `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
+  if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     // Hash canonical bytes while holding native exclusion, without a database
     // connection checked out. The final transaction rejects new pending mirrors.
@@ -154,12 +165,18 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       if(!existsSync(path)) {
         if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
         // #5219: retiring may skip a vanished checkout; the transaction proves the source is empty and its sole member.
-        if(['archive','remove','purge'].includes(input.operation)&&!root){missingCheckout=path;continue;}
+        if(retire&&!root){missingCheckout=path;continue;}
         throw missingCheckoutError(input.sourceId,path);
       }
+      if(!manifestRequired)continue;
       const manifest=worktreeManifest(path,{progress:humanManifestProgress()});
       manifests.set(path,manifest);
     }
+    // #6099: a rebind compares the new directory in the scope of the current checkout's manifest (Git-tracked files for a Git checkout).
+    const currentRoot=bindings.find(binding=>binding.source_id===input.sourceId)?.local_path;
+    if(input.operation==='rebind'&&root&&currentRoot&&currentRoot!==root.worktree&&manifests.has(currentRoot)&&manifests.has(root.worktree)
+      &&storedManifestScope(manifests.get(currentRoot))!==storedManifestScope(manifests.get(root.worktree)))
+      manifests.set(root.worktree,worktreeManifest(root.worktree,{progress:humanManifestProgress(),scope:storedManifestScope(manifests.get(currentRoot))}));
     return topologyTransaction(engine,async tx=>{
     await assertWriterAdminState(tx,input.expectedAdminState);
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
@@ -197,7 +214,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         `Claim '${input.sourceId}' at the local_path the command in fix reports, or move it to the new directory with gbrain sources set-path ${input.sourceId}; nothing was claimed.`,{fix:sourcesListFix()});
     const expired=input.expiredOnly?await tx.executeRaw(`SELECT id FROM sources WHERE id=$1 AND ${EXPIRED_ARCHIVE_SQL}`,[input.sourceId]):null;
     const noop=expired?.length===0 || input.operation==='archive'&&source?.archived || input.operation==='restore'&&!source?.archived
-      || input.operation==='claim'&&!!currentBinding || input.operation==='rebind'&&sameBinding;
+      || ['claim','rebind'].includes(input.operation)&&sameBinding&&!!source?.local_path&&nativeFilesystemPath(source.local_path)===nativeFilesystemPath(root!.source);
     if(noop){
       await lockTopologyPrincipal(tx,principal);
       return topologyReceipt(await recordTopologyChange(tx,{principal,requestId,intent,operation:input.operation,sourceId:input.sourceId,incarnation:source!.incarnation,worktrees},
@@ -206,6 +223,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     const invalidated=await settleTopologyRequests(tx,sources,worktrees,principal);
     // All pending mirrors must settle before these manifests are read. A pure
     // path rebind may never substitute stale or incomplete canonical bytes.
+    let relocated:ReturnType<typeof inspectRelocatedPhysicalRoot>|undefined;
     if(input.operation==='rebind'){
       const binding=bindings.find(value=>value.source_id===input.sourceId);
       if(!binding&&source?.local_path===null)throw new OperationError('writer_registration_required','This source has no canonical filesystem binding.',
@@ -213,9 +231,10 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       if(!binding?.local_path || !existsSync(binding.local_path)) throw opError('recovery_required','The original checkout is unavailable; recover its last verified manifest before rebinding.',
         `Nothing was rebound. Restore the original checkout of '${input.sourceId}' at the path the command in fix reports, with its last verified contents, then rerun set-path.`,
         {fix:ownerStatusFix(input.sourceId)});
-      if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw opError('writer_manifest_mismatch','The new checkout differs from the current canonical manifest, including deletions.',
-        `Nothing was rebound. Make the new directory an exact copy of the current checkout of '${input.sourceId}' (same files, nothing extra or missing), then rerun set-path.`,
-        {fix:ownerStatusFix(input.sourceId)});
+      if(manifests.get(binding.local_path)!.digest!==manifests.get(root!.worktree)!.digest) throw rebindManifestMismatch(input.sourceId,binding.local_path,root!.worktree,
+        storedManifestScope(manifests.get(binding.local_path)));
+      if(binding.local_path!==root!.worktree&&realpathSync(binding.local_path)===root!.worktree)
+        relocated=inspectRelocatedPhysicalRoot(binding.local_path,root!.worktree,{worktreeId:binding.worktree_id,coordinationPath:binding.coordination_path});
     }
     const ownedSourcePath=currentBinding?.local_path?join(currentBinding.local_path,currentBinding.relative_path):source?.local_path;
     if(input.operation==='restore'&&ownedSourcePath&&!existsSync(ownedSourcePath)) throw opError('recovery_required','Restore requires the verified canonical checkout. Reclone it before restoring the source.',
@@ -237,7 +256,16 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         archive_expires_at=COALESCE(archive_expires_at,now()+interval '72 hours'),config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:false})]);
       else if(input.operation==='restore') await tx.executeRaw(`UPDATE sources SET archived=false,archived_at=NULL,archive_expires_at=NULL,
         config=$2::text::jsonb WHERE id=$1`,[input.sourceId,JSON.stringify({...source?.config,federated:input.refederate!==false})]);
-      else if(input.operation==='rebind'){
+      else if(input.operation==='rebind'&&relocated){
+        // #5914 (P1.3c): the recorded root now resolves through a symlink to the new directory; the worktree keeps its id
+        // and its ownership records move to the real path (reservation under the new sha256(root) name, stamp naming it).
+        const moved=relocatePhysicalRoot(currentBinding!.local_path!,root!.worktree,relocated);
+        await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[input.sourceId,root!.source]);
+        await tx.executeRaw('UPDATE persistence_host_bindings SET local_path=$3 WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[currentBinding!.worktree_id,localHostId(),moved.root]);
+        const rel=relative(nativeFilesystemPath(moved.root),nativeFilesystemPath(root!.source)).split(sep).join('/');
+        await tx.executeRaw('UPDATE persistence_source_bindings SET relative_path=$2 WHERE source_id=$1',[input.sourceId,rel]);
+        manifests.set(moved.root,manifests.get(root!.worktree)!);
+      }else if(input.operation==='rebind'){
         await tx.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[input.sourceId,root!.source]);
         const id=await installTopologyBinding(tx,input.sourceId,incarnation,root!,bindings);if(!worktrees.includes(id))worktrees.push(id);
       }else{
@@ -254,6 +282,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       for(const id of worktrees){
         const [host]=await tx.executeRaw<{local_path:string}>('SELECT local_path FROM persistence_host_bindings WHERE worktree_id=$1::uuid AND host_id=$2::uuid',[id,localHostId()]);
         if(host&&manifests.has(host.local_path)) await tx.executeRaw('UPDATE persistence_worktrees SET manifest=$2::text::jsonb WHERE id=$1::uuid',[id,JSON.stringify({...manifests.get(host.local_path),canonical_stamp:await topologyCanonicalStamp(tx,id)})]);
+        else if(!manifestRequired&&host) await tx.executeRaw(`UPDATE persistence_worktrees SET manifest=COALESCE(manifest,'{}'::jsonb)||jsonb_build_object('canonical_stamp',$2::text) WHERE id=$1::uuid`,[id,await topologyCanonicalStamp(tx,id)]);
       }
       // This durable registry intentionally retains old checkout paths, so
       // stale installations cannot write after a source moved or disappeared.
@@ -267,5 +296,17 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     const row=await recordTopologyChange(tx,{principal,requestId,intent,operation:input.operation,sourceId:input.sourceId,incarnation:source?.incarnation??String(result.source_incarnation),worktrees},result);
     return topologyReceipt(row);
     });
-  },root?.worktree);
+  },root?.worktree,5000,{relocation:input.operation==='rebind'});
+}
+
+/** #6099: a rebind's new directory does not match the current checkout; names the first differing paths (Git-tracked paths in git scope). */
+function rebindManifestMismatch(sourceId:string,current:string,candidate:string,scope:WorktreeManifestScope):OperationError{
+  const diff=manifestDifferences(current,candidate,scope);
+  const named=diff.total?` ${diff.total} file(s) differ, are missing or are extra${scope==='git'?' among the tracked Git files':''}: ${diff.paths.join(', ')}${diff.total>diff.paths.length?', …':''}.`:'';
+  return opError('writer_manifest_mismatch','The new checkout differs from the current canonical manifest, including deletions.',
+    scope==='git'
+      ?`Nothing was rebound.${named} The comparison covers files Git tracks, so ignored files (such as .env files) never need copying. Make ${candidate} a clean clone of the current checkout `
+        +`(for example move it aside, then git clone ${current} ${candidate}), then rerun gbrain sources set-path ${sourceId} ${candidate}.`
+      :`Nothing was rebound.${named} Make the new directory an exact copy of the current checkout of '${sourceId}' (same files, nothing extra or missing), then rerun set-path.`,
+    {fix:ownerStatusFix(sourceId)});
 }

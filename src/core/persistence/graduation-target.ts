@@ -109,7 +109,7 @@ const SEED_ROW_LIMITS: Readonly<Record<string, number>> = {
   op_checkpoints: 1, page_generation_clock: 1, persistence_brain: 1, shared_skill_state: 1, sources: 1,
 };
 /** Each engine's own schema writes these; they never count against emptiness. */
-const SCHEMA_OWNED_TABLES = new Set(['config', 'file_migration_ledger', 'persistence_graduation']);
+const SCHEMA_OWNED_TABLES = new Set(['config', 'file_migration_ledger', 'persistence_graduation', 'trust_policy_state']);
 
 /**
  * A target counts as empty when it has no public tables, or a gbrain schema whose
@@ -284,7 +284,7 @@ export function targetProbeBlockers(probe: TargetProbe, routes: Pick<TargetRoute
 
 /** What a DBA runs once on a target whose gbrain role is not a superuser (the v35 objects, owned by that role). */
 function AUTO_RLS_DBA_SQL(role: string): string {
-  return `CREATE OR REPLACE FUNCTION public.auto_enable_rls() RETURNS event_trigger LANGUAGE plpgsql AS $f$ DECLARE obj record; BEGIN FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands() WHERE object_type = 'table' AND schema_name = 'public' LOOP EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', obj.object_identity); END LOOP; END; $f$; `
+  return `CREATE OR REPLACE FUNCTION public.auto_enable_rls() RETURNS event_trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $f$ DECLARE obj record; BEGIN FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands() WHERE object_type = 'table' AND schema_name = 'public' LOOP EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', obj.object_identity); END LOOP; END; $f$; `
     + `ALTER FUNCTION public.auto_enable_rls() OWNER TO ${role}; `
     + `CREATE EVENT TRIGGER auto_rls_on_create_table ON ddl_command_end WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO') EXECUTE FUNCTION public.auto_enable_rls();`;
 }

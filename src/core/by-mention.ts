@@ -26,7 +26,8 @@
  *  - Ignore-list applied at gazetteer-build time, not match time. Built-in
  *    ambiguous tokens (Apple, Amazon, Square, Stripe, Box) are dropped from
  *    the gazetteer only when no corresponding entity page exists: a page the
- *    user created is trusted. `mentions.ignore` names are dropped always.
+ *    user created is trusted. `mentions.ignore` names are dropped always;
+ *    pages listed in `mentions.exclude_slugs` get no entry at all (#5829).
  */
 
 import { createHash } from 'crypto';
@@ -37,7 +38,9 @@ import { stripCodeBlocks, isCrossSourceLinksEnabled } from './link-extraction.ts
 // #4222: shared generic-token reject list — same list gates enrichEntity
 // minting and drives the junk_entity_hubs doctor check.
 import { isGenericEntityToken } from './entity-name-quality.ts';
-import { ALWAYS_LINKABLE_TYPES, linkableTypesFor, loadSourcePack, readMentionPolicy, type MentionPolicy } from './mentions/policy.ts';
+import { ALWAYS_LINKABLE_TYPES, linkableTypesFor, loadSourcePack, readMentionPolicy, type MentionPolicy, type PackTypes } from './mentions/policy.ts';
+import { siblingVerdict, type SiblingCandidate } from './mentions/siblings.ts';
+import { isShortCode } from './mentions/short-codes.ts';
 
 /**
  * The four types that are always linkable, whatever the schema pack says. The
@@ -87,6 +90,18 @@ export interface GazetteerEntry {
   caseTokens?: string[];
   /** Spelling being matched (the alias, not the display title, for aliases). */
   matchText?: string;
+  /**
+   * Set on a name two or three identity siblings claim (mentions/siblings.ts):
+   * a match links to every sibling with the same tokens instead of one.
+   */
+  shared?: true;
+  /**
+   * #6158: the page is a connector's own contact rendering (`google_contact_id`
+   * frontmatter), a near-empty stub of a person who may have a canonical page
+   * elsewhere. Under the cross-source opt-in a mention in the stub's source
+   * binds to that canonical twin instead (see findMentionedEntities).
+   */
+  connector_stub?: true;
 }
 
 /**
@@ -110,7 +125,7 @@ export function hashGazetteer(gazetteer: Gazetteer): string {
     for (const e of bucket) entries.push(`${e.source_id}\0${e.slug}\0${e.title}\0${e.tokens.join(' ')}\0${e.matchText ?? ''}${e.caseTokens ? `\0${e.caseTokens.join(' ')}` : ''}`);
   }
   // Matching semantics are part of the resume identity, not just DB contents.
-  return createHash('sha256').update('hangul-boundaries-v1\n').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
+  return createHash('sha256').update('shared-sibling-names-v3\n').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
 }
 
 /** One row of the saved entry set the mention pass diffs (mention_gazetteer_entries). */
@@ -152,16 +167,11 @@ export interface DroppedName {
   slug: string;
   name: string;
   origin: GazetteerOrigin;
-  reason: 'below_min_length' | 'generic_token' | 'alias_collision' | 'ambiguous_first_word' | 'ignored' | 'title_wins';
+  reason: 'below_min_length' | 'generic_token' | 'alias_collision' | 'ambiguous_first_word' | 'ignored' | 'excluded_slug' | 'title_wins';
 }
 
 export interface BuildGazetteerOpts {
-  /**
-   * Optional user-supplied additional ignore-list entries (case-sensitive
-   * raw title match). Merged with DEFAULT_IGNORE_LIST.
-   */
-  extraIgnore?: string[];
-  /** Mention policy (types, `mentions.ignore`); read from config when absent. */
+  /** Mention policy (types, `mentions.ignore`, `mentions.exclude_slugs`); read from config when absent. */
   policy?: MentionPolicy;
   /**
    * Authoritative build for the mention pass: a pack that fails to resolve or
@@ -462,7 +472,8 @@ export function tokenizeTitle(title: string): string[] {
  * name in the source is dropped (an ambiguous first word never links alone).
  * Ignore-list applied per CK12: built-in ambiguous tokens dropped unless
  * the user has explicitly created the corresponding page; `mentions.ignore`
- * names always drop.
+ * names always drop; a page in `mentions.exclude_slugs` contributes neither
+ * its title nor its aliases.
  *
  * Returned gazetteer is keyed by lowercase first token; entries with the
  * same first token co-exist in the same bucket (e.g. "Acme" + "Acme Corp").
@@ -476,28 +487,27 @@ export async function buildGazetteer(
   const drop = (d: DroppedName) => { dropped?.push(d); };
   const sources = await engine.executeRaw<{ id: string }>('SELECT DISTINCT source_id AS id FROM pages WHERE deleted_at IS NULL', []);
   const typesBySource = new Map<string, Set<string>>();
+  const packBySource = new Map<string, PackTypes | null>();
   for (const { id } of sources) {
     const pack = await loadSourcePack(engine, id, { strict: opts.strict });
+    packBySource.set(id, pack);
     typesBySource.set(id, new Set(linkableTypesFor(pack, policy)));
   }
   const allTypes = [...new Set([...typesBySource.values()].flatMap(set => [...set]))];
   const linkable = (sourceId: string | null, type: string | null) => !!type && (typesBySource.get(sourceId ?? 'default')?.has(type) ?? false);
-  const rows = (await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null; type: string | null }>(
-    `SELECT slug, source_id, title, type
+  const rows = (await engine.executeRaw<{ slug: string; source_id: string | null; title: string | null; type: string | null; connector_stub: boolean }>(
+    `SELECT slug, source_id, title, type, (frontmatter ->> 'google_contact_id') IS NOT NULL AS connector_stub
      FROM pages
      WHERE type = ANY($1::text[])
        AND deleted_at IS NULL`,
     [allTypes],
   )).filter(r => linkable(r.source_id, r.type));
+  const stubPages = new Set(rows.filter(r => r.connector_stub).map(r => `${r.source_id ?? 'default'}\0${r.slug}`));
+  const stubFlag = (src: string, slug: string) => stubPages.has(`${src}\0${slug}`) ? { connector_stub: true as const } : {};
 
-  // Pre-build the existing-title Set so the ignore-list rule can check
-  // "does this name already correspond to a real page?" in O(1).
-  const existingTitles = new Set<string>();
-  for (const r of rows) {
-    if (r.title) existingTitles.add(r.title);
-  }
-  const ignoreSet = new Set<string>([...DEFAULT_IGNORE_LIST, ...(opts.extraIgnore ?? [])]);
+  const ignoreSet = new Set<string>(DEFAULT_IGNORE_LIST);
   const userIgnore = new Set(policy.ignore.map(n => tokenizeTitle(n).join(' ')).filter(Boolean));
+  const excludedSlugs = new Set(policy.excludeSlugs);
 
   const gazetteer: Gazetteer = new Map();
   const add = (entry: GazetteerEntry) => {
@@ -519,15 +529,14 @@ export async function buildGazetteer(
     if (!row.title) continue;
     const src = row.source_id ?? 'default';
     const base = { source_id: src, slug: row.slug, name: row.title, origin: 'title' as const };
+    if (excludedSlugs.has(row.slug)) { drop({ ...base, reason: 'excluded_slug' }); continue; }
     if (!hasCJK(row.title) && row.title.length < MIN_NAME_LENGTH) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (hasCJK(row.title) && cjkCharCount(row.title) < MIN_CJK_NAME_LENGTH) { drop({ ...base, reason: 'below_min_length' }); continue; }
-    // NOTE (v0.46.15, deliberately preserved): for TITLES this condition is
-    // intentionally vacuous — every row here IS a real page, so an
-    // ignore-listed name the user explicitly created a page for is always
-    // allowed (documented CK12 policy). The ignore list bites only via
-    // opts.extraIgnore names that have no page, and — with real teeth — on
-    // the ALIAS entries below, which are not user-created pages.
-    if (ignoreSet.has(row.title) && !existingTitles.has(row.title)) { drop({ ...base, reason: 'ignored' }); continue; }
+    // CK12 policy: an ignore-listed name the user explicitly created a page
+    // for is always allowed, so DEFAULT_IGNORE_LIST never drops a TITLE
+    // (every row here is a real page); it bites on the ALIAS entries below,
+    // which are not user-created pages. `mentions.ignore` and
+    // `mentions.exclude_slugs` are the operator's levers for titles.
 
     const tokens = tokenizeTitle(row.title);
     if (tokens.length === 0) continue;
@@ -544,7 +553,7 @@ export async function buildGazetteer(
     // below.
     if (tokens.length === 1 && row.type === 'person' && isGenericEntityToken(tokens[0]!)) { drop({ ...base, reason: 'generic_token' }); continue; }
     noteFirstWord(src, tokens);
-    add({ slug: row.slug, source_id: src, title: row.title, tokens, origin: 'title', matchText: row.title });
+    add({ slug: row.slug, source_id: src, title: row.title, tokens, origin: 'title', matchText: row.title, ...stubFlag(src, row.slug) });
   }
 
   // ── Alias entries ────────────────────────────────────────────────────────
@@ -566,10 +575,10 @@ export async function buildGazetteer(
   //   - a case-sensitive row (a single-token declared alias) matches only
   //     the original-case text
   let aliasRows: Array<{ alias_norm: string; slug: string; source_id: string | null; title: string | null; type: string | null;
-    origin: string | null; case_sensitive: boolean | null; alias_text: string | null }> = [];
+    origin: string | null; case_sensitive: boolean | null; alias_text: string | null; identity: unknown }> = [];
   try {
     aliasRows = (await engine.executeRaw<typeof aliasRows[number]>(
-      `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title, p.type, pa.origin, pa.case_sensitive, pa.alias_text
+      `SELECT pa.alias_norm, pa.slug, pa.source_id, p.title, p.type, pa.origin, pa.case_sensitive, pa.alias_text, p.frontmatter->>'identity' AS identity
        FROM page_aliases pa
        JOIN pages p ON p.slug = pa.slug AND p.source_id = pa.source_id
        WHERE p.type = ANY($1::text[])
@@ -603,13 +612,19 @@ export async function buildGazetteer(
     const prev = bestPerPage.get(k);
     if (!prev || rank(a.origin) < rank(prev.origin)) bestPerPage.set(k, a);
   }
-  const claims = new Map<string, { rank: number; slugs: Set<string> }>();
+  const claims = new Map<string, { rank: number; slugs: Set<string>; pages: SiblingCandidate[]; shared?: boolean }>();
   for (const a of bestPerPage.values()) {
     const k = `${a.source_id ?? 'default'} ${a.alias_norm}`;
     const r = rank(a.origin);
     const c = claims.get(k);
-    if (!c || r < c.rank) claims.set(k, { rank: r, slugs: new Set([a.slug]) });
-    else if (r === c.rank) c.slugs.add(a.slug);
+    const page = { slug: a.slug, title: a.title, type: a.type, identity: a.identity };
+    if (!c || r < c.rank) claims.set(k, { rank: r, slugs: new Set([a.slug]), pages: [page] });
+    else if (r === c.rank && !c.slugs.has(a.slug)) { c.slugs.add(a.slug); c.pages.push(page); }
+  }
+  // A name identity siblings share (the subject of "Account sheet: X" and
+  // "CRM record: X", or a code both declare) links to every sibling.
+  for (const [k, c] of claims) {
+    if (c.slugs.size > 1) c.shared = siblingVerdict(c.pages, packBySource.get(k.slice(0, k.indexOf(' '))) ?? null, policy) === 'group';
   }
   const aliasEntries: Array<{ entry: GazetteerEntry; base: Omit<DroppedName, 'reason'> }> = [];
   for (const a of bestPerPage.values()) {
@@ -621,19 +636,23 @@ export async function buildGazetteer(
     const base = { source_id: src, slug: a.slug, name: written, origin };
     const claim = claims.get(`${src} ${alias}`)!;
     if (rank(a.origin) > claim.rank) continue;
-    if (claim.slugs.size > 1) { drop({ ...base, reason: 'alias_collision' }); continue; }
-    if (alias.length < MIN_NAME_LENGTH && !hasCJK(alias)) { drop({ ...base, reason: 'below_min_length' }); continue; }
+    if (excludedSlugs.has(a.slug)) { drop({ ...base, reason: 'excluded_slug' }); continue; }
+    if (claim.slugs.size > 1 && !claim.shared) { drop({ ...base, reason: 'alias_collision' }); continue; }
+    // A declared 2-3 character code passed the own-page cue gate at derivation; it links only as written.
+    const shortCode = a.origin === 'declared' && !!a.case_sensitive && !!a.alias_text && isShortCode(a.alias_text);
+    if (alias.length < MIN_NAME_LENGTH && !hasCJK(alias) && !shortCode) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (hasCJK(alias) && cjkCharCount(alias) < MIN_CJK_NAME_LENGTH) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (ignoreLc.has(alias.toLowerCase())) { drop({ ...base, reason: 'ignored' }); continue; }
     if (titleBySource.has(`${src} ${alias.toLowerCase()}`)) { drop({ ...base, reason: 'title_wins' }); continue; }
     const tokens = tokenizeTitle(alias);
     if (tokens.length === 0) continue;
-    if (tokens[0]!.length < MIN_NAME_LENGTH && tokens.length === 1) { drop({ ...base, reason: 'below_min_length' }); continue; }
+    if (tokens[0]!.length < MIN_NAME_LENGTH && tokens.length === 1 && !shortCode) { drop({ ...base, reason: 'below_min_length' }); continue; }
     if (userIgnore.has(tokens.join(' '))) { drop({ ...base, reason: 'ignored' }); continue; }
     if (tokens.length === 1 && isGenericEntityToken(tokens[0]!)) { drop({ ...base, reason: 'generic_token' }); continue; }
     const caseTokens = a.case_sensitive && a.alias_text ? caseTokensOf(a.alias_text) : undefined;
     const entry: GazetteerEntry = { slug: a.slug, source_id: src, title: a.title, tokens, origin, matchText: alias,
-      ...(caseTokens && caseTokens.length === tokens.length ? { caseTokens } : {}) };
+      ...(caseTokens && caseTokens.length === tokens.length ? { caseTokens } : {}), ...(claim.shared ? { shared: true as const } : {}),
+      ...stubFlag(src, a.slug) };
     noteFirstWord(src, tokens);
     aliasEntries.push({ entry, base });
   }
@@ -666,10 +685,23 @@ function caseTokensOf(name: string): string[] {
 // Body-text scanner (pure)
 // ============================================================
 
+/** Suffixes that may attach to a Hangul name: an optional title or honorific,
+ * then up to two particles or copula forms (지원씨는, 지원에게서, 지원이었다).
+ * Any other attached Hangul continues a longer word (지원하는, 지원금), which
+ * was 99% of 1,041 word-internal matches on a Korean corpus while this suffix
+ * set kept 65 of 74 real name mentions (docs/designs/hangul-mention-boundaries.md).
+ */
+const HANGUL_NAME_TITLES = '씨 님 오빠 언니 누나 선배 후배 선생님 선생 교수 대표 사장 회장 팀장 부장 과장 이사 의원 기자 작가 감독 측';
+const HANGUL_NAME_PARTICLES = '이 가 은 는 을 를 의 에 에게 에게서 한테 한테서 께 께서 와 과 랑 이랑 도 만 로 으로 로서 으로서 로부터 으로부터 에서 부터 까지 처럼 보다 마저 조차 뿐 밖에 이나 이든 이라도 라도 이여 이며 이고 이다 입니다 이에요 예요 이었다 였다 이었던 였던 이라는 라는 이라고 라고 이란 이야 야 아';
+const hangulAlternation = (words: string) => `(?:${words.split(' ').sort((a, b) => b.length - a.length).join('|')})`;
+const HANGUL_NAME_SUFFIX_RE = new RegExp(
+  `^${hangulAlternation(HANGUL_NAME_TITLES)}?${hangulAlternation(HANGUL_NAME_PARTICLES)}{0,2}(?![가-힣])`, 'u',
+);
+
 /** Korean uses word spaces; Han/Kana retain character-substring matching.
  * Validate each candidate before maximal-munch selection so an invalid longer
- * phrase does not consume a valid shorter name. Do not require an end boundary:
- * Korean particles attach directly to names (지원은, 지원에게).
+ * phrase does not consume a valid shorter name. The name must start a word and
+ * end at a non-Hangul character or an attached name suffix (above).
  */
 function hasHangulMatchBoundary(
   text: string, tokens: ScannedToken[], start: number, entry: GazetteerEntry,
@@ -678,9 +710,10 @@ function hasHangulMatchBoundary(
   const first = tokens[start]!;
   if (first.offset > 0 && /[가-힣]/u.test(text[first.offset - 1]!)) return false;
   const last = tokens[start + entry.tokens.length - 1]!;
-  const actual = text.slice(first.offset, last.offset + last.length).replace(/\s+/gu, ' ');
+  const end = last.offset + last.length;
+  const actual = text.slice(first.offset, end).replace(/\s+/gu, ' ');
   const expected = (entry.matchText ?? entry.tokens.join('')).trim().replace(/\s+/gu, ' ');
-  return actual === expected;
+  return actual === expected && HANGUL_NAME_SUFFIX_RE.test(text.slice(end, end + 12));
 }
 
 /**
@@ -775,16 +808,25 @@ export function findMentionedEntities(
     // Same-name twin in the scanning page's own source wins over a foreign
     // one: bucket order is length-only, so `matched` may be the cross-source
     // twin even when an own-source entry with identical tokens exists.
+    const sameName = (e: GazetteerEntry, want: GazetteerEntry) =>
+      e.tokens.length === want.tokens.length
+        && e.tokens.every((t, k) => t === want.tokens[k])
+        && caseMatches(e, i)
+        && hasHangulMatchBoundary(stripped, tokens, i, e);
     if (matched.source_id !== opts.fromSourceId) {
-      const want = matched.tokens;
-      const own = bucket.find(
-        e => e.source_id === opts.fromSourceId
-          && e.tokens.length === want.length
-          && e.tokens.every((t, k) => t === want[k])
-          && caseMatches(e, i)
-          && hasHangulMatchBoundary(stripped, tokens, i, e),
-      );
+      const want = matched;
+      const own = bucket.find(e => e.source_id === opts.fromSourceId && sameName(e, want));
       if (own) matched = own;
+    }
+    // #6158: under the cross-source opt-in, a connector's contact stub (own
+    // source or not) yields to the canonical same-name page in another
+    // source: the one such page, or the one that shares its slug. Several
+    // candidates and no slug match keep the stub (an honest tie).
+    if (opts.allowCrossSource && matched.connector_stub) {
+      const stub = matched;
+      const canonical = bucket.filter(e => !e.connector_stub && e.source_id !== stub.source_id && sameName(e, stub));
+      const pick = canonical.length === 1 ? canonical[0] : canonical.find(e => e.slug === stub.slug);
+      if (pick && canonical.filter(e => e.slug === pick.slug).length === 1) matched = pick;
     }
     if (ignored.size > 0 && ignored.has(matched.tokens.join(' '))) {
       i += matchedTokens;
@@ -806,13 +848,22 @@ export function findMentionedEntities(
       continue;
     }
 
-    out.push({
-      slug: matched.slug,
-      source_id: matched.source_id,
-      name: matched.title,
-      offset: head.offset,
-    });
-    seenTargets.add(target);
+    // A shared sibling name links every sibling, unless the scanning page is one of them.
+    const want = matched.tokens;
+    const group = matched.shared
+      ? bucket.filter(e => e.shared && e.source_id === matched!.source_id && e.tokens.length === want.length
+        && e.tokens.every((t, k) => t === want[k]) && caseMatches(e, i))
+      : [matched];
+    if (group.length > 1 && group.some(e => e.source_id === opts.fromSourceId && e.slug === opts.fromSlug)) {
+      i += matchedTokens;
+      continue;
+    }
+    for (const e of group) {
+      const key = `${e.source_id}\0${e.slug}`;
+      if (seenTargets.has(key)) continue;
+      out.push({ slug: e.slug, source_id: e.source_id, name: e.title, offset: head.offset });
+      seenTargets.add(key);
+    }
     i += matchedTokens;
   }
 

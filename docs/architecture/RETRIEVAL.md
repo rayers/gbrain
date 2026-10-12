@@ -91,7 +91,18 @@ written up in [`RETRIEVAL_MAXPOOL_INCIDENT.md`](../incidents/RETRIEVAL_MAXPOOL_I
   chunks fill the inner candidate pool, the engines escalate the pool in a
   bounded loop (×4 per step, at most 3 escalations). SQL candidate limits and
   offsets are independent of `ef_search`; supported pgvector versions use
-  strict iterative scans with bounded visits. A filtered short pool is not
+  `relaxed_order` iterative scans with bounded visits (`ef_search` is still
+  sized to the candidate pool; each pooled attempt may visit 20,000 index
+  tuples, so a source or visibility filter covering a tenth of the brain fills
+  its candidate window instead of stopping at the first few hundred eligible
+  chunks). Relaxed order keeps a closer candidate the
+  scan finds after farther ones, which strict order drops, so a selective
+  source or visibility filter fills more of its true neighbours; output order
+  never reaches callers because the inner `ORDER BY distance` and the pooled
+  outer sort re-sort it. `search.hnsw_iterative_scan` (`relaxed_order` |
+  `strict_order` | `off`; env `GBRAIN_HNSW_ITERATIVE_SCAN` wins) restores the
+  older mode without a release; it is latched once per process, so restart
+  serve and autopilot after changing it. A filtered short pool is not
   proof that the corpus is exhausted. Postgres may make one exact fallback
   inside the remaining eight-second arm budget; PGLite does not pretend that
   a JavaScript timeout can cancel its WASM work. Unresolved shortfalls appear
@@ -192,7 +203,7 @@ expansion (query: requested by default in every mode; --no-expand opts out;
        ▼
 hybrid recall + fusion:
    ├── vector  (HNSW on chunk embeddings, per-page max-pool)
-   ├── keyword (BM25 via tsvector)
+   ├── keyword (BM25 via tsvector; text indexed through gbrain_fts_input)
    ├── title-phrase arm
    ├── relational (typed-edge recall arm — relational queries only; 2-3
    │      relationship questions walk typed hop chains when
@@ -242,6 +253,17 @@ limit slice → token-budget enforcement (per mode bundle)
 results (+ retrieval-confidence grade in query-op meta — crag.ts)
 ```
 
+**CJK/Latin boundaries in the keyword index (#6370).** Postgres' default
+parser reads Han, Kana and Hangul as letters, so `升级PostgreSQL17后查询Redis7`
+would be one lexeme and an ASCII query for `Redis7` would miss it. Every
+indexing `to_tsvector` (both trigger functions, the page seal, the import seal
+and `reindex-search-vector`) and the title arm's `websearch_to_tsquery` read
+their text through `gbrain_fts_input()` (`src/core/fts-language.ts`), which
+inserts a space at each CJK↔ASCII-letter/digit boundary. It is a no-op on text
+without CJK, so non-CJK vectors are byte-identical. Pure-CJK queries still take
+the raw-text CJK keyword path. The `fts_cjk_boundary` migration rebuilds only
+the rows whose text holds such a boundary.
+
 Per-arm fail-open has one deliberate exception: when BOTH lexical arms
 (`searchKeyword` + `searchTitles`) come back empty because of an ACCESS-class
 failure (`isDbAccessFailure` in `src/core/pg-access-classify.ts` — the DB
@@ -288,6 +310,37 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   `crag.ts`), so default-shape callers never pay a second expansion call for
   a near-identical candidate set. `search.crag_think=true` (local callers)
   escalates a still-weak result to `think`.
+- **Entity-anchored retrieval (default off).** With `search.entity_anchoring=true`,
+  a `query` or `search` that asks for a current state ("now", "currently",
+  "latest" and similar) and names exactly one readable entity page by title
+  gets that page first, then the pages that link to it or name it, newest
+  first (`src/core/search/entity-anchor.ts`). The function is shared with
+  pinned-question refresh. Detection is deterministic, with no model call.
+  Added rows are re-authorized through `getChunkWindows`. The row count and
+  token budget stay what the caller asked for, and anchored rows take at most
+  half the rows. It is skipped with `offset`, type, date, language or symbol
+  filters. Verdict and gates: `docs/eval/decisions/entity-anchoring-query/`.
+- **Facts arm in `query` (default on).** `query` adds up to three active
+  saved facts that match the question (by the query embedding it already
+  computed, by shared terms or by a named entity) as fact rows in spare
+  capacity only: free slots under the caller's row count, and what the page
+  rows leave of the token budget. A page row is never displaced. It also marks
+  a page row `superseded_claim` when a newer fact covers its typed claim
+  (`src/core/search/facts-arm.ts`). A fact row is never page-shaped: it carries
+  `result_type: "fact"`, `fact_id` and a `follow_up` recall call, no `slug` or
+  `id`, and `page_slug` only when the caller can read the entity page. No model
+  call. In the B2 corrections suite
+  with correction-dated writes it lifted forget-then-remember from 92% to 100%
+  correct. `search.query_facts_arm=false` turns it off. Verdict and gates:
+  `docs/eval/decisions/query-facts-arm/`.
+- **Temporal fact reserve (default off).** With `search.temporal_fact_reserve=true`,
+  a `query` with a deterministic temporal cue (when, before, after, how long,
+  since, until, ordinal-time words, ISO dates, month names) and a token budget
+  (`token_budget`, or the one evidence delivery resolves) gives facts ranked by
+  the question (cosine + term share, +0.1 for a real date) up to 15% of the
+  budget and 30% of the rows. They render with their date header, oldest first
+  after the pages, in place of the facts arm. No model call. Gates:
+  `docs/eval/decisions/temporal-fact-reserve/`.
 
 ### Use-attributed feedback
 
@@ -517,11 +570,17 @@ built from (`content_chunks.embedding_input_hash`: column, model, dimensions,
 wrapping tier and wrapped text), and a rebuild keeps it only when the current
 page would produce the same input, so an unchanged contextual page keeps its
 vectors and a synopsis-mode body edit nulls every synopsis-tier chunk. Vectors
-written before that record existed are kept on non-contextual pages and nulled
-once on contextual ones. Remaining NULL vectors still need an explicitly
-authorized `gbrain embed --stale` run. A text-ready index is not a promise that
-every page has a vector. Diagnostics do not disclose private or foreign-source
-pending pages and never start repair themselves.
+written before that record existed are grandfathered on pages whose mode
+is still NULL; contextual-mode repair and reindex stamp compatible raw inputs
+when moving those pages to explicit `none`. An explicit `none` page may have
+inherited a title-wrapped vector, so a rebuild clears unstamped vectors there,
+and switching from title or synopsis to `none` clears active text vectors
+immediately. Genuine old raw vectors on explicit `none` pages may need a
+one-time re-embed; it never starts automatically. Remaining NULL vectors
+still need an explicitly authorized `gbrain embed --stale` run. A text-ready
+index is not a promise that every page has a vector. Diagnostics do not
+disclose private or foreign-source pending pages and never start repair
+themselves.
 
 Markdown chunk creation applies the strict protected-body sanitizer before
 splitting text. For remote reads, all existing chunks of every page kind are

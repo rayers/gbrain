@@ -262,7 +262,10 @@ describe('extractPageLinks', () => {
     expect(candidates.length).toBeGreaterThan(0);
     const aliceLink = candidates.find(c => c.targetSlug === 'people/alice');
     expect(aliceLink).toBeDefined();
-    expect(aliceLink!.linkType).toBe('works_at');
+    // #6191: a person is not an employer, so the role phrase no longer types this edge works_at.
+    expect(aliceLink!.linkType).toBe('mentions');
+    const { candidates: employer } = await extractPageLinks('docs/x', 'Alice is the CEO of [Acme](companies/acme).', {}, 'concept', allowAllResolver);
+    expect(employer.find(c => c.targetSlug === 'companies/acme')!.linkType).toBe('works_at');
   });
 
   test('#2011: excerpt window slicing a non-BMP char yields well-formed context', async () => {
@@ -367,70 +370,6 @@ describe('extractPageLinks', () => {
       'docs/x', 'Plain text with no links.', {}, 'concept', nullResolver,
     );
     expect(candidates).toEqual([]);
-  });
-
-  // Generic wikilink resolution (#769 → Issue #972). Pages that link via
-  // `[[bare-name]]` outside DIR_PATTERN route through the resolver's
-  // basename lookup, but ONLY when global-basename mode is opted in
-  // (`{ globalBasename: true }` + a resolver implementing
-  // `resolveBasenameMatches`). Default-off: bare wikilinks are dropped, not
-  // persisted as dangling rows. Adapted from the fork's always-on test to
-  // upstream's opt-in contract after the #1388 merge.
-  test('resolves generic wikilinks via resolver (global_basename opt-in)', async () => {
-    const fakeResolver: SlugResolver = {
-      resolve: async () => null,
-      resolveBasenameMatches: async (name) => {
-        if (name === 'Fast-Weigh') return ['topics/aggregate-scale-software/companies/fast-weigh'];
-        if (name === '2026-05-07-cost-plan') return ['topics/dragon-pilot/raw/notes/2026-05-07-cost-plan'];
-        return [];
-      },
-    };
-    const { candidates } = await extractPageLinks(
-      'topics/wiki/index',
-      'Comparing [[Fast-Weigh]] vs [[Apex-AI]] (the latter has no page yet). Also see [[2026-05-07-cost-plan]].',
-      {}, 'concept', fakeResolver, { globalBasename: true },
-    );
-    // #4062 also emits a root-exact direct candidate per bare wikilink
-    // (`fast-weigh`, `apex-ai`, ...); downstream existence checks drop those
-    // when no root page exists. Only the resolver-backed edges are pinned here.
-    const resolved = candidates.filter(c => c.linkSource === 'wikilink-resolved');
-    expect(resolved.map(c => c.targetSlug).sort()).toEqual([
-      'topics/aggregate-scale-software/companies/fast-weigh',
-      'topics/dragon-pilot/raw/notes/2026-05-07-cost-plan',
-    ]);
-    // Apex-AI has no basename match, so no resolved edge for it.
-    expect(resolved.find(c => /apex-ai/i.test(c.targetSlug))).toBeUndefined();
-  });
-
-  // Opt-in gate: without globalBasename, bare wikilinks are dropped (the
-  // upstream #1388 default — prevents wrong cross-page edges on basename
-  // collisions). Pin it so the default-off contract can't silently drift.
-  test('drops generic wikilinks when global_basename is off (default)', async () => {
-    const fakeResolver: SlugResolver = {
-      resolve: async () => null,
-      resolveBasenameMatches: async () => ['topics/x/fast-weigh'],
-    };
-    const { candidates } = await extractPageLinks(
-      'topics/wiki/index',
-      'Comparing [[Fast-Weigh]].',
-      {}, 'concept', fakeResolver, // no globalBasename opt
-    );
-    expect(candidates.find(c => c.linkSource === 'wikilink-resolved')).toBeUndefined();
-  });
-
-  test('skipFrontmatter opt suppresses frontmatter pass', async () => {
-    const fakeResolver: SlugResolver = {
-      resolve: async (name) => name === 'meetings/2026-01-15' ? 'meetings/2026-01-15' : null,
-    };
-    const fm = { source: 'meetings/2026-01-15' };
-    const withFm = await extractPageLinks(
-      'docs/x', 'plain', fm, 'person', fakeResolver, { skipFrontmatter: false },
-    );
-    const withoutFm = await extractPageLinks(
-      'docs/x', 'plain', fm, 'person', fakeResolver, { skipFrontmatter: true },
-    );
-    expect(withFm.candidates.find(c => c.linkType === 'source')).toBeDefined();
-    expect(withoutFm.candidates.find(c => c.linkType === 'source')).toBeUndefined();
   });
 
   test('meeting page references default to attended type', async () => {

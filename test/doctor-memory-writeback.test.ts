@@ -16,6 +16,7 @@ import {
   renderAmbientInstructionBlock,
 } from '../src/core/bootstrap/instructions-block.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { writeHeartbeat, type HookHeartbeatEntry } from '../src/core/context/hook-heartbeat.ts';
 
 let engine: PGLiteEngine;
 let tmp: string;
@@ -256,6 +257,86 @@ describe('memory_writeback doctor check', () => {
       expect(c.message).toContain('still installed');
       expect(c.message).toContain('bootstrap harness --yes');
       expect(Array.isArray(c.details?.lingering_instruction_blocks)).toBe(true);
+    });
+  });
+
+  // #5557: a share of failed serve-side harvests is visible, not a silent counter.
+  const harvestCases: Array<{ name: string; ok: number; errors: string[]; requeued: number; warn: string | null }> = [
+    {
+      name: 'mostly failed harvests warn with the top error reason',
+      ok: 8,
+      errors: [...Array(10).fill('operationerror:writer_lock_unavailable'), 'aitransienterror', 'aitransienterror'],
+      requeued: 3,
+      warn: '12/20 writeback harvests failed in 7d (top: operationerror:writer_lock_unavailable x10)',
+    },
+    { name: 'a small failure share stays ok', ok: 18, errors: ['operationerror:writer_lock_unavailable', 'aborterror'], requeued: 5, warn: null },
+    { name: 'exactly 20% failed stays ok', ok: 8, errors: ['operationerror:writer_lock_unavailable', 'aborterror'], requeued: 0, warn: null },
+    {
+      name: 'exactly 10 finished harvests is enough to judge',
+      ok: 7,
+      errors: ['operationerror:writer_lock_unavailable', 'operationerror:writer_lock_unavailable', 'aborterror'],
+      requeued: 0,
+      warn: '3/10 writeback harvests failed in 7d (top: operationerror:writer_lock_unavailable x2)',
+    },
+    { name: 'too few harvests to judge stays ok', ok: 1, errors: ['operationerror:writer_lock_unavailable', 'aborterror'], requeued: 0, warn: null },
+  ];
+  for (const c of harvestCases) {
+    test(`#5557 harvest failures: ${c.name}`, async () => {
+      await engine.setConfig('memory.auto_writeback', 'salient');
+      writeFileMirror(tmp, { auto_writeback: 'salient' });
+      await withEnv({ GBRAIN_HOME: tmp }, async () => {
+        const ts = new Date().toISOString();
+        const entries: HookHeartbeatEntry[] = [
+          ...Array.from({ length: c.ok }, (): HookHeartbeatEntry => ({ ts, event: 'writeback', outcome: 'ok', duration_ms: 5000, inserted: 1 })),
+          ...c.errors.map((reason): HookHeartbeatEntry => ({ ts, event: 'writeback', outcome: 'error', reason, duration_ms: 1000 })),
+          ...Array.from({ length: c.requeued }, (): HookHeartbeatEntry => ({ ts, event: 'writeback', outcome: 'degraded', reason: 'writer_busy_requeued', duration_ms: 1000 })),
+        ];
+        for (const entry of entries) await writeHeartbeat(entry, { trim: false });
+        const check = await buildMemoryWritebackCheck(engine);
+        expect(check.details?.backstop_7d).toMatchObject({ failed: c.errors.length, last_ok_at: ts });
+        if (c.warn) {
+          expect(check.status).toBe('warn');
+          expect(check.message).toContain(c.warn);
+          expect(check.message).toContain('gbrain sweep --once');
+        } else {
+          expect(check.status).toBe('ok');
+        }
+      });
+    });
+  }
+});
+
+describe('memory_writeback doctor check: capture-lane notices (#6268, #6316)', () => {
+  test('#6268 a held session file (source never resolved) → warn naming --assign-corpus preview then --apply; the default-off path reports it too', async () => {
+    const spool = join(tmp, '.gbrain', 'transcripts', 'corpus', 'sourced');
+    mkdirSync(spool, { recursive: true });
+    writeFileSync(join(spool, 'sess-held.src-_unresolved.txt'), 'USER: hi\n');
+    await withEnv({ GBRAIN_HOME: tmp }, async () => {
+      const off = await buildMemoryWritebackCheck(engine);
+      expect(off.status).toBe('warn');
+      expect(off.details?.corpus_source_holds).toEqual({ legacy_unstamped: 0, unresolved: 1, sessions: 1 });
+      expect(off.message).toContain('gbrain sweep --assign-corpus <source>');
+      expect(off.message).toContain('--apply');
+      await engine.setConfig('memory.auto_writeback', 'off');
+      writeFileMirror(tmp, { auto_writeback: 'off' });
+      expect((await buildMemoryWritebackCheck(engine)).message).not.toContain('--assign-corpus');
+    });
+  });
+
+  test('#6316 OpenClaw compactions that never banked → warn with the top skip; one banked compaction clears it', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    writeFileMirror(tmp, { auto_writeback: 'salient' });
+    await withEnv({ GBRAIN_HOME: tmp }, async () => {
+      const ts = new Date().toISOString();
+      for (let i = 0; i < 2; i++) await writeHeartbeat({ ts, event: 'openclaw-compact', outcome: 'degraded', reason: 'no_session', segment: 'skipped', duration_ms: 1 }, { trim: false });
+      const dead = await buildMemoryWritebackCheck(engine);
+      expect(dead.status).toBe('warn');
+      expect(dead.details?.openclaw_compactions_7d).toEqual({ total: 2, banked: 0, skipped: { no_session: 2 } });
+      expect(dead.message).toContain('banked none (top skip: no_session x2)');
+      await writeHeartbeat({ ts, event: 'openclaw-compact', outcome: 'ok', segment: 'banked', duration_ms: 1 }, { trim: false });
+      const live = await buildMemoryWritebackCheck(engine);
+      expect(live.message).not.toContain('banked none');
+      expect(live.details?.openclaw_compactions_7d).toMatchObject({ total: 3, banked: 1 });
     });
   });
 });

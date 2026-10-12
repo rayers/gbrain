@@ -21,7 +21,7 @@ import { readLocalWriter, withVerifiedLocalRegistration } from '../core/persiste
 import { reportPersistenceCliError } from './persistence-delegate.ts';
 
 export const RECONCILE_HELP = `Usage:
-  gbrain sources reconcile <source> <slug> --brain <id> [--preview] [--out <new-file>] [--json]
+  gbrain sources reconcile <source> <slug> --brain <id> [--preview] [--adopt-slug-path] [--out <new-file>] [--json]
   gbrain sources reconcile <source> <slug> --brain <id> --preview --from <preview-file>
     --decisions <decisions-file> --out <new-file> [--json]
   gbrain sources reconcile <source> <slug> --brain <id> --preview --auto-additive [--accept-suggested]
@@ -35,15 +35,20 @@ export const RECONCILE_HELP = `Usage:
 Preview is the default and never changes canonical content. A database-only
 page (no recorded origin, for example one written while the source was unbound)
 is previewed against the canonical file at its slug path; apply records that
-file as the page's origin. --out creates a new
+file as the page's origin. A page that records no origin and carries no
+database-only marker (an older write) is previewed against the file at its slug
+path only with --adopt-slug-path; the preview pins that file, apply records it
+as the page's origin, and the flag is refused for pages that are database-only
+by design. --out creates a new
 private file outside canonical worktrees; it never replaces an existing file.
 Resolve conflicts with JSON-Pointer decisions and inspect the resolved preview
 before applying. Apply preserves both originals and uses the current canonical
 owner without changing ownership, activation, roots, or sync checkpoints.
 The caller must already have a trusted CLI registration whose original and
 current grants permit put_page for this source and exact slug.
-get_write_request needs its own operation grant; identical apply replay is
-available without that receipt helper. Inspect the private artifact's .conflicts
+Read a pending apply's receipt with gbrain write-request --brain <id> -- <request-id>
+(MCP: get_write_request), which needs its own operation grant; identical apply
+replay is available without that receipt helper. Inspect the private artifact's .conflicts
 and .result locally before applying; stdout contains only a summary.
 Use the same request ID and arguments after a lost response or pending receipt.
 After a terminal conflict, make a new preview and use a new request ID.
@@ -55,6 +60,9 @@ timeline lines are suggested, not decided, because an added line can still
 contradict an old one; read them in the private preview, then rerun with
 --accept-suggested. Anything else (changed or removed text, policy, privacy,
 title, type, tags, fences) keeps the preview unready for a person to decide.
+Writes to one source publish one at a time on its canonical owner, so running
+many applies at once only queues them (commits coalesce); reconcile a large set
+from one client, one or two at a time.
 Audit is bounded and read-only; its cursor is not a sync checkpoint. --classify
 adds each drifted page's structural classification and counts, never values.
 Backups persist until explicitly removed. Removal deletes that private history,
@@ -73,7 +81,7 @@ export interface ReconcileCliArgs {
 export function parseReconcileArgs(args: string[]): ReconcileCliArgs {
   const flags = new Map<string, string | true>();
   const positional: string[] = [];
-  const boolean = new Set(['--preview', '--audit', '--backups', '--json', '--auto-additive', '--accept-suggested', '--classify']);
+  const boolean = new Set(['--preview', '--audit', '--backups', '--json', '--auto-additive', '--accept-suggested', '--classify', '--adopt-slug-path']);
   const values = new Set(['--brain', '--out', '--from', '--decisions', '--apply', '--request-id', '--limit', '--after', '--remove-backup']);
   for (let i = 0; i < args.length; i++) {
     const token = args[i];
@@ -87,7 +95,7 @@ export function parseReconcileArgs(args: string[]): ReconcileCliArgs {
       continue;
     }
     if (!values.has(flag)) throw opError('invalid_params', `Unknown reconciliation option: ${flag}.`,
-      'Reconciliation accepts --brain, --preview, --out, --from, --decisions, --apply, --request-id, --audit, --backups, --remove-backup, --limit, --after and --json; the help in fix shows which forms combine.',
+      'Reconciliation accepts --brain, --preview, --adopt-slug-path, --out, --from, --decisions, --apply, --request-id, --audit, --backups, --remove-backup, --limit, --after and --json; the help in fix shows which forms combine.',
       { fix: readFix('Lists every reconciliation form and its options.', { argv: ['gbrain', 'sources', 'reconcile', '--help'] }) });
     const value = equal >= 0 ? token.slice(equal + 1) : args[++i];
     if (!value || value.startsWith('-') || value.includes('\0')) throw opError('invalid_params', `${flag} requires a value.`,
@@ -128,6 +136,8 @@ export function parseReconcileArgs(args: string[]): ReconcileCliArgs {
     'Run the audit without --preview, --out, --from, --decisions, --auto-additive or --accept-suggested, then preview a page it lists in a separate command.');
   if (flags.has('--classify') && !audit) throw opError('invalid_params', '--classify is only valid with --audit.',
     'Add --audit (with --source), or drop --classify.');
+  if ((applying || backups || audit) && flags.has('--adopt-slug-path')) throw opError('invalid_params', '--adopt-slug-path only shapes a preview.',
+    'Use --adopt-slug-path with --preview; apply adopts the file the written preview pinned.');
   if ((applying || backups) && (flags.has('--auto-additive') || flags.has('--accept-suggested'))) throw opError('invalid_params', '--auto-additive and --accept-suggested only shape a preview.',
     'Use --auto-additive (and --accept-suggested) with --preview, then apply the written preview with --from.');
   if (flags.has('--accept-suggested') && !flags.has('--auto-additive')) throw opError('invalid_params', '--accept-suggested requires --auto-additive.',
@@ -151,6 +161,7 @@ export function parseReconcileArgs(args: string[]): ReconcileCliArgs {
   }
   if (applying) params.request_id = flags.get('--request-id');
   if (flags.has('--auto-additive')) params.auto_additive = true;
+  if (flags.has('--adopt-slug-path')) params.adopt_slug_path = true;
   if (flags.has('--accept-suggested')) params.accept_suggested = true;
   if (flags.has('--classify')) params.classify = true;
   if (flags.has('--limit')) {

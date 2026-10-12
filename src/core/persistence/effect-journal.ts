@@ -13,6 +13,7 @@ import { isFactsExtractionEnabled } from '../facts/extract.ts';
 import { loadConfig } from '../config.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { EXPIRED_PREPARING_CHARGE_SQL } from './claim-phase.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { pageBatchChildRequestIds } from './page-batch-id.ts';
 import { EFFECT_FAULT_POINTS, faultPoint } from './fault-points.ts';
@@ -39,8 +40,10 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
     if (!binding?.local_path) throw opError('owner_unavailable', 'Cannot record the canonical Git target without its owner binding.',
       `Worktree ${row.worktree_id} of source ${row.source_id} has no host binding for its owner, so request ${row.id} could not record its Git target. Read the request's receipt; the owner host's binding is restored by its claim or transfer.`,
       row.principal_kind === 'local_cli' ? { fix: readFix(`Reads request ${row.id}'s durable receipt, read-only.`, { argv: ['gbrain', 'write-request', '--', row.id] }) } : {});
+    const commit = prepared.file.commit;
     queue('git', { relative_path: relative(binding.local_path, prepared.file.path).split(sep).join('/'),
-      expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content) });
+      expected_hash: prepared.file.content === null ? null : sha256(prepared.file.content),
+      ...(commit ? { commit_subject: commit.subject, commit_line: commit.line, ...(commit.trailer ? { commit_trailer: commit.trailer } : {}) } : {}) });
     if (outcome.persistence && typeof outcome.persistence === 'object') Object.assign(outcome.persistence, { git_state: 'queued' });
   }
   if (snapshot && !snapshot.page.deleted_at) {
@@ -155,16 +158,18 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
   if (limit <= 0) return [];
   const rows = await engine.transactionDirect(async tx => {
     await declarePersistenceProtocol(tx);
+    // The worktree-wide conditions (owner, refresh fence, recovery blocks) are one
+    // InitPlan, so the claim walks persistence_effects_pending in order and stops at
+    // $3 rows instead of probing every ready effect of the worktree.
     return tx.executeRaw<PersistenceEffect>(`WITH ready AS (SELECT e.id FROM persistence_effects e
-      JOIN persistence_worktrees w ON w.id=e.worktree_id AND w.owner_host_id=$1::uuid
-      WHERE e.worktree_id=$2::uuid AND e.kind='git' AND e.data ? 'relative_path'
+      WHERE EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=$2::uuid AND w.owner_host_id=$1::uuid
+        AND ${refreshFenceClear('w', 'id')}
+        AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=w.id AND blocked.recovery IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=w.id AND blocked.recovery IS NOT NULL))
+      AND e.worktree_id=$2::uuid AND e.kind='git' AND e.data ? 'relative_path'
       AND NOT (e.data ? 'targets') AND NOT (e.data ? 'source_scan') AND NOT (e.data ? 'version')
       AND (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
-      AND ${refreshFenceClear('e')}
-      AND e.recovery IS NULL AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked
-        WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
-      AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked
-        WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
+      AND e.recovery IS NULL
       AND NOT EXISTS (SELECT 1 FROM persistence_effects mirror
         WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state<>'committed')
       ORDER BY e.next_attempt_at,e.id LIMIT $3 FOR UPDATE OF e SKIP LOCKED)
@@ -183,14 +188,21 @@ export async function claimCoalescedGitEffects(engine: BrainEngine, hostId: stri
  * mirror left running would otherwise also hold back writes to its pages.
  * Claims with a recovery record stay with the recovery path.
  */
-export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date): Promise<number> {
+/**
+ * `chargePreparing` (#6278, the `preparation_deadlines` switch): a request whose
+ * dead owner stamped the reclaimed claim `preparing` is charged one preparation
+ * attempt, the same rule as the Postgres expired-claim sweep (consumer.ts), so a
+ * kill loop reaches `persistence.max_preparation_attempts`.
+ */
+export async function releaseAbandonedClaims(engine: BrainEngine, processStartedAt: Date, chargePreparing = false): Promise<number> {
   if (engine.kind !== 'pglite') return 0;
   const effects = await engine.executeRaw(`UPDATE persistence_effects SET state='queued',execution_token=NULL,claim_expires_at=NULL,
     next_attempt_at=LEAST(next_attempt_at,now()) WHERE state='running' AND recovery IS NULL AND updated_at<$1::timestamptz
     AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
-  const requests = await engine.executeRaw(`UPDATE persistence_requests SET state='queued',execution_token=NULL,claim_expires_at=NULL
+  const requests = await engine.executeRaw(`UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL,
+    preparation_attempts=preparation_attempts+CASE WHEN $2::boolean THEN ${EXPIRED_PREPARING_CHARGE_SQL('r')} ELSE 0 END
     WHERE state='running' AND recovery IS NULL AND publication_started=false AND updated_at<$1::timestamptz
-    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString()]);
+    AND ${PERSISTENCE_PROTOCOL_PREDICATE} RETURNING id`, [processStartedAt.toISOString(), chargePreparing]);
   return effects.length + requests.length;
 }
 

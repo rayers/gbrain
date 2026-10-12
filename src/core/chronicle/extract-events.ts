@@ -10,9 +10,11 @@
 // failure (no provider, provider error, refusal, truncation, unparseable
 // output) so none is ever recorded as a genuine no_events answer.
 import type { BrainEngine } from '../engine.ts';
+import { matchingCloseBracket } from '../llm-json.ts';
 import { maintenancePreflight } from '../persistence/prepared-maintenance.ts';
 import { parseConversation } from '../conversation-parser/parse.ts';
 import { chroniclePageDate } from './eligibility.ts';
+import { chronicleSettings } from './config.ts';
 import { buildChronicleEvent, pinDepth, publishChronicleGeneration, type BuiltChronicleEvent } from './publish.ts';
 
 export interface ChronicleEventProposal {
@@ -50,8 +52,9 @@ export type ChronicleJudge = (input: ChronicleJudgeInput) => Promise<ChronicleJu
  * Proposals refused before publication, never written:
  *   - 'future_dated': dated after the depth page's own day (a plan, follow-up or scheduled item).
  *   - 'date_imprecise': the judge could not give the day ("back in 2024" → "2024").
+ *   - 'over_cap' (#5329): past the page's `chronicle.max_events_per_page` after the date screen, in the judge's order.
  */
-export type ChronicleDropReason = 'future_dated' | 'date_imprecise';
+export type ChronicleDropReason = 'future_dated' | 'date_imprecise' | 'over_cap';
 export type ChronicleDropCounts = Partial<Record<ChronicleDropReason, number>>;
 
 export interface ChronicleExtractResult {
@@ -147,15 +150,20 @@ const DAY_PRECISION = /^\d{4}-\d{2}-\d{2}(?:$|[T ])/;
  * CL-1/CL-2: refuse proposals the page cannot support before anything is written. A `when` without
  * a day (YYYY, YYYY-MM) is `date_imprecise`: the timeline stores days, so pinning it to the first of
  * the month or year would invent one. A day after the page's own day is `future_dated`.
+ * #5329: of the dated survivors, at most `maxEvents` are kept, the first in the judge's order (a
+ * deterministic cut: the judge lists a page's events as it reads them); the rest are `over_cap`.
+ * The cap runs after the screen, so a proposal dropped for its date never takes a slot. Counting
+ * costs no provider call.
  */
 export function screenChronicleProposals(proposals: ChronicleEventProposal[], ctx: Pick<ChronicleJudgeContext, 'pageDates'>,
-  tz: string, now: Date): { kept: ChronicleEventProposal[]; dropped: ChronicleDropCounts } {
+  tz: string, now: Date, cap: { maxEvents: number }): { kept: ChronicleEventProposal[]; dropped: ChronicleDropCounts } {
   const cutoff = chronicleEventCutoff(ctx, tz, now);
   const kept: ChronicleEventProposal[] = [];
   const dropped: ChronicleDropCounts = {};
   for (const ev of proposals) {
     const reason: ChronicleDropReason | null = !DAY_PRECISION.test(ev.when.trim()) ? 'date_imprecise'
-      : isoDay(ev.when.trim(), tz) > cutoff ? 'future_dated' : null;
+      : isoDay(ev.when.trim(), tz) > cutoff ? 'future_dated'
+      : kept.length >= cap.maxEvents ? 'over_cap' : null;
     if (reason) dropped[reason] = (dropped[reason] ?? 0) + 1;
     else kept.push(ev);
   }
@@ -206,11 +214,11 @@ export function chronicleJudgeContext(page: { slug: string; type: string; title:
   };
 }
 
-/** Proposals → event pages for one depth snapshot; proposals the page cannot support are dropped first. */
+/** Proposals → event pages for one depth snapshot; proposals the page cannot support, then those past the cap, are dropped first. */
 export function buildChronicleEvents(proposals: ChronicleEventProposal[], ctx: ChronicleJudgeContext,
-  depth: { slug: string; visibility: 'private' | 'world'; contentHash: string }, opts: { tz: string; now: Date },
+  depth: { slug: string; visibility: 'private' | 'world'; contentHash: string }, opts: { tz: string; now: Date; maxEvents: number },
 ): { events: BuiltChronicleEvent[]; dropped: ChronicleDropCounts } {
-  const { kept, dropped } = screenChronicleProposals(proposals, ctx, opts.tz, opts.now);
+  const { kept, dropped } = screenChronicleProposals(proposals, ctx, opts.tz, opts.now, { maxEvents: opts.maxEvents });
   const events = kept.map((ev) => buildChronicleEvent(ev, {
     depthSlug: depth.slug, attendees: ctx.attendees, effectiveDate: ctx.effectiveDate, tz: opts.tz,
     visibility: depth.visibility, depthHash: depth.contentHash, isoDay, normalizeKind,
@@ -228,10 +236,13 @@ export function buildChronicleEvents(proposals: ChronicleEventProposal[], ctx: C
  */
 export async function runChronicleExtract(
   engine: BrainEngine,
-  opts: { slug: string; sourceId?: string; judge?: ChronicleJudge; tz?: string; signal?: AbortSignal },
+  opts: { slug: string; sourceId?: string; judge?: ChronicleJudge; tz?: string; signal?: AbortSignal;
+    /** #5329: events published from this page; `chronicle.max_events_per_page` when omitted. */
+    maxEvents?: number },
 ): Promise<ChronicleExtractResult> {
   const sourceId = opts.sourceId ?? 'default';
   const tz = opts.tz ?? 'UTC';
+  const maxEvents = opts.maxEvents ?? (await chronicleSettings(engine)).maxEventsPerPage;
   const snapshot = await engine.readPageSnapshot(opts.slug, { sourceId });
   if (!snapshot) return { slug: opts.slug, status: 'skipped', events_written: 0, reason: 'page_not_found' };
   const ctx = chronicleJudgeContext(snapshot.page);
@@ -261,7 +272,7 @@ export async function runChronicleExtract(
   }
   const pin = pinDepth(snapshot);
   const built = buildChronicleEvents(proposals, ctx, { slug: pin.slug, visibility: pin.visibility, contentHash: pin.contentHash },
-    { tz, now: new Date() });
+    { tz, now: new Date(), maxEvents });
   const generation = await publishChronicleGeneration(engine, {
     sourceId, pin, maintenance, decisionRequestId: null, signal: opts.signal, events: built.events,
   });
@@ -290,6 +301,17 @@ Use the provided attendee slugs for "who" when the text does not name participan
  * array). Override via `chronicle.judge_max_tokens`.
  */
 const DEFAULT_JUDGE_MAX_TOKENS = 4000;
+/** Page body characters the judge reads at most. */
+export const JUDGE_BODY_CHARS = 12_000;
+/** Judge input outside the body: the system prompt plus headroom for the wrapper, title, attendees and date rule. */
+export const JUDGE_PROMPT_CHARS = JUDGE_SYSTEM.length + 2_000;
+
+/** The judge's output-token cap: `chronicle.judge_max_tokens`, else the default. */
+export async function chronicleJudgeMaxTokens(engine: BrainEngine): Promise<number> {
+  const capRaw = await engine.getConfig('chronicle.judge_max_tokens').catch(() => null);
+  const n = capRaw ? parseInt(capRaw, 10) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_JUDGE_MAX_TOKENS;
+}
 
 export function defaultJudge(engine: BrainEngine): ChronicleJudge {
   return async (input) => {
@@ -299,21 +321,23 @@ export function defaultJudge(engine: BrainEngine): ChronicleJudge {
     // so keyless daemons reported clean no_events runs forever. Surface it as
     // a distinct failure (mapped to status 'skipped' / judge_llm_unavailable).
     if (!isAvailable('chat')) return { events: [], failure: 'llm_unavailable' };
-    const body = (input.body || '').slice(0, 12_000);
+    const body = (input.body || '').slice(0, JUDGE_BODY_CHARS);
     // #2606: configurable cap so event-dense pages have headroom.
-    let maxTokens = DEFAULT_JUDGE_MAX_TOKENS;
-    const capRaw = await engine.getConfig('chronicle.judge_max_tokens').catch(() => null);
-    if (capRaw) {
-      const n = parseInt(capRaw, 10);
-      if (Number.isFinite(n) && n > 0) maxTokens = n;
-    }
+    const maxTokens = await chronicleJudgeMaxTokens(engine);
+    // extraction.date_grounding: the page date is the observation date; a
+    // relative "last Tuesday" resolves against it, never against today.
+    const { isConsumerDateGroundingOn } = await import('../facts/extract.ts');
+    const grounded = await isConsumerDateGroundingOn(engine, 'chronicle');
+    const { observationDateFrom, observationDateLine, observationDateRule } = await import('../ai/date-grounding.ts');
+    const dateLine = grounded ? `${observationDateLine(observationDateFrom(input.effectiveDate))}\n` : '';
     let text: string;
     try {
       const res = await chat({
-        system: JUDGE_SYSTEM,
+        system: grounded ? `${JUDGE_SYSTEM}\n${observationDateRule()}` : JUDGE_SYSTEM,
         messages: [{
           role: 'user',
           content:
+            dateLine +
             `<page slug="${input.slug}" type="${input.type}" date="${input.effectiveDate ?? ''}">\n` +
             `${input.title}\n\n${body}\n</page>\n\n` +
             `Known attendees: ${input.attendees.slice(0, 10).join(', ') || '(none)'}.\nExtract the events.`,
@@ -345,6 +369,8 @@ export function defaultJudge(engine: BrainEngine): ChronicleJudge {
  * #2606: returns `null` on parse FAILURE (empty text, no `[...]` found,
  * JSON.parse throw, non-array result) so callers can distinguish "the model
  * said no events" (a legitimate `[]`) from "the response was unusable".
+ * The slice ends at the array's own closing bracket (`matchingCloseBracket`),
+ * not the last `]` in the reply, so a citation after it cannot widen it.
  */
 export function parseJudgeJson(text: string): ChronicleEventProposal[] | null {
   if (!text) return null;
@@ -352,8 +378,8 @@ export function parseJudgeJson(text: string): ChronicleEventProposal[] | null {
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) s = fence[1].trim();
   const start = s.indexOf('[');
-  const end = s.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) return null;
+  const end = matchingCloseBracket(s, start);
+  if (end === -1) return null;
   try {
     const arr = JSON.parse(s.slice(start, end + 1));
     return Array.isArray(arr) ? arr : null;

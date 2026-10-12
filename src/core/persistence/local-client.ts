@@ -8,9 +8,10 @@ import { getCliOptions } from '../cli-options.ts';
 import { loadMounts, type MountEntry } from '../brain-registry.ts';
 import { inspectLockHolder, type LockHolderInfo } from '../pglite-lock.ts';
 import { resolveSourceIdEngineFree } from '../source-resolver.ts';
-import { opError, OperationError } from '../ops/contract.ts';
+import { opError, opOwnsSource, OperationError } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import { parseWriteRequestId } from './preconditions.ts';
+import { isWriteRequestId } from './types.ts';
 import {
   isPersistenceIpcMutation, isPersistenceIpcOperation, isPersistenceIpcRegistration,
   persistenceSocketPathForConfig, requestPersistenceCapabilities, requestPersistenceOperation,
@@ -59,7 +60,7 @@ export function residentPersistenceConfig(hostConfig: GBrainConfig | null, cwd =
 /** Reads an existing registration only. Revocation/missing credentials never create a new principal. */
 export function readPersistenceCliRegistration(brainId: string): PersistenceIpcRegistration {
   // Capability validation has already constrained this filename component to a UUID.
-  const id = parseWriteRequestId(brainId);
+  const id = isWriteRequestId(brainId) ? brainId.toLowerCase() : undefined;
   if (!id) {
     throw opError('permission_denied', 'Missing durable brain identity.',
       'The resident owner reported no durable brain identity, so this CLI cannot select its writer registration. Check the brain\'s persistence state; if an older owner is running, the user restarts it after upgrading.',
@@ -104,6 +105,12 @@ export async function maybeDelegateLocalAdministration(
  * that answered), every failure is final here: never fall through after an
  * unavailable owner socket or a lost acknowledgment.
  */
+async function operationOwnsSource(operation: string): Promise<boolean> {
+  const { operationsByName } = await import('../operations.ts');
+  const op = operationsByName[operation];
+  return op !== undefined && opOwnsSource(op);
+}
+
 export async function maybeDelegateLocalOperation(
   operation: string,
   params: Record<string, unknown>,
@@ -123,8 +130,8 @@ export async function maybeDelegateLocalOperation(
   const socketPath = persistenceSocketPathForConfig(config);
   if (!socketPath) throw noDiscoveryPath('The selected PGLite owner has no persistence discovery path.', holder, brainId);
 
-  // Takes' source is claim provenance, independent of the CLI source routing axis.
-  const sourceInParams = options.source === undefined && !operation.startsWith('takes_');
+  // An op that owns `source` (claim or timeline provenance) gets it on the wire, never as routing scope.
+  const sourceInParams = options.source === undefined && !(await operationOwnsSource(operation));
   const explicit = options.source ?? (sourceInParams && typeof params.source === 'string' ? params.source : null);
   const source = resolveSourceIdEngineFree(explicit, cwd);
   const wireParams = { ...params };

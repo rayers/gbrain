@@ -224,7 +224,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove', 'rebuild'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -245,7 +245,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove', 'rebuild'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -452,6 +452,13 @@
             "unconditionalFor": []
           }
         ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
+      "core": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
         "thinClient": "none",
         "thinClientRoutedSubcommands": []
       },
@@ -774,7 +781,7 @@
             "unconditionalFor": []
           },
           {
-            "condition": "command === 'extract' && args.includes('--stale') && !hasHelpFlag(args) && await (await import('./commands/extract-stale-delegate.ts')).maybeDelegateExtractStale(loadConfig(), args)",
+            "condition": "command === 'extract' && args.includes('--stale') && !hasHelpFlag(args) && await (await import('../commands/extract-stale-delegate.ts')).maybeDelegateExtractStale(loadConfig(), args)",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -838,7 +845,7 @@
         "phase": "pre-connect-own-engine",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove', 'rebuild'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1115,7 +1122,7 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'migrate' && await (await import('./commands/migrate-graduation.ts')).tryRunMigrateGraduation(args)",
+            "condition": "command === 'migrate' && await (await import('../commands/migrate-graduation.ts')).tryRunMigrateGraduation(args)",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1329,6 +1336,13 @@
         "thinClientRoutedSubcommands": [
           "list"
         ]
+      },
+      "questions": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
       },
       "recall": {
         "hasSwitchCase": true,
@@ -1611,6 +1625,25 @@
         "thinClient": "refuse",
         "thinClientRoutedSubcommands": []
       },
+      "setup": {
+        "hasSwitchCase": false,
+        "phase": "pre-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'setup'",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": [
+              "setup"
+            ]
+          }
+        ],
+        "thinClient": "none",
+        "thinClientRoutedSubcommands": []
+      },
       "skillify": {
         "hasSwitchCase": false,
         "phase": "pre-connect",
@@ -1699,7 +1732,7 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove', 'rebuild'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1712,7 +1745,7 @@
             ]
           },
           {
-            "condition": "command === 'sources' && args[0] === 'refresh' && !hasHelpFlag(args) && await (await import('./commands/sources-refresh-delegate.ts')).maybeDelegateSourcesRefresh(loadConfig(), args.slice(1))",
+            "condition": "command === 'sources' && args[0] === 'refresh' && !hasHelpFlag(args) && await (await import('../commands/sources-refresh-delegate.ts')).maybeDelegateSourcesRefresh(loadConfig(), args.slice(1))",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1721,8 +1754,10 @@
             "unconditionalFor": []
           }
         ],
-        "thinClient": "refuse",
-        "thinClientRoutedSubcommands": []
+        "thinClient": "route-then-refuse",
+        "thinClientRoutedSubcommands": [
+          "shared-skills"
+        ]
       },
       "status": {
         "hasSwitchCase": true,
@@ -1802,26 +1837,22 @@
             "unconditionalFor": []
           },
           {
-            "condition": "command === 'sync'",
+            "condition": "command === 'sync' && !syncOperator",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
             "terminates": false,
             "thinClientCheck": false,
-            "unconditionalFor": [
-              "sync"
-            ]
+            "unconditionalFor": []
           },
           {
-            "condition": "command === 'sync'",
+            "condition": "command === 'sync' && !syncOperator",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
             "terminates": false,
             "thinClientCheck": false,
-            "unconditionalFor": [
-              "sync"
-            ]
+            "unconditionalFor": []
           }
         ],
         "thinClient": "refuse",
@@ -1832,7 +1863,7 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve'].includes(args[0]) && !hasHelpFlag(args)",
+            "condition": "command === 'capture' || command === 'forget' || command === 'call' || command === 'sources' && ['writer', 'reconcile', 'add', 'remove', 'archive', 'restore', 'purge', 'set-path', 'reclone'].includes(args[0]) || command === 'takes' && ['add', 'update', 'supersede', 'resolve', 'remove', 'rebuild'].includes(args[0]) && !hasHelpFlag(args)",
             "connectsEngine": true,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -1890,7 +1921,24 @@
         "phase": "post-connect",
         "preConnectRules": [
           {
-            "condition": "command === 'transcripts' && args[0] === 'recent' && !hasHelpFlag(args) && await (await import('./commands/transcripts.ts')).runDelegatedTranscriptsRecent(args.slice(1))",
+            "condition": "command === 'transcripts' && args[0] === 'recent' && !hasHelpFlag(args) && await (await import('../commands/transcripts.ts')).runDelegatedTranscriptsRecent(args.slice(1))",
+            "connectsEngine": false,
+            "refusesThinClient": false,
+            "routesThinClient": false,
+            "terminates": true,
+            "thinClientCheck": false,
+            "unconditionalFor": []
+          }
+        ],
+        "thinClient": "refuse",
+        "thinClientRoutedSubcommands": []
+      },
+      "trust": {
+        "hasSwitchCase": true,
+        "phase": "post-connect",
+        "preConnectRules": [
+          {
+            "condition": "command === 'trust' && await (await import('../commands/trust.ts')).maybeDelegateTrust(loadConfig(), args)",
             "connectsEngine": false,
             "refusesThinClient": false,
             "routesThinClient": false,
@@ -2013,16 +2061,6 @@
         "unconditionalFor": []
       },
       {
-        "commands": [],
-        "condition": "command !== 'hook'",
-        "connectsEngine": false,
-        "refusesThinClient": false,
-        "routesThinClient": false,
-        "terminates": false,
-        "thinClientCheck": false,
-        "unconditionalFor": []
-      },
-      {
         "commands": [
           "ask"
         ],
@@ -2129,6 +2167,9 @@
         "modes",
         "stats",
         "tune"
+      ],
+      "sources": [
+        "shared-skills"
       ],
       "takes": [
         "list",
