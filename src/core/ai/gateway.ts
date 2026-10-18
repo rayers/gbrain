@@ -37,6 +37,7 @@ import { DEFAULT_CHARS_PER_TOKEN, DEFAULT_SAFETY_FACTOR, embedRequestMaxInputTok
 export { splitByTokenBudget, capBatchItems, NO_BATCH_CAP_SUB_BATCH_ITEMS } from './embed-batch-plan.ts';
 import { BudgetTracker, type BudgetReservation } from '../budget/budget-tracker.ts';
 import { failedCallUsage, recordOnTracker } from './budget-record.ts';
+import { estimateChatInputTokens } from './chat-input-estimate.ts';
 import { chatWithFallback, normalizeChatFallbackChain } from './chat-fallback.ts';
 import { applyThinkingOff, thinkingOffMaxOutputTokens } from './thinking-off.ts';
 import type {
@@ -50,6 +51,7 @@ import type {
 } from './types.ts';
 import { resolveRecipe, assertTouchpoint, parseModelId, embeddingDimsForModel } from './model-resolver.ts';
 import { recordChatUsage } from './chat-usage.ts';
+import { buildExpansionPrompt } from './expansion-prompt.ts';
 import {
   OPENROUTER_CACHE_HEADER,
   openrouterRequiresExplicitPromptCache,
@@ -62,6 +64,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
+import { embeddingModelNotFoundHint, gatewayModelNotFoundHint } from './model-not-found-hint.ts';
 import { fitMatryoshkaPrefix, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
@@ -130,7 +133,7 @@ const DEFAULT_CHAT_MODEL = 'anthropic:claude-sonnet-4-6';
 // v0.35.0.0+: reranker runtime fallback. Used only when search.reranker.enabled
 // is set AND no explicit reranker_model is configured. #3657 seam: the value is
 // `DEFAULT_RERANKER_MODEL` imported from ./defaults.ts (ONE constant, shared with
-// the mode bundles) — `voyage:rerank-2.5` since v0.48.2.
+// the mode bundles) — `voyage:rerank-3-lite` (was `voyage:rerank-2.5` from v0.48.2).
 
 let _config: AIGatewayConfig | null = null;
 /** #5137: provider auth errors echo keys; scrub every key in effect before the text leaves the gateway. */
@@ -533,31 +536,47 @@ export function refreshGatewayEnvFromFilePlane(): void {
  * config for callers who want to inspect what landed.
  */
 export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise<AIGatewayConfig> {
+  _discoveryEngine = engine;
+  _discovery = null;
+  return resolveGatewayModels(engine);
+}
+
+let _discoveryEngine: BrainEngine | null = null;
+let _discovery: Promise<void> | null = null;
+
+/**
+ * #6607: OpenAI model discovery runs once per reconfigure, just before an
+ * OpenAI-routed call, never on connect (a brain that never calls OpenAI sends
+ * nothing). TTL, backoff, decline and kill switch live in openai-latest.ts.
+ * Changed tiers re-resolve the models first. Endpoint: OPENAI_BASE_URL (env
+ * plane), never DB-mergeable base_urls, so a shared brain cannot redirect the
+ * key. Fail-open.
+ */
+async function discoverBeforeOpenAICall(modelStr: string | undefined): Promise<void> {
+  if (!modelStr) return;
+  try { if (resolveRecipe(modelStr).recipe.id !== 'openai') return; } catch { return; }
+  _discovery ??= (async () => {
+    try {
+      const cfg = requireConfig();
+      const { refreshLatestOpenAIModels, latestOpenAITiers } = await import('./openai-latest.ts');
+      const before = JSON.stringify(latestOpenAITiers());
+      await refreshLatestOpenAIModels({ env: cfg.env ?? process.env, baseUrl: resolveNativeBaseUrl('openai', cfg) });
+      if (_discoveryEngine && JSON.stringify(latestOpenAITiers()) !== before) await resolveGatewayModels(_discoveryEngine);
+    } catch {
+      // Fail-open: the call proceeds on the models already resolved.
+    }
+  })();
+  await _discovery;
+}
+
+async function resolveGatewayModels(engine: BrainEngine): Promise<AIGatewayConfig> {
   const cfg = requireConfig();
-  // Refresh the OpenAI latest-model discovery cache BEFORE resolution so the
-  // key-aware tier defaults below see it. TTL-throttled (one fetch/24h),
-  // 3s-bounded, fail-open, disabled in test lanes via GBRAIN_MODEL_DISCOVERY
-  // — a connect never blocks on or breaks from discovery.
-  const { refreshLatestOpenAIModels } = await import('./openai-latest.ts');
-  // Discovery hits the same endpoint real native-openai calls use:
-  // OPENAI_BASE_URL via resolveNativeBaseUrl — the ENV PLANE, deliberately
-  // NOT cfg.base_urls.openai. Two reasons: (1) defaulting to api.openai.com
-  // when a custom endpoint is configured would send that endpoint's key to
-  // the official host; (2) base_urls can be DB-plane-merged from a mounted
-  // brain, and discovery fires automatically on connect — a hostile shared
-  // brain must never be able to point this process's bearer key at an
-  // attacker URL (native chat calls ignore base_urls for the same reason).
-  await refreshLatestOpenAIModels({
-    env: cfg.env ?? process.env,
-    baseUrl: resolveNativeBaseUrl('openai', cfg),
-  });
 
   // The two resolutions below each walk a 5-tier precedence chain that reads
   // up to 4 config keys, plus alias expansion. Against the engine that is
   // many sequential round trips before the CLI does any work — seconds of
   // `gbrain stats`'s wall clock on a hosted brain, for reads the server
-  // answered in microseconds. Take one snapshot of the config table (AFTER
-  // the discovery refresh above, so tier defaults see fresh discovery) and
+  // answered in microseconds. Take one snapshot of the config table and
   // resolve every model against it. Same keys, same precedence, one round
   // trip.
   const reader = await snapshotConfigReader(engine);
@@ -691,6 +710,8 @@ export function __setGatewayResetBaselineForTests(
 /** Clear every piece of module state. Shared by both reset flavors. */
 function clearGatewayState(): void {
   _config = null;
+  _discoveryEngine = null;
+  _discovery = null;
   clearGatewayModelSources();
   stashGatewayAnthropicKeyFromEnv(undefined); // gateway-owned snapshot dies with the config
   _modelCache.clear();
@@ -1404,6 +1425,7 @@ function noKeyOnce(modelStr: string, keyName: string, query: string, docCount: n
 }
 
 async function resolveEmbeddingProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'embedding', parsed.modelId);
   const cfg = requireConfig();
@@ -1805,7 +1827,7 @@ async function embedSubBatch(
       };
     }
     reportEmbeddingAuthFailure(recipe, err);
-    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`, redactKeys);
+    throw normalizeAIError(err, `embed(${recipe.id}:${modelId})`, redactKeys, embeddingModelNotFoundHint());
   }
 }
 
@@ -2341,6 +2363,7 @@ export async function embedMultimodalSafe(
 // ---- Expansion ----
 
 async function resolveExpansionProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'expansion', parsed.modelId);
   const cfg = requireConfig();
@@ -2472,13 +2495,7 @@ export async function expand(query: string): Promise<string[]> {
     metadata: { query_chars: query.length },
   });
 
-  const expansionPrompt = [
-    'Rewrite the search query below into 3-4 different, related queries that would help find relevant documents. Respond with a JSON object in exactly this shape: {"queries": ["rewrite1", "rewrite2", "rewrite3"]}. The JSON key MUST be exactly "queries" (not "rewrites" or any other variation).',
-    'Return ONLY the JSON object. Do NOT include the original query in the result.',
-    'Each rewrite should emphasize different aspects, synonyms, or framings.',
-    '',
-    `Query: ${query}`,
-  ].join('\n');
+  const expansionPrompt = buildExpansionPrompt(query);
 
   // #4121: expand() calls generateObject/generateText directly and never
   // goes through chat()'s _recordBudget closure, so every expansion LLM
@@ -2498,6 +2515,7 @@ export async function expand(query: string): Promise<string[]> {
   });
 
   try {
+    await discoverBeforeOpenAICall(_config?.expansion_model);
     const requestedModelId = getExpansionModel();
     const { model, recipe, modelId } = await resolveExpansionProvider(requestedModelId);
     const modelLabel = `${recipe.id}:${modelId}`;
@@ -2639,7 +2657,7 @@ export async function expand(query: string): Promise<string[]> {
   } catch (err) {
     if (isAIInvocationPolicyError(err)) throw err;
     // Expansion is best-effort: on failure, fall back to the original query alone.
-    const normalized = normalizeAIError(err, 'expand', redactKeys);
+    const normalized = normalizeAIError(err, `expand(${_config?.expansion_model ?? ''})`, redactKeys, gatewayModelNotFoundHint('expansion', _config?.expansion_model ?? ''));
     if (normalized instanceof AIConfigError) {
       console.warn(`[ai.gateway] expansion disabled: ${normalized.message}`);
     }
@@ -2757,23 +2775,6 @@ export function getCurrentBudgetTracker(): BudgetTracker | null {
   return __budgetStore.getStore() ?? null;
 }
 
-/** Internal helper: estimate input tokens from messages + system. Heuristic only
- * (~4 chars/token); cap math is best-effort because we pre-flight reservation
- * before the SDK has counted anything. */
-function estimateChatInputTokens(opts: { system?: string; messages?: Array<{ content?: unknown }> }): number {
-  let chars = (opts.system ?? '').length;
-  for (const m of opts.messages ?? []) {
-    if (typeof m.content === 'string') chars += m.content.length;
-    else if (Array.isArray(m.content)) {
-      for (const block of m.content) {
-        const t = (block as { text?: unknown }).text;
-        if (typeof t === 'string') chars += t.length;
-      }
-    }
-  }
-  return Math.ceil(chars / 4);
-}
-
 // ---- Chat (commit 1) ----
 
 /**
@@ -2803,7 +2804,10 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
  * on turn 2 without this: `chat()` previously never captured the part at all.
  */
 export type ChatBlock =
-  | { type: 'text'; text: string; providerMetadata?: Record<string, unknown> }
+  // `cache: true` (PR #6341): an explicit prompt-cache breakpoint after this block, so a
+  // single-turn caller's stable USER prefix (page-summary's title + document) caches. Honoured
+  // only when the call derives a cache-control value; other routes see a plain text block.
+  | { type: 'text'; text: string; cache?: true; providerMetadata?: Record<string, unknown> }
   | { type: 'reasoning'; text: string; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown; providerMetadata?: Record<string, unknown> }
   | { type: 'tool-result'; toolCallId: string; toolName: string; output: unknown; isError?: boolean; providerMetadata?: Record<string, unknown> };
@@ -2936,7 +2940,10 @@ function ensureToolCallId(id: unknown, toolName: string): string {
   return `glmfix-${toolName}-${randomUUID()}`;
 }
 
-export function toModelMessages(messages: ChatMessage[]): unknown[] {
+export function toModelMessages(
+  messages: ChatMessage[],
+  cacheControl?: { type: 'ephemeral'; ttl?: '5m' | '1h' },
+): unknown[] {
   return messages.map((m) => {
     if (typeof m.content === 'string') return { role: m.role, content: m.content };
     const blocks = m.content;
@@ -2973,10 +2980,13 @@ export function toModelMessages(messages: ChatMessage[]): unknown[] {
           // Gemini 3.x thoughtSignature, OpenAI reasoning-item id) — attached
           // only when captured.
           if (b.type === 'text') {
+            const providerOptions = b.cache && cacheControl
+              ? { ...b.providerMetadata, anthropic: { ...(b.providerMetadata?.anthropic as Record<string, unknown> | undefined), cacheControl } }
+              : b.providerMetadata;
             return {
               type: 'text' as const,
               text: b.text,
-              ...(b.providerMetadata ? { providerOptions: b.providerMetadata } : {}),
+              ...(providerOptions ? { providerOptions } : {}),
             };
           }
           if (b.type === 'reasoning') {
@@ -3271,6 +3281,7 @@ function chatSupportsPromptCache(recipe: Recipe, modelId: string): boolean {
 }
 
 async function resolveChatProvider(modelStr: string): Promise<{ model: any; recipe: Recipe; modelId: string }> {
+  await discoverBeforeOpenAICall(modelStr);
   const { parsed, recipe } = resolveRecipe(modelStr);
   assertTouchpoint(recipe, 'chat', parsed.modelId);
   const cfg = requireConfig();
@@ -3520,6 +3531,7 @@ export function toAISDKTools(tools: ChatToolDef[] | undefined): Record<string, a
 }
 
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
+  await discoverBeforeOpenAICall(opts.model ?? _config?.chat_model);
   const fallbackChain = opts.allowFallback === false ? undefined : _config?.chat_fallback_chain;
   if (fallbackChain?.length) return chatWithFallback(opts, opts.model ?? getChatModel(), fallbackChain, chat, { onRefusal: _config?.chat_fallback_on_refusal !== false });
   const tracker = __budgetStore.getStore() ?? null;
@@ -3730,7 +3742,7 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
   const generate = (out: typeof output) => guardedGeneration(modelStr, _generateTextTransport, {
     model,
     system: systemParam,
-    messages: toModelMessages(repairToolPairing(opts.messages)) as any,
+    messages: toModelMessages(repairToolPairing(opts.messages), cacheControlValue) as any,
     tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
     maxOutputTokens,
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
@@ -3840,7 +3852,7 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
     // Pessimistic fallback (A3 amended): when err.usage isn't there, charge
     // the worst-case ceiling — better to overcount on failure than under.
     _recordBudget(failedCallUsage(err, { inputTokens: estimatedInputTokens, outputTokens: maxOutputTokens }));
-    throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys);
+    throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys, gatewayModelNotFoundHint('chat', modelStr));
   }
 }
 
@@ -3963,7 +3975,7 @@ export type TurnPermit =
   | (() => Promise<void> | void)
   | { release: () => Promise<void> | void; signal?: AbortSignal };
 
-export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable';
+export type ToolLoopStopReason = 'end' | 'length' | 'max_turns' | 'refusal' | 'content_filter' | 'aborted' | 'unrecoverable' | 'empty_response';
 
 export interface ToolLoopResult {
   finalText: string;
@@ -4097,8 +4109,9 @@ export async function toolLoop(opts: ToolLoopOpts): Promise<ToolLoopResult> {
       // #4088: an output-cap hit is NOT a clean finish. Folding 'length' into
       // 'end' made truncated zero-tool-call runs indistinguishable from the
       // model choosing to stop — the exact honesty bug #2778 fixed on the
-      // direct Anthropic path.
-      stopReason = chatResult.stopReason === 'length' ? 'length' : 'end';
+      // direct Anthropic path. #6448: a clean stop with no text (refusal
+      // body, thinking-only turn) is 'empty_response', not 'end'.
+      stopReason = chatResult.stopReason === 'length' ? 'length' : chatResult.text.trim() === '' ? 'empty_response' : 'end';
       finalText = chatResult.text;
       break;
     }

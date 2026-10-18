@@ -1,6 +1,6 @@
 import type { BrainEngine, LinkBatchInput } from './engine.ts';
 import { extractPageLinks, unwrapWikilink, resolvedLinkCandidate,
-  isCrossSourceLinksEnabled, type LinkCandidate, type LinkExtractionPack, type SlugResolver } from './link-extraction.ts';
+  isCrossSourceLinksEnabled, type LinkCandidate, type LinkExtractionPack, type PageLinksResult, type SlugResolver } from './link-extraction.ts';
 import { fetchSource, isSourceFederated } from './sources-load.ts';
 import { parseMarkdown } from './markdown.ts';
 import { isValidSourceId } from './source-id.ts';
@@ -8,6 +8,9 @@ import { buildSourceLocalReferenceIndex } from './source-local-reference-index.t
 import { collectWantedLinks, isWantedPagesEnabled } from './wanted-links.ts';
 import { readLineGrammarSettings } from './line-grammar.ts';
 import { DerivedLinkSettingsChangedError } from './derived-links.ts';
+import { isSegmentedPage } from './page-body/page-shape.ts';
+import { extractSegmentedPageLinks } from './page-body/segment-links.ts';
+import type { TemporalBody } from './link-temporal-apply.ts';
 
 export interface LinkPageMetadata {
   slug: string;
@@ -93,12 +96,16 @@ export async function reconcileSourceLinks(
       }
       const page = snapshot.page;
       const sourcesOf = makeLinkSourceResolver(page.slug, sourceId, endpoints, policy);
-      const extracted = await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter,
-        page.type, resolver, { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,
-          targetType: (slug, source) => {
-            const resolved = sourcesOf.resolve({ targetSlug: slug, targetSourceId: source, linkType: '', context: '' });
-            return resolved.ok ? metadata.get(`${resolved.toSourceId}\0${slug}`)?.type : undefined;
-          } });
+      const linkOpts = { pack: opts.pack, globalBasename: opts.globalBasename, lineGrammar,
+        targetType: (slug: string, source?: string) => {
+          const resolved = sourcesOf.resolve({ targetSlug: slug, targetSourceId: source, linkType: '', context: '' });
+          return resolved.ok ? metadata.get(`${resolved.toSourceId}\0${slug}`)?.type : undefined;
+        } };
+      // A segmented body is read block by block, and its temporal inputs with it (the publication never reads it).
+      const extracted: PageLinksResult & { temporalBody?: TemporalBody } = isSegmentedPage(page)
+        ? await extractSegmentedPageLinks(engine, { id: Number(page.id), slug: page.slug, source_id: sourceId, type: page.type, frontmatter: page.frontmatter },
+          resolver, { ...linkOpts, temporal: true })
+        : await extractPageLinks(page.slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter, page.type, resolver, linkOpts);
       for (const ref of extracted.unresolved) {
         const target = unwrapWikilink(ref.name);
         const qualifier = target.split(':')[0];
@@ -124,7 +131,8 @@ export async function reconcileSourceLinks(
       try {
         written = await engine.replaceDerivedLinks({ slug: page.slug, sourceId,
           expectedRevision: snapshot.revision, sourceIncarnation }, rows, { lineGrammar: grammar,
-          wanted: { producers: ['body', 'frontmatter'], rows: wanted }, expectedEndpoints: capturedLinkEndpoints(rows, metadata) });
+          wanted: { producers: ['body', 'frontmatter'], rows: wanted }, expectedEndpoints: capturedLinkEndpoints(rows, metadata),
+          ...(extracted.temporalBody ? { temporalBody: extracted.temporalBody } : {}) });
       } catch (error) {
         if (!(error instanceof DerivedLinkSettingsChangedError)) throw error;
         result.failures.push({ originSlug, code: 'revision_conflict' });
@@ -274,10 +282,22 @@ export function makeLinkSourceResolver(pageSlug: string, pageSourceId: string,
   };
 }
 
-export function capturedLinkEndpoints(links: LinkBatchInput[], metadata: ReadonlyMap<string, Pick<LinkPageMetadata, 'slug' | 'source_id' | 'knowledge_revision'>>) {
+/**
+ * Endpoint fences for one origin's link batch: every endpoint at the revision
+ * the resolver census captured. The source-qualified `origin`, when given, is
+ * left out (#6474): its body and type came from the snapshot whose revision
+ * `expectedRevision` already fences at publication, so fencing it again at
+ * the older census revision would defer a page rewritten between the census
+ * and its own read even though the run extracted its live body. A page with
+ * the same slug in another source is still fenced. This is the one place the
+ * rule lives; the managed preparation and both DB walks call it.
+ */
+export function capturedLinkEndpoints(links: LinkBatchInput[], metadata: ReadonlyMap<string, Pick<LinkPageMetadata, 'slug' | 'source_id' | 'knowledge_revision'>>,
+  origin?: { slug: string; sourceId: string }) {
   const keys = new Set(links.flatMap(link => [
     `${link.from_source_id ?? 'default'}\0${link.from_slug}`, `${link.to_source_id ?? 'default'}\0${link.to_slug}`,
   ]));
+  if (origin) keys.delete(`${origin.sourceId}\0${origin.slug}`);
   return [...keys].map(key => {
     const endpoint = metadata.get(key);
     if (!endpoint) throw new Error('A derived link endpoint was not captured during type resolution');

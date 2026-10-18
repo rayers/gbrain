@@ -73,6 +73,7 @@ import { preflightOauthClientColumns } from './auth.ts';
 import { deleteSourceRow } from '../core/source-delete.ts';
 import { USAGE_EXIT_CODE } from '../core/exit-codes.ts';
 import { isSyncStrategy } from '../core/sync.ts';
+import { pullStrategyOf } from '../core/git-remote.ts';
 
 // ── Validation ──────────────────────────────────────────────
 
@@ -106,6 +107,7 @@ interface SourceListEntry {
   federated: boolean;
   mirror_read_only: boolean;
   strategy: 'markdown' | 'code' | 'auto' | null;
+  pull_strategy: 'rebase' | 'merge';
   page_count: number;
   last_sync_at: string | null;
 }
@@ -615,6 +617,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
   }
 
   let dir = path;
+  let pullStrategy: 'rebase' | 'merge' = 'rebase';
   if (id) {
     const src = await fetchSource(engine, id);
     if (!src) {
@@ -626,6 +629,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
       process.exit(1);
     }
     dir = src.local_path;
+    pullStrategy = pullStrategyOf(parseConfig(src.config));
   }
 
   const { workspacePush, formatBlockedSecrets } = await import('../core/workspace-push.ts');
@@ -633,6 +637,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
   const res = await workspacePush({
     dir: dir!,
     branch,
+    pullStrategy,
     commitMessage: message,
     allowUnverifiedRemote: allowUnverified,
     logger: (l) => console.error(`[gbrain] ${l}`),
@@ -675,7 +680,7 @@ async function runPush(engine: BrainEngine, args: string[]): Promise<void> {
         console.error('PUSH BLOCKED — staged file(s) the secret scan could not read (fail-closed):');
         for (const p of res.unscannable ?? []) console.error(`  ${p}`);
         console.error(
-          'Remove from the index (git rm --cached <path>), keep it under the scan cap, ' +
+          'Remove from the index (git rm --cached <path>), keep it under the scan ceiling, ' +
             `or allowlist it in ${SCAN_ALLOW_FILENAME}.`,
         );
       }
@@ -713,6 +718,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       federated: isFederated(r.config),
       mirror_read_only: parseConfig(r.config).mirror_read_only === true,
       strategy: isSyncStrategy(parseConfig(r.config).strategy) ? parseConfig(r.config).strategy as 'markdown' | 'code' | 'auto' : null,
+      pull_strategy: pullStrategyOf(parseConfig(r.config)),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
     });
@@ -913,6 +919,7 @@ async function runSetCrMode(engine: BrainEngine, args: string[]): Promise<void> 
   } else {
     console.log(`Set source "${id}" contextual_retrieval_mode = ${mode}.`);
   }
+  console.log((await import('./config/contextual-mode-hint.ts')).contextualModeHint(id));
 }
 
 async function runArchive(engine: BrainEngine, args: string[]): Promise<void> {
@@ -1183,6 +1190,8 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
       console.log(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
     } else if (sub.status === 'no_worker_surface') {
       console.log(`  → embed-backfill not queued (${sub.engineKind} has no recognized persistent worker); run: gbrain embed --stale --source ${id}`);
+    } else if (sub.status === 'stalled') {
+      console.log(`  → embed-backfill not queued: the last ${sub.failures} runs failed on the same blocked pages with nothing embedded. See: gbrain doctor --only embed_backfill_stalled`);
     } else { sub satisfies never; }
   } catch (err) {
     // Federation flip already succeeded; embed-backfill is a follow-up nicety.
@@ -1508,7 +1517,7 @@ async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<vo
       process.exit(1);
     }
     try {
-      const { execFileSync } = await import('node:child_process');
+      const { execFileSync } = await import('../core/spawn.ts');
       const branch = execFileSync('git', ['-C', src.local_path, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
       cfg.tracked_branch = branch;
       await engine.executeRaw(
@@ -1883,6 +1892,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'unfederate': return runFederate(engine, rest, false);
     case 'mirror-readonly': case 'mirror-writable': return (await import('./sources-mirror.ts')).runMirrorMode(engine, rest, sub === 'mirror-readonly');
     case 'set-strategy': return (await import('./sources-strategy.ts')).runSetStrategy(engine, rest);
+    case 'set-pull-strategy': return (await import('./sources-pull-strategy.ts')).runSetPullStrategy(engine, rest);
     case 'refresh':    return (await import('./sources-refresh.ts')).runSourcesRefresh(engine, rest);
     case 'archive':    return runArchive(engine, rest);
     case 'restore':    return runRestore(engine, rest);
@@ -1900,6 +1910,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'tracked-branch': return runTrackedBranch(engine, rest);
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
+    case 'set-calendar': return (await import('./sources-set-calendar.ts')).runSetCalendar(engine, rest);
     case 'set-trust':  { const { runSetTrust } = await import('./sources-trust.ts'); return runSetTrust(engine, rest); }
     // #4739 non-destructive local_path pointer repair
     case 'set-path':   { const { runSetPath } = await import('./sources-set-path.ts'); return runSetPath(engine, rest); }
@@ -1976,6 +1987,7 @@ Subcommands:
   mirror-readonly <id>              Read-only mirror (#5409): managed writes never touch its checkout.
   mirror-writable <id>              Undo mirror-readonly.
   set-strategy <id> <markdown|code|auto>  Persist the sync strategy every sync of the source uses (PR #5955).
+  set-pull-strategy <id> <rebase|merge>   How pulls reconcile local commits with origin (#5429); default rebase.
   refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
                                     Managed brains: drain writes to the source's worktree, fast-forward
                                     it to its upstream (git merge --ff-only) and sync every source bound
@@ -1985,6 +1997,7 @@ Subcommands:
                                     override (v0.40.3.0). Pass "unset" or
                                     "default" to clear (NULL falls through
                                     to the global search.mode bundle).
+  set-calendar <id> <calendar-id> [--yes]  Point a Google source at another calendar (ids: gbrain google calendars).
   set-trust <id> <tier>|--clear     Trust default for this source's sync and import (operator_curated or lower).
   set-path <id> <path> [--force]    Repair a source's local_path pointer
                                     (DB column only, never touches disk).
@@ -1992,10 +2005,11 @@ Subcommands:
                                     Rejects a missing source or a path that
                                     doesn't exist. See gbrain doctor's
                                     default_source_local_path check.
-  retry-held <id> [--dry-run] [--json]
+  retry-held <id> [--unindexed] [--dry-run] [--json]
                                     Re-attempt a connector source's held items, or re-screen a Git source's held files, on its next sync.
                                     Runs nothing now. Most Git holds re-screen by themselves (file changed or deleted, newer gbrain); fix
                                     frontmatter holds with gbrain repair frontmatter --source <id>; preview fence holds (invalid_fence) with gbrain repair fences --source <id>.
+                                    --unindexed instead schedules committed files with no page and no hold (doctor unindexed_files).
   shared-skills <id> on|off|status [--json]
                                     Opt a source out of (or back into) shared-skills adoption; status explains its effective policy.
   set-path <id> --clear             Clear a connector source's (google, github)

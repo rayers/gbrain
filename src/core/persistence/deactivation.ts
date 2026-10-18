@@ -7,8 +7,10 @@
  * transaction locks `persistence_brain FOR UPDATE` first, checks the expected
  * admin state and the writer admin lock, locks worktrees then sources (the
  * order admission uses) and rechecks quiescence: no request queued, running or
- * recovering, no request or topology change with a recovery record, no
- * uncommitted effect, no live connector or maintenance lease. It then sets
+ * recovering, no request or topology change with a recovery record, no queued,
+ * running or recovering effect, no live connector or maintenance lease. A
+ * terminally failed effect can no longer change, so it does not block: the
+ * report lists it in `failed_effects` with its code and exit. It then sets
  * `enabled=false`, increments `mode_epoch`, marks every worktree `retired`
  * (rows kept for receipt and effect foreign keys), deletes source and host
  * bindings, and records a committed `writer_deactivate` topology change naming
@@ -23,13 +25,14 @@
  * committed deactivation; a newer or unknown one is kept and reported pending.
  */
 import { randomUUID } from 'node:crypto';
+import { DATABASE_ONLY_SOURCES_KEY } from './unbound-source.ts';
 import { existsSync, lstatSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import { configDir } from '../config.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
-import { acquireWorktree, getWorktreeBinding } from './ownership.ts';
+import { acquireWorktree, getWorktreeBinding, readPersistenceBrain, type PersistenceBrainRow } from './ownership.ts';
 import { existingLocalHostId } from './identity.ts';
 import type { NativeLockHandle } from './native-lock.ts';
 import { assertWriterAdminState } from './admin-intent.ts';
@@ -41,6 +44,8 @@ import { canonicalFilesystemPath } from './root-registry.ts';
 import { carryHoldsToClassicState, holdCarryBlocked, planHoldCarry, type HoldCarry } from '../connectors/item-holds-store.ts';
 import { assertPhysicalRoot, assertPhysicalRootReservation, PHYSICAL_ROOT_MARKER, physicalRootReservationPath } from './physical-root-record.ts';
 import { preActivationClaims, releasePreActivationClaims, type PreActivationClaim } from './pre-activation-release.ts';
+import { PARK_AFTER_FAILURES } from './effect-model.ts';
+import { EMBEDDING_ZERO_NORM } from '../ai/embedding-guard.ts';
 
 export const DEACTIVATE_DOCS = 'docs/architecture/topologies.md#deactivate-runbook';
 
@@ -51,6 +56,13 @@ export interface DeactivationBlocker {
   detail: string;
   /** The supported exit, filled with real values. */
   exit: string;
+}
+
+/** GBRA-130 A-15: a terminally failed effect, reported as history; `exit` is the command that retries it, or null when nothing can. */
+export interface FailedEffectEntry {
+  effect_id: string; kind: string; source_id: string; request_id: string; code: string | null;
+  exit: string | null;
+  detail: string;
 }
 
 export interface LocalMarkerReport {
@@ -72,24 +84,18 @@ export interface DeactivationReport {
   blockers: DeactivationBlocker[];
   /** Held connector items copied (or, on a dry run, to be copied) into each source's classic state file. */
   carried_holds?: HoldCarry[];
+  /** Terminally failed effects (history, never blockers), at most 50, each with its code and exit. */
+  failed_effects?: FailedEffectEntry[];
   /** #6122: on a never-activated brain, the claimed sources a deactivation releases (dry run) or released. */
   pre_activation_claims?: PreActivationClaim[];
   local_markers?: LocalMarkerReport;
 }
 
-interface BrainRow { brain_id: string; enabled: boolean; mode_epoch: string | number; skill_bundles_enabled: boolean | null; writer_protocol_floor: number | null }
+type BrainRow = PersistenceBrainRow;
 
-async function readBrain(engine: BrainEngine, lock = false): Promise<BrainRow> {
-  const [brain] = await engine.executeRaw<BrainRow>(`SELECT brain_id, enabled, mode_epoch,
-      (to_jsonb(persistence_brain)->>'skill_bundles_enabled')::boolean AS skill_bundles_enabled,
-      (to_jsonb(persistence_brain)->>'writer_protocol_floor')::int AS writer_protocol_floor
-    FROM persistence_brain WHERE singleton=1${lock ? ' FOR UPDATE' : ''}`);
-  if (!brain) {
-    throw opError('writer_not_initialized', 'Persistence identity is missing.',
-      'This brain has no persistence identity row, so there is no managed mode to read or deactivate. List the pending migrations that create it and ask the user before applying them.',
-      { fix: { argv: ['gbrain', 'apply-migrations', '--dry-run', '--json'], consent: [], actor: 'agent', why: 'Lists the pending migrations without applying them.', requires_exclusive: false } });
-  }
-  return brain;
+/** #6482: the shared fail-closed read; a missing, duplicated or non-boolean singleton refuses `storage_error`. */
+function readBrain(engine: BrainEngine, lock = false): Promise<BrainRow> {
+  return readPersistenceBrain(engine, lock ? { lock: 'update' } : {});
 }
 
 /** Every piece of work that keeps the brain from quiescing, with its CLI exit. Read-only. */
@@ -105,22 +111,20 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
     blockers.push({ kind: 'request', id: r.request_id, source_id: r.source_id, detail: `${r.operation} ${r.state}${r.recovering ? ', recovering' : ''} (${r.source_id}:${r.slug})`,
       exit: r.state === 'queued' && !r.recovering ? `gbrain cancel-write-request ${r.request_id} (MCP: cancel_write_request), or wait for the owner to publish it`
         : r.state === 'running' && !r.recovering ? 'wait for the owner to finish publishing it, then rerun deactivate'
-          : `gbrain sync --source ${r.source_id} --no-pull --retry-failed` });
+          : `gbrain sync --source ${r.source_id} --no-pull` });
   }
   const topology = await engine.executeRaw<{ id: string; operation: string; source_id: string }>(
     "SELECT id::text AS id, operation, source_id FROM persistence_topology_changes WHERE state='recovering' OR recovery IS NOT NULL ORDER BY created_at LIMIT 20");
   for (const t of topology) blockers.push({ kind: 'topology_recovery', id: t.id, source_id: t.source_id, detail: `${t.operation} for ${t.source_id} is recovering`,
     exit: `gbrain sources writer status ${t.source_id} --json, then let the owner finish recovery` });
-  const effects = await engine.executeRaw<{ effect_id: string; kind: string; state: string; source_id: string; request_id: string; error_code: string | null; recovering: boolean; source_live: boolean }>(
-    `SELECT e.id::text AS effect_id, e.kind, e.state, COALESCE(e.source_id, r.source_id) AS source_id, r.request_id::text AS request_id, e.error_code,
-       e.recovery IS NOT NULL AS recovering,
-       EXISTS (SELECT 1 FROM sources s WHERE s.id = r.source_id AND s.incarnation = r.source_incarnation) AS source_live
-     FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
-     WHERE e.state<>'committed' OR e.recovery IS NOT NULL ORDER BY e.id LIMIT 50`);
+  // GBRA-130 A-15: only work that can still change blocks, as activation checks; terminal failures are failedEffectHistory's.
+  const effects = await engine.executeRaw<EffectRow>(`${EFFECT_ROWS} WHERE e.state IN ('queued','running') OR e.recovery IS NOT NULL ORDER BY e.id LIMIT 50`);
   for (const e of effects) {
-    blockers.push({ kind: 'effect', id: e.effect_id, source_id: e.source_id, detail: `${e.kind} effect ${e.state}${e.error_code ? ` (${e.error_code})` : ''} for request ${e.request_id}`,
-      exit: e.kind === 'embedding' ? (e.source_live ? `gbrain repair embedding-effects --source ${e.source_id}` : 'gbrain repair embedding-effects (its source was removed; run it brain-wide)')
-        : e.state === 'failed' ? `gbrain sources writer retry-effects ${e.source_id} --request-id ${e.request_id} --dry-run`
+    blockers.push({ kind: 'effect', id: e.effect_id, source_id: e.source_id, detail: `${e.kind} effect ${e.state}${e.recovering ? ', recovering' : ''}${e.error_code ? ` (${e.error_code})` : ''} for request ${e.request_id}`,
+      exit: e.kind === 'links' || e.kind === 'facts-backstop'
+        ? `wait for the owner to drain it (a ${e.kind} effect that keeps failing settles after ${PARK_AFTER_FAILURES} attempts), then rerun deactivate`
+        : e.kind === 'embedding' && !e.recovering
+          ? `wait for the owner to drain it, then rerun deactivate; one still queued after an hour is re-queued by gbrain repair embedding-effects --source ${e.source_id}`
           : 'wait for the owner to drain it, then rerun deactivate' });
   }
   // Managed connector holds live in the managed checkpoint, which classic mode does not read. Deactivation copies
@@ -143,6 +147,31 @@ export async function deactivationBlockers(engine: BrainEngine): Promise<Deactiv
   for (const l of leases) blockers.push({ kind: 'lease', id: l.id, detail: `held by host ${l.holder_host}, pid ${l.holder_pid}`,
     exit: 'wait for that connector sync or maintenance run to finish (gbrain doctor shows live locks), then rerun deactivate' });
   return blockers;
+}
+
+type EffectRow = { effect_id: string; kind: string; state: string; source_id: string; request_id: string; error_code: string | null; recovering: boolean; source_live: boolean };
+const EFFECT_ROWS = `SELECT e.id::text AS effect_id, e.kind, e.state, COALESCE(e.source_id, r.source_id) AS source_id, r.request_id::text AS request_id, e.error_code,
+       e.recovery IS NOT NULL AS recovering,
+       EXISTS (SELECT 1 FROM sources s WHERE s.id = r.source_id AND s.incarnation = r.source_incarnation AND NOT s.archived) AS source_live
+     FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id`;
+
+/**
+ * GBRA-130 A-15: terminally failed effects, oldest first (at most 50). They block nothing; each carries the exit that
+ * retries it: retry-effects for parked targets and failed Git, withdrawal, links and facts-backstop effects,
+ * `repair embedding-effects` for a failed embedding effect, and none for a zero-norm refusal (the same input returns
+ * the same vector) or an effect whose source was archived, replaced or removed.
+ */
+export async function failedEffectHistory(engine: BrainEngine): Promise<FailedEffectEntry[]> {
+  const rows = await engine.executeRaw<EffectRow>(`${EFFECT_ROWS} WHERE e.state='failed' AND e.recovery IS NULL ORDER BY e.id LIMIT 50`);
+  return rows.map(e => {
+    const retry = `gbrain sources writer retry-effects ${e.source_id} --request-id ${e.request_id} --dry-run`;
+    const [exit, why] = !e.source_live ? [null, 'its source was archived, replaced or removed, so nothing can run it']
+      : e.kind !== 'embedding' || e.error_code === 'targets_parked' ? [retry, 'preview it, fix the recorded cause, then run the command without --dry-run']
+        : e.error_code === EMBEDDING_ZERO_NORM ? [null, 'the provider returns a zero vector for this text, so a retry fails the same way; the page keeps no signature, so gbrain embed --stale retries it under another model']
+          : [`gbrain repair embedding-effects --source ${e.source_id}`, 'preview the bounded retry, then apply it with --apply after the user approves the cost'];
+    return { effect_id: e.effect_id, kind: e.kind, source_id: e.source_id, request_id: e.request_id, code: e.error_code, exit,
+      detail: `${e.kind} effect failed${e.error_code ? ` (${e.error_code})` : ''} for request ${e.request_id}: ${why}` };
+  });
 }
 
 /**
@@ -228,7 +257,7 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
   const blockers = [...await deactivationBlockers(engine), ...await physicalRootBlockers(engine, 'managed')];
   if (opts.dryRun) {
     const carried_holds = (await planHoldCarry(engine, existingLocalHostId())).filter(c => c.items > 0 && !holdCarryBlocked(c));
-    return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers, carried_holds };
+    return { ...base, mode: 'managed', deactivated: false, mode_epoch: Number(brain.mode_epoch), blockers, carried_holds, failed_effects: await failedEffectHistory(engine) };
   }
   if (blockers.length) throw blockedError(blockers);
   const principal = await topologyPrincipal(engine);
@@ -267,12 +296,14 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
       if (inside.length) throw blockedError(inside);
       // Written before commit: if the transaction then fails, the brain stays managed and ignores these files.
       const carried_holds = await carryHoldsToClassicState(tx, hostId);
+      const failed_effects = await failedEffectHistory(tx);
       const retired = await retiredTopology(tx);
       const [epoch] = await tx.executeRaw<{ mode_epoch: string }>(
         'UPDATE persistence_brain SET enabled=false, mode_epoch=mode_epoch+1 WHERE singleton=1 RETURNING mode_epoch::text');
       await tx.executeRaw("UPDATE persistence_worktrees SET state='retired' WHERE state<>'retired'");
       await tx.executeRaw('DELETE FROM persistence_source_bindings');
       await tx.executeRaw('DELETE FROM persistence_host_bindings');
+      await tx.unsetConfig(DATABASE_ONLY_SOURCES_KEY);
       const sourceRoots = (await tx.executeRaw<{ local_path: string }>('SELECT local_path FROM sources WHERE local_path IS NOT NULL')).map(r => r.local_path);
       const outcome = { brain_id: current.brain_id, retired_mode_epoch: Number(current.mode_epoch), mode_epoch: Number(epoch.mode_epoch),
         worktrees: retired.worktrees, source_roots: sourceRoots };
@@ -281,7 +312,7 @@ export async function deactivatePersistence(engine: BrainEngine, opts: { dryRun?
         incarnation: null, worktrees: retired.worktrees.map(w => w.id) }, outcome);
       await refreshManagedFilesystemRoots(tx, managedFilesystemDatastorePath(engine));
       return { ...base, mode: 'classic' as const, deactivated: true, mode_epoch: Number(epoch.mode_epoch), retired_mode_epoch: Number(current.mode_epoch),
-        retired_worktrees: retired.worktrees, source_bindings: retired.bindings, blockers: [], carried_holds };
+        retired_worktrees: retired.worktrees, source_bindings: retired.bindings, blockers: [], carried_holds, failed_effects };
     });
   } finally { for (const lock of locks.reverse()) await lock.release(); }
   return { ...report, local_markers: await cleanupRetiredManagedMarkers(engine) };
@@ -320,9 +351,7 @@ export async function cleanupRetiredManagedMarkers(engine: BrainEngine): Promise
   const report: LocalMarkerReport = { state: 'cleared', removed: [], pending: [] };
   const [present] = await engine.executeRaw<{ present: boolean }>("SELECT to_regclass('persistence_topology_changes') IS NOT NULL AS present");
   if (!present?.present) return report;
-  const [brain] = await engine.executeRaw<{ brain_id: string; enabled: boolean; mode_epoch: string | null }>(
-    "SELECT brain_id, enabled, to_jsonb(persistence_brain)->>'mode_epoch' AS mode_epoch FROM persistence_brain WHERE singleton=1");
-  if (!brain) return report;
+  const brain = await readPersistenceBrain(engine);
   const current = Number(brain.mode_epoch ?? 1);
   const retired = await readRetired(engine, brain.brain_id);
   if (!retired.epochs.size && !retired.worktrees.size) return report;

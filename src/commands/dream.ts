@@ -407,9 +407,10 @@ Options:
                       unlike toggling the flag on/off around the run, a
                       crash mid-invocation can't leave it stuck. Applies to
                       patterns, synthesize, conversation_facts_backfill,
-                      enrich_thin, skillopt, drift; no-op on phases with no such
-                      gate. Requires an EXPLICIT --phase <name> — a phase
-                      implied by --input or --drain does not count (bare
+                      enrich_thin, skillopt, drift, lint, consolidate; no-op
+                      on phases with no such gate. Requires an EXPLICIT
+                      --phase <name> — a phase implied by --input or
+                      --drain does not count (bare
                       --once, or --once with --input/--drain and no
                       explicit --phase, is a usage error).
   --eval-run          Eval harness run: honor GBRAIN_DECIDE_SLOTS (e.g. triage=on)
@@ -657,6 +658,13 @@ async function runDrain(
       `[drain] ${result.failure_count} item failure(s)${omitted}${result.last_error ? `; last error: ${result.last_error}` : ''}\n`,
     );
   }
+  // #6503: cut items are not failures and not complete; say so once per drain.
+  if ((result.input_truncated ?? 0) > 0) {
+    process.stderr.write(
+      `[drain] ${result.input_truncated} item(s) cut at cycle.extract_atoms.max_input_chars: the model did not read their tail; ` +
+      'head atoms are kept, the items are not marked complete and are skipped until the cap rises (gbrain config set cycle.extract_atoms.max_input_chars <n>)\n',
+    );
+  }
   const { drainBudgetNotice, usd } = await import('../core/cycle/extract-atoms-budget-notice.ts');
   const budgetNotice = result.stopped === 'budget' ? drainBudgetNotice(result) : null;
   if (opts.json) {
@@ -861,6 +869,7 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     dryRun: opts.dryRun,
     pull: opts.pull,
     phases,
+    directPhases: phases !== undefined,
     // Undefined for legacy unscoped runs; set for explicit source cycles,
     // path-derived cycles, and bare default-like non-default source cycles.
     sourceId: resolvedSourceId,

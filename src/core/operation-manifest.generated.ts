@@ -30,7 +30,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "content_origin": {
         "type": "string",
@@ -130,6 +130,16 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "type": "string"
         },
         "description": "Or up to 50 names/codes at once: compact rows."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Read only this source. Default: your source first, then every source you can read.",
+        "fullSurfaceOnly": true
+      },
+      "prefer_source_id": {
+        "type": "string",
+        "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -189,7 +199,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "id": {
         "type": "string",
@@ -222,7 +232,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)"
     },
-    "description": "Read a page by slug. To edit, pass include_content:true and send `content` to put_page, or use edit_page.",
+    "description": "Read a page by slug. To edit: include_content:true, send `content` to put_page; or edit_page. >256 KB: outline+window, then `next`.",
     "params": {
       "slug": {
         "type": "string",
@@ -235,19 +245,95 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "include_content": {
         "type": "boolean",
-        "description": "Full markdown + revision, for editing."
+        "description": "Markdown + revision, to edit."
       },
       "content_only": {
         "type": "boolean",
         "description": "Round-trip fields only."
       },
+      "body": {
+        "type": "string",
+        "enum": [
+          "auto",
+          "full",
+          "none",
+          "outline",
+          "window"
+        ],
+        "description": "auto: whole up to 256 KB, else outline + window. none: revision + size.",
+        "fullSurfaceOnly": true
+      },
+      "lines": {
+        "type": "object",
+        "description": "Window: 1-based lines.",
+        "properties": {
+          "from": {
+            "type": "number",
+            "required": true
+          },
+          "count": {
+            "type": "number",
+            "required": true
+          }
+        },
+        "fullSurfaceOnly": true
+      },
+      "bytes": {
+        "type": "object",
+        "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
+        "properties": {
+          "offset": {
+            "type": "number",
+            "required": true
+          },
+          "length": {
+            "type": "number",
+            "required": true
+          }
+        },
+        "fullSurfaceOnly": true
+      },
+      "around_chunk_id": {
+        "type": "number",
+        "description": "Window around a search hit chunk_id.",
+        "fullSurfaceOnly": true
+      },
+      "context_lines": {
+        "type": "number",
+        "description": "Lines around around_chunk_id (20).",
+        "fullSurfaceOnly": true
+      },
+      "cursor": {
+        "type": "string",
+        "description": "next_cursor: read on.",
+        "fullSurfaceOnly": true
+      },
+      "max_bytes": {
+        "type": "number",
+        "description": "Window bytes (40000).",
+        "fullSurfaceOnly": true
+      },
+      "view": {
+        "type": "string",
+        "enum": [
+          "read",
+          "markdown"
+        ],
+        "description": "markdown: page the round-trip content.",
+        "fullSurfaceOnly": true
+      },
+      "outline_from": {
+        "type": "number",
+        "description": "Outline next_from_index.",
+        "fullSurfaceOnly": true
+      },
       "include_deleted": {
         "type": "boolean",
-        "description": "Include soft-deleted pages."
+        "description": "Soft-deleted too."
       },
       "include_timeline_entries": {
         "type": "boolean",
-        "description": "Also return timeline rows."
+        "description": "Timeline rows too."
       },
       "grammar_diagnostics": {
         "type": "boolean",
@@ -274,6 +360,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "known_as_of": {
+        "type": "string",
+        "fullSurfaceOnly": true,
+        "description": "Recorded time: the page as this brain had recorded it at this ISO 8601 instant (2026-10-01T12:00:00Z), from the belief ledger. Not as_of, which is valid time (a date)."
       }
     },
     "scope": "read",
@@ -306,7 +397,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "content_origin": {
         "type": "string",
@@ -332,6 +423,12 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "boolean",
         "required": false,
         "description": "Allow emptying the page."
+      },
+      "allow_shrink": {
+        "type": "boolean",
+        "required": false,
+        "description": "Allow content under half a >256 KB page.",
+        "fullSurfaceOnly": true
       },
       "drop_timeline": {
         "type": "boolean",
@@ -373,7 +470,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "delete_page",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
+    "description": "Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the warning names gbrain repair file-drift --prefer file, which imports the file's current content into the surviving page (sync holds that page file_drift rather than overwrite it). purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.",
     "params": {
       "source_id": {
         "type": "string",
@@ -389,7 +486,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "slug": {
         "type": "string",
@@ -415,7 +512,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "list_pages",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; a full page may be truncated: continue with updated_after + updated_after_slug from the last row.",
+    "description": "List pages with filters. For 'what's recent / what did I touch this week' use sort=updated_desc. Default 50 rows; truncated: continue with updated_after + updated_after_slug from the last row.",
     "params": {
       "type": {
         "type": "string",
@@ -435,7 +532,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "updated_after": {
         "type": "string",
-        "description": "Only pages updated after this ISO time."
+        "description": "Pages updated after this ISO time."
       },
       "updated_after_slug": {
         "type": "string",
@@ -471,7 +568,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "restore_page",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag.",
+    "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag. A restore that writes no file refuses (source_changed, detail canonical_file_absent) when the page's recorded file is gone from the checkout, because the next full sync would delete it again; the user chooses between putting the file back and detach: true.",
     "params": {
       "source_id": {
         "type": "string",
@@ -487,12 +584,16 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "slug": {
         "type": "string",
         "required": true,
         "description": "Slug of the soft-deleted page to restore, e.g. 'people/alice-example'."
+      },
+      "detach": {
+        "type": "boolean",
+        "description": "Restore a page whose recorded canonical file is gone from the checkout as a database-only page: it forgets the file, so sync never deletes it again. Only accepted when a plain restore refuses with canonical_file_absent; ask the user first."
       }
     },
     "mutating": true,
@@ -542,7 +643,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "capture",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. Use put_page to control slug or type; remember for facts about entities.",
+    "description": "Quick note (\"just remember this\"): slugged under inbox/ by date + content hash, so recapturing is idempotent. put_page controls slug or type; remember is for facts about entities.",
     "params": {
       "source_id": {
         "type": "string",
@@ -558,7 +659,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "content_origin": {
         "type": "string",
@@ -590,6 +691,24 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         "type": "string",
         "description": "Event depth page to link."
       },
+      "source_kind": {
+        "type": "string",
+        "required": false,
+        "fullSurfaceOnly": true,
+        "description": "Trusted local CLI provenance (capture-cli); a remote caller's value is replaced by the server-stamped mcp:capture."
+      },
+      "source_uri": {
+        "type": "string",
+        "required": false,
+        "fullSurfaceOnly": true,
+        "description": "Trusted local CLI provenance (stdin, cli-positional); a remote caller's value is replaced by the server-stamped mcp:capture."
+      },
+      "ingested_via": {
+        "type": "string",
+        "required": false,
+        "fullSurfaceOnly": true,
+        "description": "Trusted local CLI provenance (capture-cli); a remote caller's value is replaced by the server-stamped mcp:capture."
+      },
       "content": {
         "type": "string",
         "required": true,
@@ -608,7 +727,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "type": {
         "type": "string",
         "required": false,
-        "description": "Schema-pack page type (default note)."
+        "description": "Page type (default note)."
       }
     },
     "scope": "write",
@@ -625,7 +744,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)"
     },
-    "description": "Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). Pass the id unchanged; it does not grant access. Legacy slug ids work only when unambiguous within your current read scope. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown. For fuzzy slugs, soft-delete recovery, or lossless edit round-trips, use get_page.",
+    "description": "Fetch the full text of one search result by its opaque, source-qualified `id` (OpenAI deep-research contract: the search/fetch pair). Pass the id unchanged; it does not grant access. Legacy slug ids work only when unambiguous within your current read scope. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown; a page over 256 KB returns the window around the searched chunk instead, with metadata.total_bytes and metadata.next_id (fetch it to read on). For fuzzy slugs, soft-delete recovery, or lossless edit round-trips, use get_page.",
     "params": {
       "id": {
         "type": "string",
@@ -676,7 +795,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "expected_revision": {
         "type": "string",
         "required": true,
-        "description": "revision from get_page include_content:true."
+        "description": "From get_page include_content:true."
       },
       "edits": {
         "type": "array",
@@ -688,7 +807,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
             "old_text": {
               "type": "string",
               "required": true,
-              "description": "Exact text to replace (must occur once)."
+              "description": "Exact text to replace."
             },
             "new_text": {
               "type": "string",
@@ -704,7 +823,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       }
     },
     "mutating": true,
@@ -741,6 +860,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
               "type": "boolean",
               "description": "Allow emptying a non-empty page."
             },
+            "allow_shrink": {
+              "type": "boolean",
+              "description": "Allow content under half a >256 KB page."
+            },
             "drop_timeline": {
               "type": "boolean",
               "description": "Content without a Timeline section deletes its dated entries."
@@ -773,7 +896,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "get_write_request",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Read your write's receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.",
+    "description": "Your write's receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.",
     "params": {
       "request_id": {
         "type": "string",
@@ -795,7 +918,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "list_write_requests",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "List your write receipts in one source, newest first. Use when a request_id was lost.",
+    "description": "Your write receipts in one source, newest first (for a lost request_id).",
     "params": {
       "source_id": {
         "type": "string",
@@ -808,7 +931,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "before": {
         "type": "string",
-        "description": "next cursor from the previous page."
+        "description": "Previous page's next cursor."
       }
     },
     "scope": "write",
@@ -819,10 +942,37 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     }
   },
   {
+    "name": "list_write_conflicts",
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Pages whose writes keep ending in a source_changed conflict, grouped by slug.",
+    "params": {
+      "source_id": {
+        "type": "string",
+        "description": "Default: yours."
+      },
+      "limit": {
+        "type": "number",
+        "default": 25,
+        "description": "1-100 slugs (default 25)."
+      },
+      "cursor": {
+        "type": "string",
+        "description": "Previous page's next."
+      }
+    },
+    "scope": "read",
+    "mutating": false,
+    "area": "pages",
+    "cliHints": {
+      "name": "write-conflicts"
+    }
+  },
+  {
     "name": "cancel_write_request",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Cancel your accepted write before it publishes. Returns the actual receipt.",
+    "description": "Cancel your accepted write before it publishes; returns the receipt.",
     "params": {
       "request_id": {
         "type": "string",
@@ -844,7 +994,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "search",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.",
+    "description": "Cheap hybrid search, no LLM expansion, top 20: exact tokens, names, field values. NOT proof of coverage; match: \"keyword\" pages every keyword match and takes OR across quoted names or codes (\"A\" OR \"B\" OR …): one call lists every page matching any. Name lists: entity names. Concepts/landscape or people/companies/projects by topic: `query`; lists: list_pages; personal: get_recent_salience. return_unit: sections or conversations. fields: \"full\" adds diagnostics.",
     "params": {
       "query": {
         "type": "string",
@@ -963,7 +1113,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "query",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Hybrid search plus multi-query expansion for concept/landscape questions (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
+    "description": "Hybrid search for concept/landscape questions and people/companies/projects by topic; expand adds multi-query expansion (expansion recovers synonyms). Still top-K; return_unit: sections or conversations. Lists: list_pages. Exact tokens: `search` is cheaper (no LLM call). Personal: get_recent_salience, find_anomalies; transcripts: `gbrain transcripts recent`. Do NOT assume 'crazy' means impressive (often difficult or emotionally charged). Needs an embedding key (else keyword-only); expansion needs a chat key. Fact rows: use follow_up. fields: \"full\" adds diagnostics.",
     "params": {
       "query": {
         "type": "string",
@@ -1018,7 +1168,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "expand": {
         "type": "boolean",
-        "description": "Default true; false skips the LLM expansion."
+        "description": "Default off; search.expansion overrides."
       },
       "detail": {
         "type": "string",
@@ -1341,7 +1491,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -1383,7 +1533,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -1649,7 +1799,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Link provenances in the brain (e.g. markdown, manual) with edge counts.",
+    "description": "Link provenances (e.g. markdown, manual) with their edge counts.",
     "params": {},
     "scope": "read",
     "cliHints": {
@@ -1662,7 +1812,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Walk the link graph from a page. Remote callers get bidirectional paths at depth 2 by default.",
+    "description": "Walk the link graph from a page. Remote default: both directions, depth 2.",
     "params": {
       "slug": {
         "type": "string",
@@ -1675,7 +1825,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "link_type": {
         "type": "string",
-        "description": "Follow only this link type."
+        "description": "Only this link type."
       },
       "direction": {
         "type": "string",
@@ -1755,11 +1905,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "add_timeline_entry",
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Append a dated entry to a page timeline. Replaying the same entry changes nothing. A page's Timeline section needs no call.",
+    "description": "Append a dated entry to a page timeline. Replays change nothing; the Timeline section needs no call. To change or remove one, edit its bullet via edit_page with expected_revision.",
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -1788,11 +1938,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "detail": {
         "type": "string",
-        "description": "Longer text."
+        "description": "Details."
       },
       "source": {
         "type": "string",
-        "description": "Provenance slug or URL."
+        "description": "Source slug or URL."
       }
     },
     "mutating": true,
@@ -1812,7 +1962,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Get timeline entries for a page, optionally filtered by date window",
+    "description": "Get timeline entries for a page, optionally filtered by date window. To change or remove an entry, edit its bullet in the page's Timeline section with edit_page (expected_revision from get_page include_content:true): the row follows the page.",
     "params": {
       "slug": {
         "type": "string",
@@ -1893,10 +2043,35 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface).",
-    "params": {},
+    "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface). tier \"ops\": only the operational sections under a 4 s deadline; only: just the named checks.",
+    "params": {
+      "tier": {
+        "type": "string",
+        "enum": [
+          "ops"
+        ],
+        "description": "ops: capacity, write failures, embedding state, sync movement, compaction, serve build and schema pack, under one 4 s deadline. Omit for the focused remote report."
+      },
+      "only": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Run just these checks (doctor check names, for example persistence_capacity)."
+      }
+    },
     "scope": "admin",
     "localOnly": false,
+    "area": "admin"
+  },
+  {
+    "name": "get_brain_health",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. No slugs. Cached 60 s.",
+    "params": {},
+    "scope": "read",
     "area": "admin"
   },
   {
@@ -1906,7 +2081,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "full page version snapshots by slug; a page read governed by visibility like get_page (CEO-17)"
     },
-    "description": "Page version history, newest snapshot first. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). `limit` returns only the newest N; `include_body: false` returns metadata only.",
+    "description": "Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest 20 versions by default. Pass include_body: true for each version's compiled_truth and timeline, and a larger limit (at most 100 over MCP) for older versions. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). revert_version takes the id field.",
     "params": {
       "slug": {
         "type": "string",
@@ -1915,11 +2090,26 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "limit": {
         "type": "number",
-        "description": "Return only the newest N versions (a positive integer). Omit for the full history."
+        "description": "Return only the newest N versions (a positive integer). Default 20; MCP callers are capped at 100."
       },
       "include_body": {
         "type": "boolean",
-        "description": "false omits compiled_truth and timeline from every version (metadata only). Default true."
+        "description": "true adds compiled_truth and timeline to every version. Default false (metadata only)."
+      },
+      "known_as_of": {
+        "type": "string",
+        "fullSurfaceOnly": true,
+        "description": "Recorded time: the validity intervals this brain had recorded by this ISO 8601 instant, from the belief ledger. Not as_of, which is valid time (a date)."
+      },
+      "diff": {
+        "type": "boolean",
+        "fullSurfaceOnly": true,
+        "description": "With known_as_of: each version also carries a unified diff from the version before it."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "With known_as_of: the source.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -1951,7 +2141,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "slug": {
         "type": "string",
@@ -1980,7 +2170,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, and page/chunk counts. Read-scope.",
+    "description": "Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, page/chunk counts and capabilities (large_pages_v1: windowed get_page). Read-scope.",
     "params": {},
     "scope": "read",
     "area": "identity"
@@ -2081,7 +2271,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "limit": {
         "type": "number",
-        "description": "Version 2 page size (1-100)."
+        "description": "Page size or rank cap (1-100)."
       },
       "cursor": {
         "type": "string",
@@ -2094,6 +2284,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "section": {
         "type": "string",
         "description": "Only this routing section."
+      },
+      "query": {
+        "type": "string",
+        "description": "Version 1 host catalog: rank skills by word overlap with this task (name, triggers, description), drop the rest, cap at limit (default 10). Refused on a shared catalog.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -2123,7 +2318,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "expected_brain_id": {
         "type": "string",
-        "description": "Version 2 brain id to assert."
+        "description": "Brain id to assert."
       },
       "source_incarnation": {
         "type": "string",
@@ -2143,7 +2338,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "source_id": {
         "type": "string",
-        "description": "Fetch a brain-resident pack skill from this source."
+        "description": "Brain-resident pack skill from this source."
       }
     },
     "scope": "read",
@@ -2162,7 +2357,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions"
     },
-    "description": "Skillpacks this brain ships, with skills and a scaffold spec to offer the user.",
+    "description": "Skillpacks this brain ships: skills and a scaffold spec to offer the user.",
     "publishGateKey": "mcp.publish_skills",
     "params": {},
     "scope": "read",
@@ -2200,7 +2395,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
   },
   {
     "name": "get_skill_asset",
-    "description": "Read an approved file from an exact skill revision (data only; never executed).",
+    "description": "Read an approved file from an exact skill revision (data, never executed).",
     "mutating": false,
     "idempotent": true,
     "outputRedaction": {
@@ -2797,7 +2992,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "partial": {
         "type": "string",
         "required": true,
-        "description": "Partial slug or title, e.g. 'alice-ex'."
+        "description": "Partial slug or title."
       },
       "source_id": {
         "type": "string",
@@ -2814,7 +3009,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit chunk read by slug, the page-read twin of get_page (CEO-17 raw-read exception)"
     },
-    "description": "Return a page's indexed content chunks (the units search ranks). Use when debugging why search did or did not match a page. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+    "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: the last chunk of a cut list carries truncated: true and next_from_index, _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
     "params": {
       "slug": {
         "type": "string",
@@ -2833,6 +3028,14 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "from_index": {
+        "type": "number",
+        "description": "Return chunks from this chunk_index on (a non-negative integer). Default 0."
+      },
+      "limit": {
+        "type": "number",
+        "description": "How many chunk_index positions to return (a positive integer). Default 50; MCP callers are capped at 500."
       }
     },
     "scope": "read",
@@ -2877,7 +3080,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Recent ingestion log entries. Use when checking what was already imported.",
+    "description": "Recent ingestion log entries: what was already imported, and when.",
     "params": {
       "limit": {
         "type": "number",
@@ -3511,6 +3714,18 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "until": {
         "type": "string",
         "description": "Window end (YYYY-MM-DD)"
+      },
+      "group_by": {
+        "type": "string",
+        "enum": [
+          "holder",
+          "source"
+        ],
+        "description": "Trusted local CLI only: per-group journal statistics"
+      },
+      "min_n": {
+        "type": "number",
+        "description": "Trusted local CLI only: groups with fewer resolved predictions are flagged low_n (default 10)"
       }
     },
     "cliHints": {
@@ -3548,7 +3763,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -3618,7 +3833,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -3672,7 +3887,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -3742,7 +3957,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -3817,7 +4032,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "expected_revision": {
         "type": "string",
@@ -3859,7 +4074,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "slug": {
         "type": "string",
@@ -4046,7 +4261,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "request_tools",
     "idempotent": false,
     "outputRedaction": "no_stored_text",
-    "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per OAuth client or stdio session).",
+    "description": "More tools: no arguments lists your catalog; {tools: [names]} returns schemas; {surface} widens it (per client or stdio session).",
     "area": "discovery",
     "agentCallable": true,
     "params": {
@@ -4056,7 +4271,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "type": "string",
           "description": "A tool name from the catalog."
         },
-        "description": "Tool names to fetch schemas for."
+        "description": "Tool names to fetch."
       },
       "surface": {
         "type": "string",
@@ -4089,7 +4304,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "slugPrefix": {
         "type": "string",
-        "description": "Slug prefix, e.g. 'wiki/people'."
+        "description": "Slug prefix."
       },
       "recency_bias": {
         "type": "string",
@@ -4795,7 +5010,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior."
+        "description": "Reuse only to retry. Managed extraction returns durable receipts; when omitted, each call gets a new UUID. Unmanaged extraction retains its legacy non-journaled behavior."
       },
       "turn_text": {
         "type": "string",
@@ -4845,7 +5060,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ]
       }
     },
-    "description": "MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.",
+    "description": "MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.",
     "params": {
       "entity": {
         "type": "string",
@@ -4873,7 +5088,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "source_id": {
         "type": "string",
-        "description": "One source you may read."
+        "description": "One readable source."
       },
       "since": {
         "type": "string",
@@ -4885,7 +5100,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "include_expired": {
         "type": "boolean",
-        "description": "Include expired."
+        "description": "Also expired; question ranks them."
       },
       "supersessions": {
         "type": "boolean",
@@ -4916,7 +5131,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "return_window": {
         "type": "number",
-        "description": "Window size 1-3."
+        "description": "Window 1-3."
       },
       "min_trust": {
         "type": "string",
@@ -4963,7 +5178,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "since": {
         "type": "string",
-        "description": "Only open-thread events after this ISO time."
+        "description": "Open-thread events after this ISO time."
       },
       "session_id": {
         "type": "string",
@@ -4989,6 +5204,46 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "include_quarantined": {
         "type": "boolean",
         "description": "Admin or memory_confirm: quarantined cards.",
+        "fullSurfaceOnly": true
+      },
+      "counterparty": {
+        "type": "string",
+        "description": "Person or company (name or slug): adds a pulled brief of dated items about them.",
+        "fullSurfaceOnly": true
+      },
+      "intent": {
+        "type": "string",
+        "enum": [
+          "meeting",
+          "reply"
+        ],
+        "description": "With counterparty: the task the brief is for.",
+        "fullSurfaceOnly": true
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Resolve entities in this source only. Default: your source first, then every source you can read.",
+        "fullSurfaceOnly": true
+      },
+      "entity_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string"
+            },
+            "slug": {
+              "type": "string"
+            }
+          }
+        },
+        "description": "Source-qualified entities: [{\"source_id\":\"wiki\",\"slug\":\"people/alice-example\"}].",
+        "fullSurfaceOnly": true
+      },
+      "prefer_source_id": {
+        "type": "string",
+        "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
         "fullSurfaceOnly": true
       }
     },
@@ -5056,6 +5311,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "beliefs": {
+        "type": "boolean",
+        "fullSurfaceOnly": true,
+        "description": "Add `beliefs`: each belief that changed in the window, before and after, with cause and evidence (belief ledger); entities narrows it."
       }
     },
     "scope": "read",
@@ -5077,7 +5337,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "id": {
         "type": "number",
@@ -5102,7 +5362,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "params": {
       "request_id": {
         "type": "string",
-        "description": "Optional; reuse only to retry."
+        "description": "Reuse only to retry."
       },
       "id": {
         "type": "number",
@@ -5229,7 +5489,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. Remote or source-scoped callers receive {contradictions: [], note} with an availability note. For eligible local callers, return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. An eligible read loads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
+    "description": "Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. Remote, source-scoped or min_trust callers get only findings whose two sides they can read now (each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. Reads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
     "scope": "read",
     "params": {
       "slug": {
@@ -5248,6 +5508,19 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "limit": {
         "type": "number",
         "description": "Max findings to return. Default 20."
+      },
+      "min_trust": {
+        "type": "string",
+        "enum": [
+          "user_confirmed",
+          "operator_curated",
+          "tool_observed",
+          "agent_written",
+          "unknown",
+          "external_untrusted"
+        ],
+        "description": "Lowest trust tier to return (the connection floor still applies).",
+        "fullSurfaceOnly": true
       }
     },
     "cliHints": {
@@ -5838,7 +6111,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in no_counterparty (null when none). Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command.",
+    "description": "The open-loop engine's killer output: who is waiting on you, what you promised, and the context needed to respond. Grouped by counterparty (default, ranked; each group shows at most 5 loops, the rest counted in loops_omitted) or flat. Loops that name no counterparty are never ranked as a person: they come back in no_counterparty (null when none). Loops come from the deterministic Gmail thread-state detector and the LLM commitment extractor. Remote callers get redacted evidence (no verbatim quotes); trusted local callers also get quotes, Gmail deep links, entity-card context, and a pre-rendered text digest. Carries google-source freshness (stale flag) and completeness: when it is \"partial\", some mail in the window is held after repeated import failures; present the answer as partial and name the held items and their retry command. The grouped view also returns withheld_noise (null when none): open reply-owed loops from senders whose mail the detector now treats as automated, with a per-sender preview_command for closing them.",
     "params": {
       "group_by": {
         "type": "string",
@@ -5941,7 +6214,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "loops_mute",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind \"never track this sender\". Existing loops keep their state.",
+    "description": "Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback primitive behind \"never track this sender\". It also closes that sender's (or thread's) open reply-owed (unanswered_inbound) loops as dropped with closed_by \"muted\" and lists their ids in `closed`; other loop types keep their state. dry_run lists `would_close` and changes nothing. loops_unmute re-checks the closed loops.",
     "params": {
       "kind": {
         "type": "string",
@@ -5970,7 +6243,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "name": "loops_unmute",
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. Exact-match only. Does not reopen loops closed while the mute was in place.",
+    "description": "Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for it again. Exact-match only. The reply-owed loops the mute closed (unless another mute still covers them) are queued for re-check on the next Gmail sync and listed in `requeued`: a loop reopens only when nothing answered its thread since the mute. `unverifiable` lists closed loops with no thread to re-check (they stay closed); `stale_source` means the re-check waits on a sync that has not run in 24h. Manually closed loops are never touched. dry_run lists `would_requeue` and changes nothing.",
     "params": {
       "kind": {
         "type": "string",
@@ -6160,12 +6433,12 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": true,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Mute a coaching or info notice (or first_run_decisions) for this client; muted: false unmutes.",
+    "description": "Mute a coaching or info notice (or first_run_decisions) for this client.",
     "params": {
       "code": {
         "type": "string",
         "required": true,
-        "description": "Notice code, the word after `[gbrain notice` in the block."
+        "description": "The word after `[gbrain notice` in the block."
       },
       "muted": {
         "type": "boolean",

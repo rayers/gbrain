@@ -36,6 +36,15 @@ the `onpoisoned(status)` option (#5730). Cancellation
 must settle or retire the connection before another query can own it. This
 is necessary for worker admission, query timeout and lease-release safety.
 See issues #5466 and #5560 and `test/e2e/persistence-chaos.test.ts`.
+Reserved and transaction owners also expose `cancelAndDiscard({ timeout })`
+(#6598): a Terminate cannot interrupt the statement already running on a busy
+socket, so it sends the fenced statement's CancelRequest first, refuses new and
+queued statements while it waits for that statement to settle, then discards.
+It rejects `CANCEL_UNCONFIRMED` when the statement does not settle within
+`timeout` (default 2000 ms) or was not fenced, so a socket close is never
+reported as a confirmed server stop
+(`test/postgres-transaction-cancel-order.test.ts`,
+`test/e2e/transaction-cancel-held-lock.test.ts`).
 
 A statement that fails to build is answered in its place in the pipeline
 (#6383; the approach of upstream PR porsager/postgres#1236, which fixes
@@ -73,6 +82,13 @@ recreated under a new oid; a statement that fails forgets its shared types, and
 to share types in: GBrain passes one per database target, so every pool in a
 process that reaches one database shares it, and `src/core/pg-type-cache.ts`
 saves it for the next process.
+
+Each statement's row count resets at its ReadyForQuery. Stock postgres.js
+resets it only at CommandComplete. A statement that streams rows and then fails
+never gets there: a runtime error after its first rows, or a cancel or timeout
+while it is still producing them. The next statement on that connection then
+stored its rows after that many empty slots, so a one-row read came back as
+`[empty, row]` (`test/e2e/postgres-driver-row-count-postgres.test.ts`).
 
 ## Reproduce and update
 
