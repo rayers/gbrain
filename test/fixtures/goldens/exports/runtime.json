@@ -228,6 +228,7 @@
         "batchRetry",
         "connRetry",
         "connect",
+        "connectedDatabaseUrl",
         "consolidateFact",
         "countChunklessPagesWithContent",
         "countKeywordPages",
@@ -358,6 +359,7 @@
         "readPageSnapshot",
         "readPageSnapshotsBatch",
         "readSegmentTexts",
+        "readTransaction",
         "reconnect",
         "refreshPageBody",
         "registerBeforeDisconnect",
@@ -447,6 +449,7 @@
         "splitBody"
       ],
       "./ai/gateway": [
+        "AI_CHAT_TIMEOUT_MS",
         "DEFAULT_EMBEDDING_DIMENSIONS",
         "DEFAULT_EMBEDDING_MODEL",
         "DEFAULT_MAX_OUTPUT_TOKENS",
@@ -537,6 +540,7 @@
         "sdkInvocationUsage",
         "withAIAttribution",
         "withAIInvocationGuard",
+        "withAIInvocationMeter",
         "withAIInvocationPreflight"
       ],
       "./backoff": [
@@ -552,6 +556,7 @@
         "DB_MERGED_PROVIDER_KEY_FIELDS",
         "KNOWN_CONFIG_KEYS",
         "KNOWN_CONFIG_KEY_PREFIXES",
+        "MERGED_CONFIG_BY_ENGINE",
         "configDir",
         "configPath",
         "dotenvValuesForKey",
@@ -921,6 +926,7 @@
         "DEGRADED_CACHE_TTL_SECONDS",
         "PRE_FUSION_POOL_FLOOR",
         "RRF_K",
+        "SUPERSEDE_EDGE_PROBE_SQL",
         "SUPERSEDE_PENALTY",
         "_resetPendingSearchCacheWritesForTests",
         "_resetSupersedeProbeForTests",

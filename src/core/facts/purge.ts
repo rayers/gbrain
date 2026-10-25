@@ -346,8 +346,9 @@ export async function redactPageVersions(tx: BrainEngine, sourceId: string, clai
 /**
  * Wave B (spec 11), after the body and version rewrites: stagings holding the claim are aborted (their upload parts
  * deleted, requests that reference them cancelled with purged_content), closed manifest rows outside every GC root
- * go, and every segment text the rewrites replaced, or that still holds the claim, is deleted once nothing
- * references it, in this transaction (purge never waits for GC). A live staging that recorded such a text was aborted
+ * go, and every segment text the rewrites replaced, or that still holds the claim (plain, or as a fence cell stores it:
+ * escapeFenceCell, the forms stagingsHoldingClaim matches), is deleted once nothing references it, in this transaction
+ * (purge never waits for GC). A live staging that recorded such a text was aborted
  * by the plan (`stagingsHoldingClaim`), so no write in flight still needs it. The restore-time purge replay runs it too.
  */
 export async function purgeSegmentStorage(tx: BrainEngine, sourceId: string, claim: string, plan: Pick<PurgePlan, 'stagings' | 'held'>, pageIds: number[],
@@ -366,8 +367,9 @@ export async function purgeSegmentStorage(tx: BrainEngine, sourceId: string, cla
   if (pageIds.length) await tx.executeRaw('DELETE FROM page_view_digests WHERE page_id=ANY($1::int[])', [pageIds]);
   const texts = (await tx.executeRaw(`DELETE FROM page_segment_texts d WHERE (d.source_id,d.sha256) IN (SELECT t.source_id,t.sha256 FROM page_segment_texts t
       WHERE t.source_id=$1 AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id=t.source_id AND m.sha256=t.sha256) OFFSET 0)
-    AND (d.sha256=ANY(SELECT decode(h,'hex') FROM unnest($2::text[]) AS h) OR strpos(lower(convert_from(d.body,'UTF8')),$3)>0) RETURNING 1`,
-  [sourceId, replaced.map(sha => Buffer.from(sha).toString('hex')), claim.toLowerCase()])).length;
+    AND (d.sha256=ANY(SELECT decode(h,'hex') FROM unnest($2::text[]) AS h) OR strpos(lower(convert_from(d.body,'UTF8')),$3)>0
+      OR strpos(lower(convert_from(d.body,'UTF8')),$4)>0) RETURNING 1`,
+  [sourceId, replaced.map(sha => Buffer.from(sha).toString('hex')), claim.toLowerCase(), escapeFenceCell(claim).toLowerCase()])).length;
   return { texts, stagings: plan.stagings.length, parts, cancelled };
 }
 
@@ -524,6 +526,7 @@ export async function submitPurgeFactMutation(ctx: OperationContext, params: Rec
       const inline = pageIds.filter(id => !bodies.segmented.includes(id));
       const chunks = inline.length ? (await tx.executeRaw('DELETE FROM content_chunks WHERE page_id=ANY($1::integer[]) RETURNING 1', [inline])).length : 0;
       const versions = await redactPageVersions(tx, p.sourceId, current.fact, pageIds);
+      const ledger = await (await import('../generations/ledger-scrub.ts')).scrubGenerationLedger(tx, p.sourceId, { needles: [current.fact] });
       prose = versions.prose;
       const segments = await purgeSegmentStorage(tx, p.sourceId, current.fact, plan, [...new Set([...bodies.segmented, ...versions.segmentedPages])],
         [...bodies.replaced, ...versions.replaced], admitted.id);
@@ -538,7 +541,7 @@ export async function submitPurgeFactMutation(ctx: OperationContext, params: Rec
         commit_subject: `gbrain: purge fact ${token}`, commit_line: `purge fact ${token}`,
         targets: pages.map(page => ({ slug: page.slug, page_id: Number(page.id), revision: page.knowledge_revision })) })]);
       counts = { facts, takes, chunks, page_versions: versions.redacted, pages: rewritten.length, persistence_requests: intents,
-        query_cache: cache, decide_review: review, open_loops: loops, take_proposals: proposals, core_edit_notices: notices,
+        query_cache: cache, decide_review: review, open_loops: loops, take_proposals: proposals, core_edit_notices: notices, ...ledger,
         write_gate_holds: holdIds.length, write_gate_receipts: gateReceipts, page_segment_texts: segments.texts,
         page_body_stagings: segments.stagings, page_body_staging_parts: segments.parts, persistence_requests_cancelled: segments.cancelled,
         derived_hidden: Object.values(derived.hidden).reduce((a, b) => a + b, 0) };

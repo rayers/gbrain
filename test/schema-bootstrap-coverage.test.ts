@@ -1103,6 +1103,15 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // v178/v198/v217: migration-created on PGLite, no index references the
   // column, and every reader treats a missing value as 0 attempts.
   'persistence_requests.preparation_attempts',
+  // Large-pages hardening (migration v261) — transient retry budget. Same posture as
+  // v178/v198/v217/v220: migration-created on PGLite, no index references the columns,
+  // and every reader treats a missing value as 0 interruptions and no backoff.
+  'persistence_requests.transient_interruptions',
+  'persistence_requests.next_attempt_at',
+  // GBRA-133 (migration v268) — owner stamp of an effect claim. Same posture: persistence_effects is
+  // migration-created on PGLite, no index references the column, and every reader treats NULL as an
+  // unstamped claim (never provably dead, so it keeps its lease).
+  'persistence_effects.claim_owner',
   // Cat 40 Hard F6 (migration v238) — the client's original request_id. Same
   // posture as v178/v198: persistence_requests is migration-created on PGLite,
   // no index references the column, and every reader treats NULL as "sent a UUID or nothing".

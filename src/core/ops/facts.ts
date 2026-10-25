@@ -40,7 +40,8 @@ import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
 import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
 import type { SearchResult } from '../types.ts';
-import type { BrainEngine, FactRow } from '../engine.ts';
+import { MAX_SEARCH_LIMIT, type BrainEngine, type FactRow } from '../engine.ts';
+import { collapseFactReads } from '../facts/capture-dedup.ts';
 import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
 import { hasScope } from '../scope.ts';
 import { renderTrustedText } from '../eligibility/labels.ts';
@@ -50,7 +51,7 @@ import { activationSuppressionNotice, suppressionSummary } from '../eligibility/
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
-import { parseRelativeSince } from '../facts/since-parse.ts';
+import { parseSinceParam } from '../facts/since-parse.ts';
 import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
@@ -109,8 +110,8 @@ const extract_facts: Operation = {
     // [ENG-8] Explicit caller value wins; UNSET resolves through the shared
     // facts.default_visibility helper (the old ternary coerced unset →
     // 'private' before any config default could run). Garbage stays 'private'.
-    const { resolveVisibilityParam } = await import('../facts/visibility.ts');
-    const visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
+    const { resolveVisibilityParam, tightenToPage } = await import('../facts/visibility.ts');
+    let visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
     // #4206: optional event-time + provenance threading. An unparseable
     // valid_from fails LOUD — silently defaulting to now() is exactly the
@@ -129,6 +130,12 @@ const extract_facts: Operation = {
       typeof p.source_slug === 'string' && p.source_slug.trim().length > 0
         ? p.source_slug.trim()
         : undefined;
+    // A turn taken from a private page yields private facts, even when the caller asked for world. A remote caller's
+    // facts are also private when it cannot see the source page, so a hidden page and a missing one look the same.
+    if (visibility === 'world' && sourceSlug) {
+      const origin = await ctx.engine.readPageSnapshot(sourceSlug.replace(/\.md$/, ''), { sourceId });
+      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin?.page);
+    }
 
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
@@ -338,7 +345,7 @@ const recall: Operation = {
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
-    type FactRows = Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>;
+    type FactRows = Array<Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>[number] & { entity_slugs?: string[]; collapsed_count?: number }>;
     type FactRowItem = FactRows[number];
     // Per-arm merge key: each arm's engine query ORDERs by a different column
     // (supersessions by COALESCE(expired_at, valid_until) — #3014, entity by
@@ -357,7 +364,7 @@ const recall: Operation = {
         k: toTime(keyOf(r as unknown as Record<string, unknown>)),
       }));
       decorated.sort((a, b) => b.k - a.k);
-      return decorated.slice(0, limit).map(d => d.r);
+      return decorated.slice(0, MAX_SEARCH_LIMIT).map(d => d.r);
     };
     const byCreated = (rec: Record<string, unknown>) => rec.created_at ?? rec.since_date;
     // The since-arms below pass eventTime:true (COALESCE(valid_from,
@@ -390,7 +397,7 @@ const recall: Operation = {
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
       activeOnly: !includeExpired,
-      limit,
+      limit: MAX_SEARCH_LIMIT,
       visibility, excludePrivate,
       grep: grep ?? undefined,
       excludeAuditRows: true, eligibility,
@@ -423,7 +430,7 @@ const recall: Operation = {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       const resolvedLists = await Promise.all(factSources.map(async (src) => {
         const entitySlug = entityParam ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam) : undefined;
-        const rows = await readEntityFacts(ctx, src, entitySlug, limit,
+        const rows = await readEntityFacts(ctx, src, entitySlug, MAX_SEARCH_LIMIT,
           s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
         return { slug: entitySlug, rows };
       }));
@@ -433,7 +440,7 @@ const recall: Operation = {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
       const resolvedLists = await Promise.all(factSources.map(async (src) => {
         const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
-        return { slug, rows: await readEntityFacts(ctx, src, slug, limit, s => ctx.engine.listFactsByEntity(src, s!, listOpts)) };
+        return { slug, rows: await readEntityFacts(ctx, src, slug, MAX_SEARCH_LIMIT, s => ctx.engine.listFactsByEntity(src, s!, { ...listOpts, sessionId: sessionParam ?? undefined })) };
       }));
       ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
       rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
@@ -468,6 +475,8 @@ const recall: Operation = {
       rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
     }
 
+    // #7043: copies of one claim (the fact arms read MAX_SEARCH_LIMIT rows) collapse after the visibility filters, before the limit cut.
+    if (!ranking) rows = (await collapseFactReads(ctx.engine, rows)).slice(0, limit);
     // v0.32: optional pending-consolidation count piggy-backed on the recall
     // response. Single round trip on thin-client; omitted when not requested
     // so existing callers see no shape change. Sums over the SAME factSources
@@ -603,6 +612,7 @@ const recall: Operation = {
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
+        ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
         ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
       })), f => f.id)),
       total: packedFacts.length,
@@ -1355,37 +1365,7 @@ export function clampRecallLimit(raw: unknown): number {
   return Math.min(raw, 100);
 }
 
-/**
- * Parse a `since` parameter into a Date. Accepts ISO 8601, plain duration
- * shorthand ("8 hours ago", "3 days ago", "30m", "1h", "2d", "7d"), Unix
- * epoch millis, or a relative phrase (since-parse.ts: "6 weeks ago",
- * "last month"). Returns null on unparseable input.
- */
-export function parseSinceParam(raw: unknown): Date | null {
-  if (raw == null) return null;
-  if (typeof raw === 'number' && Number.isFinite(raw)) return new Date(raw);
-  if (typeof raw !== 'string') return null;
-  const s = raw.trim();
-  if (!s) return null;
-
-  // Try ISO first.
-  const iso = Date.parse(s);
-  if (Number.isFinite(iso)) return new Date(iso);
-
-  // "N (minutes|hours|days) ago" or compact forms.
-  const ago = s.match(/^(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hr|hours?|d|days?)(?:\s+ago)?$/i);
-  if (ago) {
-    const n = parseInt(ago[1], 10);
-    const unit = ago[2].toLowerCase();
-    const ms =
-      unit.startsWith('s') ? n * 1000 :
-      unit.startsWith('m') ? n * 60 * 1000 :
-      unit.startsWith('h') ? n * 60 * 60 * 1000 :
-      n * 24 * 60 * 60 * 1000;
-    return new Date(Date.now() - ms);
-  }
-  return parseRelativeSince(s);
-}
+export { parseSinceParam } from '../facts/since-parse.ts';
 
 /**
  * MEMORY_VERBS v1 — parse the `remember` verb's `ttl` param into a
