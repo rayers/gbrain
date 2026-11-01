@@ -59,6 +59,7 @@ import { nativeFileTarget } from './native-file-target.ts';
 import { sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { isLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { planPageEmbedding } from '../page-embedding-budget.ts';
+import { acquirePageEmbeddingLease, pageEmbeddingLeaseUnavailable } from '../page-embedding-lease.ts';
 import { chunkGenerationFilter, chunkManifestReads } from '../search/safe-chunks.ts';
 import { classifyItemFailure, ItemRun } from '../item-failure.ts';
 
@@ -89,6 +90,8 @@ export interface EffectWorkerOptions {
   embedding?: { signature: string; model: string; embed: typeof embedBatch };
   /** GBRA-133: owner keys the consumer proved dead (`deadOwnerClaims`); their running effects are claimed before the lease lapses. */
   deadOwners?: readonly string[];
+  /** How long a pass waits for a contended worktree (default EFFECT_LOCK_WAIT_MS); production never supplies this. */
+  lockWaitMs?: number;
 }
 
 export async function selectedEffectPage(engine: BrainEngine, effect: PersistenceEffect): Promise<PageSnapshot | null> {
@@ -454,6 +457,13 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
   const segmented = await readSegmentedEmbedPage(engine, { id: snapshot.page.id });
   if (segmented) { await embedSegmentedEffect(engine, config, effect, snapshot, segmented, signature, opts); return; }
   await faultPoint('effect:embedding:page_read', { effectId: effect.id, requestId: effect.request_id, sourceId: effect.source_id });
+  // A stale drain or another worker embedding this page finishes first; the projection read below then finds its chunks complete.
+  await using pageLease = await acquirePageEmbeddingLease(engine, snapshot.page.id, { signal: opts.signal, whileWaiting: async () => {
+    if (!await renewPersistenceEffectClaim({ executeRaw: engine.executeRawDirect.bind(engine) }, effect)) throw opError('write_claim_lost', 'The embedding claim changed.',
+      `Another worker took over the embedding of ${snapshot.page.slug} in source ${effect.source_id}; this attempt stops without installing vectors and the owning claim finishes it.`,
+      { fix: effectStatusFix(effect) });
+  } });
+  if (pageLease.busy) throw pageEmbeddingLeaseUnavailable(snapshot.page.id, false);
   // A write that committed after the page read above leaves no projection at this revision to wait for: the effect is
   // superseded, as when the page read already saw the newer revision; only the effect's own revision still unsealed retries.
   const projection = await readEmbeddingEffectProjection(engine, effect, snapshot, opts.hostId, signature, opts.embedding?.model).catch(async error => {
@@ -527,6 +537,7 @@ async function embedPage(engine: BrainEngine, config: GBrainConfig, effect: Pers
       await tx.executeRaw("SELECT key FROM config WHERE key='embedding_disabled' FOR SHARE");
       await assertEmbeddingEffectEnabled(tx, config);
       signal.throwIfAborted();
+      await pageLease.assertHeld(tx);
       // A partially refused page keeps its signature unstamped so `gbrain embed --stale` finds the refused chunks.
       // A partial install (the page changed under the provider call) keeps the vectors whose chunk and input
       // still match and settles like a superseded one: the newer revision's own effect embeds the rest.
@@ -585,6 +596,7 @@ async function embedSegmentedEffect(engine: BrainEngine, config: GBrainConfig, e
     { fix: effectStatusFix(effect) });
   const embed = opts.embedding?.embed ?? embedBatch;
   const result = await embedSegmentedPage(engine, page, { signature, signal: opts.signal, occurrenceIds: effect.data.occurrence_ids,
+    whileWaiting: async () => { if (!await renewPersistenceEffectClaim({ executeRaw: engine.executeRawDirect.bind(engine) }, effect)) throw claimLost(); },
     embedFn: (texts, o) => withAIInvocationPreflight(async () => {
       opts.signal?.throwIfAborted();
       if (!await renewPersistenceEffectClaim({ executeRaw: engine.executeRawDirect.bind(engine) }, effect)) throw claimLost();
@@ -598,6 +610,7 @@ async function embedSegmentedEffect(engine: BrainEngine, config: GBrainConfig, e
     } });
   if (result.stopped === 'budget') { await completeEffect(engine, effect, { embedding: 'skipped', reason: 'budget_capped' }); return; }
   if (result.stopped === 'page_moved') { await completeEffect(engine, effect, { embedding: 'superseded', reason: 'revision_changed' }); return; }
+  if (result.stopped === 'busy') throw pageEmbeddingLeaseUnavailable(page.id, false);
   const stamp = await resolveProvenanceStamp(engine, signature);
   if (stamp) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, stamp);
   await finishPage(engine, effect, snapshot);
@@ -734,7 +747,7 @@ async function settleDerivedFailures(engine: BrainEngine, derived: DerivedFailur
 /** Waits that say nothing about the target never count toward parking. */
 const CONTENTION_CODES = ['projection_pending', 'revision_conflict', 'writer_busy', 'writer_pool_capacity', 'git_index_locked'];
 // #6305: writer_lock_unavailable is this process failing to open the lock file, not the effect failing; it never parks the effect.
-const DEPENDENCY_CODES = ['recovery_required', 'owner_unavailable', 'write_claim_lost', 'queue_capacity', 'write_quota_exhausted', 'write_capacity_backpressure', 'writer_lock_unavailable'];
+const DEPENDENCY_CODES = ['recovery_required', 'owner_marker_missing', 'owner_unavailable', 'write_claim_lost', 'queue_capacity', 'write_quota_exhausted', 'write_capacity_backpressure', 'writer_lock_unavailable'];
 
 /**
  * A scan sets its failing target aside and moves on; a single-target effect,
@@ -798,6 +811,28 @@ export async function runPersistenceEffects(engine: BrainEngine, config: GBrainC
   }
 }
 
+/**
+ * The effect-side twin of the consumer's #6712 release: a pass whose claim loop or deferred flush lost its database
+ * connection (a pooler drop, a failover) gives back the git effects it claimed and had not finished, as soon as the database answers
+ * again, so the next pass claims them at once instead of waiting out their 2-minute lease. Fenced on each claim's token,
+ * so an effect another worker took over is untouched. Stops after 30 s or on abort, checked between claims, leaving the
+ * rest to their lease as before; a retry resumes after the last claim given back.
+ */
+async function releaseAfterConnectionLoss(engine: BrainEngine, effects: PersistenceEffect[], signal?: AbortSignal): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  const live = () => !signal?.aborted && Date.now() < deadline;
+  let next = 0;
+  for (let attempt = 0; next < effects.length && live(); attempt++) {
+    try {
+      for (; next < effects.length && live(); next++) await retryEffect(engine, effects[next]!, 'database_contention', 0);
+      return;
+    } catch (error) {
+      if (!transientDatabaseFailure(error)) return;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(2000, 250 * 2 ** attempt)));
+  }
+}
+
 async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: EffectWorkerOptions, touched: Set<string>, derived: DerivedFailures,
   waited: Set<string>): Promise<number> {
   const limit = Math.max(1, Math.min(opts.limit ?? 2, 20));
@@ -808,7 +843,7 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
     const path = binding.coordination_path ?? '';
     if (stalled.has(path)) return acquireWorktree(binding, 0, undefined, engine);
     waited.add(path);
-    const lock = await acquireWorktreeWaiting(binding, engine, EFFECT_LOCK_WAIT_MS, opts.signal);
+    const lock = await acquireWorktreeWaiting(binding, engine, opts.lockWaitMs ?? EFFECT_LOCK_WAIT_MS, opts.signal);
     if (!lock) stalled.add(path);
     return lock;
   };
@@ -1010,41 +1045,58 @@ async function runEffectPass(engine: BrainEngine, config: GBrainConfig, opts: Ef
   // A deferred effect that requeues itself (a page walk advancing its cursor,
   // or work unblocked by an earlier effect) is claimable again after the flush.
   for (;;) {
-    while (attempted < limit && !opts.signal?.aborted) {
-      const effect = await claimPersistenceEffect(engine, opts.hostId, opts.deadOwners);
-      if (!effect) break;
-      attempted++;
-      touched.add(effect.request_id);
-      let binding: WorktreeBinding | null = null;
-      try {
-        if (effect.worktree_id && !['embedding', 'facts-backstop', 'links'].includes(effect.kind)) binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId);
-      } catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
-      if (effect.kind === 'git' && binding?.local_path) {
-        const root = binding.local_path;
-        // #5182: the binding's recorded setting decides; the legacy hook probe only when nothing is recorded (fail-closed).
-        if (!probes.has(root)) probes.set(root, gitDurabilityPolicy(binding, root).then(policy => ({ durable: policy.durable }), error => ({ error })));
-        const group = singleFileGitEffect(effect) && effect.worktree_id
-          ? [effect, ...await claimCoalescedGitEffects(engine, opts.hostId, effect.worktree_id, GIT_GROUP_SIZE - 1, opts.deadOwners)] : [effect];
-        for (const member of group) touched.add(member.request_id);
-        deferred.push({ effects: group, binding, hardened: probes.get(root)! });
-      } else await run(effect, binding);
+    let setAside: PersistenceEffect | null = null;
+    try {
+      while (attempted < limit && !opts.signal?.aborted) {
+        setAside = null;
+        const effect = await claimPersistenceEffect(engine, opts.hostId, opts.deadOwners);
+        if (!effect) break;
+        setAside = effect;
+        attempted++;
+        touched.add(effect.request_id);
+        let binding: WorktreeBinding | null = null;
+        try {
+          if (effect.worktree_id && !['embedding', 'facts-backstop', 'links'].includes(effect.kind)) binding = await getWorktreeBinding(engine, effect.source_id, opts.hostId);
+        } catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
+        if (effect.kind === 'git' && binding?.local_path) {
+          const root = binding.local_path;
+          // #5182: the binding's recorded setting decides; the legacy hook probe only when nothing is recorded (fail-closed).
+          if (!probes.has(root)) probes.set(root, gitDurabilityPolicy(binding, root).then(policy => ({ durable: policy.durable }), error => ({ error })));
+          setAside = effect;
+          const group = singleFileGitEffect(effect) && effect.worktree_id
+            ? [effect, ...await claimCoalescedGitEffects(engine, opts.hostId, effect.worktree_id, GIT_GROUP_SIZE - 1, opts.deadOwners)] : [effect];
+          for (const member of group) touched.add(member.request_id);
+          deferred.push({ effects: group, binding, hardened: probes.get(root)! });
+          setAside = null;
+        } else await run(effect, binding);
+      }
+    } catch (error) {
+      if (transientDatabaseFailure(error)) await releaseAfterConnectionLoss(engine, [...(setAside ? [setAside] : []), ...deferred.flatMap(d => d.effects)], opts.signal);
+      throw error;
     }
     if (!deferred.length) break;
-    for (const { effects, binding, hardened } of deferred.splice(0)) {
-      const probe = await hardened;
-      if ('error' in probe) {
-        for (const effect of effects) await recordFailure(engine, effect, probe.error, opts.signal);
-        continue;
-      }
-      const durable = probe.durable;
-      if (durable && singleFileGitEffect(effects[0]!)) await commitGroup(effects, { ...binding, local_path: binding.local_path! });
-      else if (singleFileGitEffect(effects[0]!) && effects[0]!.worktree_id) await recordGroup(effects, binding);
-      // Coalesced siblings run with their own source's binding (sources can share a worktree).
-      else for (const effect of effects) {
-        let own: WorktreeBinding | null;
-        try { own = effect === effects[0] ? binding : await getWorktreeBinding(engine, effect.source_id, opts.hostId); }
-        catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
-        await run(effect, own, durable);
+    const groups = deferred.splice(0);
+    for (let i = 0; i < groups.length; i++) {
+      const { effects, binding, hardened } = groups[i]!;
+      try {
+        const probe = await hardened;
+        if ('error' in probe) {
+          for (const effect of effects) await recordFailure(engine, effect, probe.error, opts.signal);
+          continue;
+        }
+        const durable = probe.durable;
+        if (durable && singleFileGitEffect(effects[0]!)) await commitGroup(effects, { ...binding, local_path: binding.local_path! });
+        else if (singleFileGitEffect(effects[0]!) && effects[0]!.worktree_id) await recordGroup(effects, binding);
+        // Coalesced siblings run with their own source's binding (sources can share a worktree).
+        else for (const effect of effects) {
+          let own: WorktreeBinding | null;
+          try { own = effect === effects[0] ? binding : await getWorktreeBinding(engine, effect.source_id, opts.hostId); }
+          catch (error) { await recordFailure(engine, effect, error, opts.signal); continue; }
+          await run(effect, own, durable);
+        }
+      } catch (error) {
+        if (transientDatabaseFailure(error)) await releaseAfterConnectionLoss(engine, groups.slice(i).flatMap(g => g.effects), opts.signal);
+        throw error;
       }
     }
   }
