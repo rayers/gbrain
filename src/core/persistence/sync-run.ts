@@ -59,6 +59,7 @@ import { syncReceiptWait } from './sync-receipt-wait.ts';
 import { directoryAt, freezeFaultHold, noteFrozen, nullBytesRefusal } from './sync-entry-fault.ts';
 import { syncCursorOptions } from './sync-slices.ts';
 import { pipelined } from '../page-state/transactions.ts';
+import { withManagedReasonNotices } from './sync-reasons.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
@@ -698,7 +699,7 @@ export const STOPS_PER_ENTRY = 3;
 /**
  * #6712: the entry of a request that did not commit and whose fault is not the page's (a transport fault proven by its
  * receipt, a systemic stop an earlier invocation recorded, or a legacy knock-on an older gbrain cancelled) is re-frozen in
- * place under a fresh request: the cursor does not advance past it and the failed receipt is recorded as converted
+ * place under a fresh request (#8729: in a pass, the retry's own `passRequestId`, never the failed one): the cursor does not advance past it and the failed receipt is recorded as converted
  * (`convertedFromFailed`), so it never blocks the checkpoint. Bounded by `STOPS_PER_ENTRY` re-freezes in a row at the
  * entry (`Pending.stops`); null past the bound, so the failure is recorded and the next sync takes the entry again (a pass re-classifies its path; a company run retries its recorded stop).
  */
@@ -717,7 +718,7 @@ async function refreezeInPlace(engine: BrainEngine, input: SettleInput): Promise
     const held = await holdUnderGate(engine, { cursor, key, pending, hold: fresh.hold, assertActive, observedAt, waitMs: input.waitMs, base });
     return held === 'pending' ? null : held;
   }
-  return saveCursor(engine, key, cursor, { ...base, convertedFromFailed: converted, pending: { ...fresh, stops: (pending.stops ?? 0) + 1 } }, false, assertActive,
+  return saveCursor(engine, key, cursor, { ...base, convertedFromFailed: converted, pending: { ...fresh, stops: (pending.stops ?? 0) + 1, requestId: cursor.passId ? passRequestId(cursor.passId, entry.path, (entry as PassEntry).level ?? null, pending.requestId) : fresh.requestId } }, false, assertActive,
     tx => recordSyncConversion(tx, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'refrozen' }));
 }
 
@@ -1259,7 +1260,12 @@ export interface RetryWait { request_id: string; kind: string | null; slug: stri
  * returns `sync_drain_lease_held` (resumable). A dry run takes no lease.
  */
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
-  if (opts.dryRun || currentDrainLease(opts.sourceId ?? 'default')) return performManagedPass(engine, opts, slice);
+  if (opts.dryRun) return performManagedPass(engine, opts, slice);
+  // GBRA-218: every managed pass (sync, drain, sources refresh, git conversion, owner slice) applies the committed folder rules.
+  return (await import('../access/policy-git.ts')).withCommittedPolicy(engine, opts.sourceId ?? 'default', opts.repoPath, () => performLeasedPass(engine, opts, slice));
+}
+async function performLeasedPass(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
+  if (currentDrainLease(opts.sourceId ?? 'default')) return performManagedPass(engine, opts, slice);
   const sourceId = opts.sourceId ?? 'default';
   const remote = currentSubmissionAuthority()?.kind === 'remote_generic';
   let tailClear = false;
@@ -1276,7 +1282,7 @@ export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, sl
 async function performManagedPass(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
   const state: HoldRunState = {};
   // #6729: every managed entry point (CLI, drain, owner slice, worktree refresh) records the renames whose identity it did not keep.
-  const synced = await noteIdentityDowngrades(engine, opts.sourceId ?? 'default', await runManagedSync(engine, opts, slice, state), serr);
+  const synced = await withManagedReasonNotices(engine, opts.sourceId ?? 'default', await noteIdentityDowngrades(engine, opts.sourceId ?? 'default', await runManagedSync(engine, opts, slice, state), serr));
   if (!state.sourceId || !state.incarnation || synced.status === 'dry_run' || currentDrainLease(state.sourceId)?.idleClear) return synced;
   const cursor = state.cursor?.() ?? null;
   try {
@@ -1553,6 +1559,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         if (cursor.passId && ((fileChangedAfterAdmission(done) && !passedOverBefore(cursor.passId, pending.requestId)) || (done.error_code === 'page_identity_changed'
           && await liveRevision(engine, context.sourceId, pending) !== (pending.intent.expected_revision == null ? null : String(pending.intent.expected_revision))))) {
           cursor = await saveCursor(engine, key, cursor, committedPast({ ...cursor, counts: { ...cursor.counts } }, pending));
+          await faultPoint('sync:passed_over', { sourceId: cursor.sourceId, path: pending.intent.path ?? undefined });
           assertActive();
           continue;
         }

@@ -17,7 +17,7 @@
  * is resubmitted by its caller after that sync.
  */
 import { spawn } from '../spawn.ts';
-import { relative, sep } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { Action } from '../agent-output.ts';
 import { gitChildEnv } from '../git-env.ts';
@@ -97,6 +97,11 @@ export async function headBlob(root: string, path: string, signal?: AbortSignal)
   return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', `HEAD:./${relative(root, path).split(sep).join('/')}`], signal), signal);
 }
 
+/** The bytes of blob `blob` in `root`'s repository as text, or null when Git cannot read it. */
+export async function blobText(root: string, blob: string, signal?: AbortSignal): Promise<string | null> {
+  return gitRead(root, ['cat-file', 'blob', blob], signal).then(out => out, error => { if (signal?.aborted) throw error; return null; });
+}
+
 /**
  * The blob id HEAD holds at `path` when the working-tree file there is exactly that blob (`hash-object` applies the
  * path's clean filters, as `git add` would); null when the file differs, is absent, or HEAD has no entry there.
@@ -115,6 +120,30 @@ export async function landedCommit(root: string, from: string | null, path: stri
   return quiet(gitRead(root, ['rev-list', '-1', from ? `${from}..HEAD` : 'HEAD', '--', `:(literal)${relative(root, path).split(sep).join('/')}`]));
 }
 
+/** #8755: whether the index holds unmerged stages for `path` (a conflict); null when Git cannot read it. */
+export async function unmergedPath(root: string, path: string, signal?: AbortSignal): Promise<boolean | null> {
+  return gitRead(root, ['ls-files', '-u', '-z', '--', `:(literal)${relative(root, path).split(sep).join('/')}`], signal)
+    .then(out => out.length > 0, error => { if (signal?.aborted) throw error; return null; });
+}
+
+/**
+ * #8755: the absolute paths of the markers a merge, cherry-pick, revert or rebase in progress leaves in `root`'s git dir
+ * (MERGE_HEAD, CHERRY_PICK_HEAD, REVERT_HEAD, sequencer, rebase-merge, rebase-apply); null when Git cannot name them. The
+ * caller checks which exist. All of them live in the per-worktree git dir, which Git prints absolute and symlink-resolved,
+ * so a root reached through a symlink still names the real markers. Output that is not exactly one line answers null.
+ */
+export async function operationMarkerPaths(root: string, signal?: AbortSignal): Promise<string[] | null> {
+  const markers = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer', 'rebase-merge', 'rebase-apply'];
+  return gitRead(root, ['rev-parse', '--absolute-git-dir'], signal)
+    .then(out => { const lines = out.split('\n'); return lines.length === 2 && lines[0] && !lines[1] ? markers.map(marker => join(lines[0], marker)) : null; },
+      error => { if (signal?.aborted) throw error; return null; });
+}
+
+/** #8759: the text of `path` as `commit` holds it, or null when Git cannot read it there. */
+export async function fileAtCommit(root: string, commit: string, path: string): Promise<string | null> {
+  return gitRead(root, ['show', `${commit}:./${relative(root, path).split(sep).join('/')}`]).catch(() => null);
+}
+
 /** The commit HEAD names in `root`, or null on an unborn branch or when Git cannot read it. */
 export async function headCommit(root: string, signal?: AbortSignal): Promise<string | null> {
   return quiet(gitRead(root, ['rev-parse', '--verify', '--quiet', 'HEAD'], signal), signal);
@@ -128,7 +157,8 @@ function quiet(read: Promise<string>, signal?: AbortSignal): Promise<string | nu
  * The refusal: nothing was overwritten; a remember waits for its replay, any other write is resubmitted after the next sync.
  * GBRA-133: neither fix starts a sync; both read the status, so no caller puts a second sync owner beside a running one.
  */
-export function pendingImportRefusal(row: { source_id: string; slug: string; operation?: string }, remote: boolean): OperationError {
+export function pendingImportRefusal(row: { source_id: string; slug: string; operation?: string }, remote: boolean, importFrom?: string,
+  importFile?: { root: string; path: string }): OperationError {
   const status = ['gbrain', 'sync', 'status', '--source', row.source_id, '--json'];
   const remember = row.operation === 'remember';
   const fix: Action = remember
@@ -138,9 +168,12 @@ export function pendingImportRefusal(row: { source_id: string; slug: string; ope
     : { argv: status, consent: [], actor: remote ? 'host_admin' : 'agent', requires_exclusive: false,
       verify: { argv: status }, docs: 'docs/guides/write-refusals.md#pending_import',
       why: `${PENDING_IMPORT_OWNER.replace('<source>', row.source_id)} Once it has, read the page again and resubmit the intended write with a new request_id.` };
-  return opError('source_changed', PENDING_IMPORT_MESSAGE,
+  const refusal = opError('source_changed', PENDING_IMPORT_MESSAGE,
     `Nothing was overwritten. The canonical file of ${row.slug} in source ${row.source_id} holds a change committed through Git that managed sync has not imported yet, `
     + (remember ? 'so this remember was refused and kept: the first sync that imports the file makes one replay attempt, with its original date and authority.'
       : 'so this write was refused rather than replacing those bytes: after the next sync imports them, read the page again and resubmit with a new request_id.'),
     { detail: 'file_database_drift', reason: PENDING_IMPORT, fix });
+  // GST-1582: the last imported commit the check compared against, so a refresh-barrier consumer can hold the write for the import;
+  // GST-1623: and the file it compared, so a write deferred behind a refresh is checked against that refresh before it is held.
+  return importFrom === undefined ? refusal : Object.assign(refusal, { importFrom, ...(importFile ? { importFile } : {}) });
 }

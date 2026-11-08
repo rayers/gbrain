@@ -169,7 +169,7 @@ grant.
 
 ### Narrow one request with `source_ids`
 
-`search`, `query`, `recall` and `list_pages` take `source_ids`, a list of
+`search`, `query`, `recall`, `memory_recall` and `list_pages` take `source_ids`, a list of
 source ids (CLI: `--source-ids source-a,source-b`). The request reads only
 those sources:
 
@@ -223,9 +223,13 @@ per-member tokens for that, and `source_ids` to narrow further.
 
 ### Lay out sources by who may read them
 
-gbrain enforces access per source, never per page. Two pages in one source are
-readable by exactly the same tokens. So put content in sources by who may read
-it, before any member's bot connects:
+Source grants are the coarse boundary: without page readers, two pages in one
+source are readable by exactly the same tokens. Inside one source, a page that
+names readers in frontmatter `readable_by` is read only by credentials bound to
+a listed member, and a folder rule (`gbrain access rule add`) does the same for
+a whole prefix ([Model C](../tutorials/company-brain.md#two-scoping-models-pick-the-one-that-matches-your-shape));
+both only narrow a grant, never widen it. Either way, put content in sources by
+who may read it, before any member's bot connects:
 
 - **One source per channel, team or member.** Give a channel's pages a source
   of their own (`channel-a`), a team's documents theirs (`team-a`), and each
@@ -378,12 +382,16 @@ gbrain sources set-sync <id> <on|off> [--dry-run] [--expect <on|off>]
                                (config.syncEnabled; an explicit gbrain sync --source
                                still runs). --dry-run prints the apply command, which
                                carries --expect; a moved state refuses preview_changed.
+                               Off: autopilot cycles work only on pages changed since
+                               the last cycle, so a file edited on disk is picked up
+                               by the next explicit sync, not by the cycle.
 gbrain sources host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
                                Managed brains: host a new, empty source in a bare
                                repository under <path> (see below). Previews without --expect.
-gbrain sources canonical <id> --to git|mixed [--dry-run | --apply --expect <hash>] [--json]
+gbrain sources canonical <id> --to git|mixed [--dry-run [--list-out <file>] [--approval-out <file>] | --apply (--expect <hash> | --approved <file>)] [--decisions <file>] [--json]
                                Managed brains: convert a source to git-canonical or back
-                               to mixed. Previews without --apply; the apply prints progress
+                               to mixed. Previews without --apply (review list, decisions
+                               and approvals: docs/guides/git-canonical.md); the apply prints progress
                                on stderr and, if stopped, where it stopped
                                (docs/designs/GIT_CANONICAL_MEMORY.md#conversion).
 ```
@@ -430,6 +438,8 @@ maintenance write) is stored database-only too; its receipt says
 write on, except for pages created while the source was a mirror: those have
 no file in the checkout and stay database-only. Git effects of a mirror's
 writes (for example a `forget`) complete as skipped. The flag is off by default.
+With `sync.write_through` off, sync keeps that canonical metadata in the
+database for every source, mirror or not, and never rewrites a checkout file.
 
 A managed brain never pulls inside a cycle. Advance a managed checkout with
 one command on its owner host:

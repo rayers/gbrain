@@ -13,6 +13,7 @@ import { prepareMarkdownChunks } from '../../src/core/markdown-chunks.ts';
 import { installFixtureChunks } from './page-projection.ts';
 import { withEnv } from './with-env.ts';
 import { leanRow } from '../../src/core/search/lean-rows.ts';
+import { degradedStampFor, degradedStampLine } from '../../src/core/degraded-stamp.ts';
 import { fenceTranscriptText } from '../../src/core/search/transcript-quote.ts';
 
 export const OFF_PATH_PAGES: Array<{ slug: string; body: string; timeline?: string; frontmatter?: Record<string, unknown> }> = [
@@ -101,7 +102,8 @@ export function offPathMcpBytes(res: { content: { type: string; text: string }[]
   // Cat 40 Hard F2's keyword count line and fields and F4's row-date line are additive too
   // (pinned in test/search-keyword-paging.test.ts and test/search-date-labels.test.ts).
   const content = res.content.filter(c => !/^\[gbrain (notice |search\] |dates\] )/.test(c.text));
-  const { gbrain_notices: _notices, ...meta } = res._meta ?? {};
+  // GBRA-231's additive `_meta.access` (the caller's applied view) is pinned in test/access-on-behalf-of.test.ts.
+  const { gbrain_notices: _notices, access: _access, ...meta } = res._meta ?? {};
   if (meta.retrieval) meta.retrieval = withoutCounts(withoutTimings(meta.retrieval) as Record<string, unknown>);
   return JSON.stringify({ ...res, content, ...(res._meta ? { _meta: Object.keys(meta).length > 0 ? meta : undefined } : {}) });
 }
@@ -120,11 +122,12 @@ function withFactsOrder(payload: Record<string, unknown>): Record<string, unknow
   return Object.fromEntries(Object.entries(payload).flatMap(([k, v]) => k === 'total' ? [[k, v], ['facts_order', 'newest']] : [[k, v]]));
 }
 
-/** GST-687's remote quote of one row: its text fenced as an excerpt of its slug and `quoted` set (recall places it before `trust_tier`). */
+/** GST-687's remote quote of one row: its text (#8384: and title) fenced as an excerpt of its slug and `quoted` set (recall places it before `trust_tier`). */
 function quotedRow(row: Record<string, unknown>, field: 'chunk_text' | 'chunk'): Record<string, unknown> {
   const text = row[field];
   if (row.quoted !== undefined || typeof text !== 'string' || text.length === 0) return row;
-  const fenced = { ...row, [field]: fenceTranscriptText(text, row.slug as string) };
+  const title = typeof row.title === 'string' && row.title ? { title: fenceTranscriptText(row.title, row.slug as string) } : {};
+  const fenced = { ...row, ...title, [field]: fenceTranscriptText(text, row.slug as string) };
   if (field === 'chunk_text') return { ...fenced, quoted: 'transcript' };
   return Object.fromEntries(Object.entries(fenced).flatMap(([k, v]) => k === 'trust_tier' ? [['quoted', 'transcript'], [k, v]] : [[k, v]]));
 }
@@ -136,7 +139,9 @@ function quotedRow(row: Record<string, unknown>, field: 'chunk_text' | 'chunk'):
  * ranking adds `facts_order` to every recall response. GST-687 quotes text
  * below the owner's trust tier for remote readers, and this fixture's pages
  * carry no trust declaration (`unknown`), so every remote row comes back
- * fenced and marked `quoted`. The frozen pre-feature bytes stay as captured;
+ * fenced and marked `quoted`. GBRA-200 appends the degraded stamp (a last
+ * text block and `_meta.degraded`) to an MCP reply whose frozen meta names a
+ * recall-affecting stage. The frozen pre-feature bytes stay as captured;
  * this applies exactly those declared transforms to them, so every other byte
  * of the capture is still compared.
  */
@@ -160,6 +165,11 @@ export function withCostWave(key: string, frozen: string): string {
   res.content[0].text = JSON.stringify(lean ? (body as Record<string, unknown>[]).map(r => quotedRow(leanRow(r), 'chunk_text'))
     : base === 'mcp-recall' ? { ...withFactsOrder(body), results: (body.results as Record<string, unknown>[]).map(r => quotedRow(r, 'chunk')) } : body);
   if (lean && res._meta?.retrieval) res._meta.retrieval = leanRetrieval(res._meta.retrieval);
+  const stamp = degradedStampFor(base.slice('mcp-'.length), body, res._meta ?? {}, []);
+  if (stamp) {
+    res.content.push({ type: 'text', text: degradedStampLine(stamp) });
+    res._meta = { ...res._meta, degraded: stamp as unknown as Record<string, unknown> };
+  }
   return JSON.stringify(res);
 }
 

@@ -116,6 +116,7 @@ interface SourceListEntry {
   pull_strategy: 'rebase' | 'merge';
   page_count: number;
   last_sync_at: string | null;
+  archived: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -145,10 +146,12 @@ async function countPages(engine: BrainEngine, sourceId: string): Promise<number
 // ── Subcommand: add ─────────────────────────────────────────
 
 async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
+  const apiKind = args.includes('--kind') ? args[args.indexOf('--kind') + 1] : undefined;
+  if (args[0] && (apiKind === 'meetings' || apiKind === 'slack')) return (await import('./sources-add-api.ts')).runApiSourceAdd(engine, args);
   const id = args[0];
   if (!id) {
     console.error(
-      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google] ' +
+      'Usage: gbrain sources add <id> [--path <path> | --url <https-url> | --kind github|google|meetings|slack] ' +
         '[--name <display>] [--federated|--no-federated] [--clone-dir <path>] [--force] [--json]\n' +
         '       github kind: [--token-env <env>] [--scope auto|repos] ' +
         '[--repos owner/name,...] [--dir <path>] ' +
@@ -734,6 +737,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
       pull_strategy: pullStrategyOf(parseConfig(r.config)),
       page_count: pageCount,
       last_sync_at: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
+      archived: r.archived === true,
     });
   }
 
@@ -752,7 +756,7 @@ async function runList(engine: BrainEngine, args: string[]): Promise<void> {
     // it out of OTHER anchors' reads — its own unqualified reads still widen
     // outward (see sourceFederationState). Collapsing both to "isolated"
     // overstates what an unset flag does.
-    const fedMark = (e as any).archived ? '⚠ archived' : sourceFederationState(rows[i].config);
+    const fedMark = e.archived ? '⚠ archived' : sourceFederationState(rows[i].config);
     const pathStr = e.local_path ?? '(no local path)';
     const sync = e.last_sync_at ? `last sync ${e.last_sync_at}` : 'never synced';
     console.log(`  ${e.id.padEnd(20)}  ${fedMark.padEnd(12)}  ${String(e.page_count).padStart(6)} pages  ${sync}`);
@@ -1169,12 +1173,18 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     console.error(`Source "${id}" not found.`);
     process.exit(4);
   }
-  const config = parseConfig(src.config);
-  config.federated = value;
-  await engine.executeRaw(
-    `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
-    [JSON.stringify(normalizeSourceConfig(config)), id],
-  );
+  // GST-1113: the mark check and the config write hold the source row, so a concurrent --attest-sources mark commits
+  // before (and federate refuses) or after (and sees federated, so it refuses), never between them.
+  await engine.transaction(async tx => {
+    const [row] = await tx.executeRaw<{ config: unknown }>('SELECT config FROM sources WHERE id = $1 FOR UPDATE', [id]);
+    if (value) await (await import('../core/access/attest-sources.ts')).assertNotScopeSource(tx, id);
+    const config = parseConfig(row?.config ?? src.config);
+    config.federated = value;
+    await tx.executeRaw(
+      `UPDATE sources SET config = $1::text::jsonb WHERE id = $2`,
+      [JSON.stringify(normalizeSourceConfig(config)), id],
+    );
+  });
   console.log(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
 
   // v0.40 D19: auto-submit embed-backfill when coverage < 100%. Federation
@@ -1920,6 +1930,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'refresh':    return (await import('./sources-refresh.ts')).runSourcesRefresh(engine, rest);
     case 'git-gap':    return (await import('./sources-git-gap.ts')).runSourcesGitGap(engine, rest);
     case 'host-repo':  return (await import('./sources-host-repo.ts')).runHostRepo(engine, rest);
+    case 'guard':      return (await import('./sources-guard.ts')).runSourcesGuard(engine, rest);
     case 'reindex':    return (await import('./sources-reindex.ts')).runSourcesReindex(engine, rest);
     case 'canonical':  return (await import('./sources-canonical.ts')).runSourcesCanonical(engine, rest);
     case 'archive':    return runArchive(engine, rest);
@@ -2024,6 +2035,8 @@ Subcommands:
   set-sync <id> <on|off> [--dry-run] [--expect <on|off>]   Include or exclude the source from automatic sync (config.syncEnabled).
   host-repo <id> --dir <path> [--push-remote <url>] [--dry-run | --expect <plan_hash>]
                                     Managed brains: host an empty source in a new bare repository with a gbrain-owned worktree; it becomes git-canonical.
+  guard <id> [--install [--mode enforce] | --uninstall | --status] [--json]
+                                    Managed brains, owner host: the commit guard on the source's worktree only.
   refresh <id> [--dry-run] [--wait-drain <s>] [--fetch-timeout-ms <ms>] [--resume|--abandon] [--json]
                                     Managed brains: drain writes to the source's worktree, fast-forward
                                     it to its upstream (git merge --ff-only) and sync every source bound

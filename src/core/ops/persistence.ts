@@ -137,9 +137,13 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
   const render = ctx.remote === false ? cliRenderContext() : { transport: 'stdio' as const, isCallable: () => false, preapproved: () => false };
   const { liveSearchable } = await import('../persistence/searchable.ts');
   const receipt = publicWriteReceipt(receiptFor(row, facts));
+  // GBRA-217: a reason whose Git effect was superseded is reported as not committed.
+  const settled = await (await import('../persistence/change-reason.ts')).settledReasonRecorded(ctx.engine, row);
+  if (settled) ctx.emitNotice?.(settled.notice);
+  const outcome = settled ? { ...receipt.outcome, reason_recorded: settled.recorded } : receipt.outcome;
   return {
     ...receipt,
-    ...(ctx.remote !== false && receipt.outcome ? { outcome: await quotedOutcome(receipt.outcome, String(row.slug ?? '')) } : {}),
+    ...(ctx.remote !== false && outcome ? { outcome: await quotedOutcome(outcome, String(row.slug ?? '')) } : settled ? { outcome } : {}),
     operation: row.operation, source_id: row.source_id, slug: row.slug,
     ...await liveSearchable(ctx, { request_id: row.request_id, state: row.state, source_id: row.source_id, slug: row.slug, searchable: row.outcome?.searchable }),
     ...(mismatch ? { owner_build: mismatch } : {}),
@@ -235,7 +239,7 @@ export const persistenceOperations: Operation[] = [
     description: 'Pages whose writes keep ending in a source_changed conflict, grouped by slug.',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
-      limit: { type: 'number', default: 25, description: '1-100 slugs (default 25).' },
+      limit: { type: 'number', minimum: 1, default: 25, description: '1-100 slugs (default 25).' },
       cursor: { type: 'string', description: "Previous page's next." },
     },
     scope: 'read', mutating: false, area: 'pages',

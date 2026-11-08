@@ -115,7 +115,7 @@ and `view: markdown` keep the stored text byte-exact inside the fence, so
 `edit_page` `old_text` copied from inside a fence still matches, and
 `put_page` given that `content` back removes exactly the fences get_page
 added around this page before writing (a fence-like text in an owner-tier
-note's stored body is kept; a whole-markdown read whose closing fence the edit replaced or appended past is unfenced too,
+note's stored body is kept; a whole-markdown read whose closing fence the edit replaced or appended past, or whose line endings it converted to CRLF, is unfenced too,
 as is one with blank lines added before its marker, and a backtick code block the edit added inside, in place of or after the read
 is kept whole). A remote `put_page` whose content holds a
 tool-call summary that a whole read of the stored page never produces, or
@@ -148,9 +148,10 @@ into `takes_add`, `takes_update` or `takes_supersede`, is stored without the fen
 tracked trust reads as unverified, so it is quoted until the owner runs
 `gbrain trust claim-sources` or `gbrain trust backfill` (`gbrain doctor` names how
 many pages that is); a remote `get_page` or `fetch` of such a page carries a
-`quoted_unverified_origin` notice naming those commands, once per session. Page titles are quoted on `get_page` and `fetch` only:
-search rows and context cards return them as stored, and so is a chronicle
-entry's `kind`. Local reads are unchanged.
+`quoted_unverified_origin` notice naming those commands, once per session. A quoted page's title is quoted on
+`get_page`, `fetch` and search and `query` rows, and its tags on `get_page`, `fetch` and `get_tags` (`add_tag` and
+`remove_tag` take a copied tag without the fence); a context card below "your notes" carries its title under the
+card's trust label, as its summary does; a chronicle entry's `kind` is quoted by its event page's tier. Local reads are unchanged.
 
 `effective_date` is the page's own date and `effective_date_source` says
 which kind: `date`, `published` or `filename` is a document date,
@@ -207,10 +208,14 @@ pass it to `get_page`.
 {"result_type":"fact","fact_id":"412","page_slug":"companies/acme-example","follow_up":{"op":"recall","args":{"entity":"companies/acme-example"}},"title":"Saved fact about companies/acme-example","chunk_text":"Saved fact (fact; valid from 2026-09-01; provenance: user update): The billing contact for Acme Example is Bob.","score":0.42,"source_id":"default"}
 ```
 
-`search.query_facts_arm=false` turns these rows off. A `query` with a token
-budget instead gets the facts block (on by default): up to 40 dated fact rows,
-oldest first, ahead of the pages and within 22% of the budget, in place of the
-facts arm. `search.query_facts_block=false` restores the arm.
+`search.query_facts_arm=false` turns these rows off. A `query` that passes
+`token_budget` instead gets the facts block (on by default): dated fact rows,
+oldest first, ahead of the pages, within 22% of the budget and at most 40 rows
+and at most `limit` rows, in place of the facts arm. Block rows carry the top
+page's `score`: they are placed first, not ranked above the pages, so read
+`result_type` rather than comparing scores. Without `token_budget`, fact
+rows only fill free slots, so `limit` caps the whole result.
+`search.query_facts_block=false` restores the arm.
 
 ## Recent facts in `_meta.brain_hot_memory`
 

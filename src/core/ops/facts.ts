@@ -6,7 +6,7 @@ import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
 import { countEvidenceTokens, deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
 import { withFactDateHeaders } from '../search/evidence-date.ts';
-import { fenceTranscriptRows, neutralizeTranscriptRows, quoteFacts } from '../search/transcript-quote.ts';
+import { fenceTranscriptRows, fenceTranscriptText, neutralizeTranscriptRows, quoteFacts } from '../search/transcript-quote.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
 /**
@@ -29,6 +29,7 @@ import { OperationError, opError, verbError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
 import { parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { parseSourceIdsParam, requestSourceScope, SOURCE_IDS_PARAM } from './search-source-scope.ts';
+import { boundRecallChars, MEMORY_RECALL_MAX_CHARS, parseMaxChars } from './qm-memory.ts';
 import { markKeywordHits } from '../search/evidence.ts';
 import { hybridSearchCached, stampContentFlags, type HybridSearchOpts } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
@@ -41,7 +42,7 @@ import { isAvailable } from '../ai/gateway.ts';
 import { ENTITY_HINTS_CAP } from '../facts/extract.ts';
 import { parseTtlShorthand } from '../facts/ttl-parse.ts';
 import { MEMORY_VERBS_VERSION } from '../verbs.ts';
-import type { SearchResult } from '../types.ts';
+import type { DegradedStageEntry, SearchResult } from '../types.ts';
 import { MAX_SEARCH_LIMIT, type BrainEngine, type FactRow } from '../engine.ts';
 import { collapseFactReads } from '../facts/capture-dedup.ts';
 import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
@@ -51,10 +52,12 @@ import { MEMORY_CONFIRM_SCOPE } from '../trust/confirm.ts';
 import { proactiveEligibility } from '../eligibility/registry.ts';
 import { activationSuppressionNotice, suppressionSummary } from '../eligibility/activation.ts';
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
+import { withDecideContested, type ContestedLookup } from '../facts/contested-claims.ts'; import { claimColumns } from '../facts/typed-claim.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { parseSinceParam } from '../facts/since-parse.ts';
-import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
+import { callerSessionKey } from '../access/member-facts.ts';
+import { groupFactsByEntity, parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -113,6 +116,7 @@ const extract_facts: Operation = {
     // facts.default_visibility helper (the old ternary coerced unset →
     // 'private' before any config default could run). Garbage stays 'private'.
     const { resolveVisibilityParam, tightenToPage } = await import('../facts/visibility.ts');
+    const { withFolderRestricted } = await import('../search/private-visibility.ts');
     let visibility: 'private' | 'world' = await resolveVisibilityParam(ctx.engine, p.visibility);
 
     // #4206: optional event-time + provenance threading. An unparseable
@@ -136,7 +140,7 @@ const extract_facts: Operation = {
     // facts are also private when it cannot see the source page, so a hidden page and a missing one look the same.
     if (visibility === 'world' && sourceSlug) {
       const origin = await ctx.engine.readPageSnapshot(sourceSlug.replace(/\.md$/, ''), { sourceId });
-      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin?.page);
+      visibility = ctx.remote !== false && !origin ? 'private' : tightenToPage(visibility, origin && await withFolderRestricted(ctx.engine, origin.page));
     }
 
     const r = await runFactsPipeline(p.turn_text as string, {
@@ -228,6 +232,13 @@ async function quoteRecall<F extends { id: number; fact: string; source?: string
   return { facts: quoted ?? [], withheld: quoted === null && facts.length > 0, results: fenceTranscriptRows(neutralizeTranscriptRows(results, delivery?.date_header === true), recount, true) };
 }
 
+/** A delivered fact's typed claim; a quoted fact's claim strings are fenced like its text (quoteFacts), the value is a number. */
+function recallClaimColumns(row: { id: number; quoted?: string; claim_metric?: string | null; claim_value?: number | null; claim_unit?: string | null; claim_period?: string | null }) {
+  const claim = claimColumns(row);
+  if (!row.quoted) return claim;
+  return Object.fromEntries(Object.entries(claim).map(([key, value]) => [key, typeof value === 'string' ? fenceTranscriptText(value, `fact ${row.id}`) : value]));
+}
+
 /**
  * A result row's cost in recall's packing. A delivered block costs what delivery counted (its text and title in
  * delivery's tokenizer), so recall never re-cuts a set delivery already fit using a different estimator.
@@ -307,11 +318,13 @@ const recall: Operation = {
     return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).', fullSurfaceOnly: true },
     return_window: { type: 'number', description: 'Window 1-3.', fullSurfaceOnly: true },
     min_trust: MIN_TRUST_PARAM,
+    max_chars: { type: 'integer', minimum: MEMORY_RECALL_MAX_CHARS.min, description: `Cap on fact (then results) text, ${MEMORY_RECALL_MAX_CHARS.min}-${MEMORY_RECALL_MAX_CHARS.max}; whole items only, truncated says if cut.`, fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
   annotations: { title: 'recall (memory read)', readOnlyHint: true },
   handler: async (ctx, p) => {
+    const maxChars = p.max_chars === undefined || p.max_chars === null ? null : parseMaxChars(p.max_chars);
     const sourceId = ctx.sourceId ?? 'default';
     const limit = clampRecallLimit(p.limit);
     const includeExpired = p.include_expired === true;
@@ -488,9 +501,7 @@ const recall: Operation = {
 
     // Engines apply grep in SQL (pre-limit). This client-side pass stays only
     // as the filter for the supersessions branch, which bypasses FactListOpts.
-    if (grep && p.supersessions === true) {
-      rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
-    }
+    if (grep && p.supersessions === true) rows = rows.filter(r => r.fact.toLowerCase().includes(grep));
 
     // #7043: copies of one claim (the fact arms read MAX_SEARCH_LIMIT rows) collapse after the visibility filters, before the limit cut.
     if (!ranking) rows = (await collapseFactReads(ctx.engine, rows)).slice(0, limit);
@@ -540,21 +551,7 @@ const recall: Operation = {
       const searchScope = { ...scope, ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
       // untrusted callers with the excludePrivate resolved above.
-      const keywordOnly = await recallKeywordOnlyReason(ctx);
-      if (keywordOnly) {
-        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts);
-        searchDegraded = keywordOnly;
-      } else {
-        searchResults = await hybridSearchCached(ctx.engine, queryText, {
-          limit,
-          expansion: false,
-          excludePrivate,
-          requireSafeChunks: ctx.remote !== false,
-          takesHoldersAllowList: readHolders(ctx),
-          ...searchScope,
-          ...rankCutOpts,
-        });
-      }
+      ({ rows: searchResults, keywordOnly: searchDegraded } = await recallPageRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts));
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
       const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
@@ -596,10 +593,11 @@ const recall: Operation = {
       droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
     }
 
-    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery));
+    const grouped = ranking?.groupByEntity ? groupFactsByEntity(packedFacts, ranking, p, ctx.emitNotice) : null; if (grouped) packedFacts = grouped.rows; // #2953: reorders delivered facts only
+    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery)), contested: ContestedLookup = {};
 
     const out = {
-      facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
+      facts: await withDecideContested(ctx.engine, await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6 trust labels; GBRA-216 dp contested
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -628,15 +626,15 @@ const recall: Operation = {
         // pre-v1 consumers — legacy fields are frozen byte-equal). `provenance`
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
-        provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}), ...(r.quoted ? { quoted: r.quoted } : {}),
+        provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}), ...(r.quoted ? { quoted: r.quoted } : {}), ...recallClaimColumns(r),
         ...(r.entity_slugs ? { entity_slugs: r.entity_slugs } : {}), ...(r.collapsed_count ? { collapsed_count: r.collapsed_count } : {}),
-        ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
-      })), f => f.id)),
+        ...(ranking ? { relevance: ranking.relevance.get(r.id), ...(ranking.weighting ? { rank_score: ranking.weighting.rank.get(r.id), confidence_factor: ranking.weighting.factor.get(r.id) } : {}) } : {}),
+      })), f => f.id)), { remote: ctx.remote !== false, excludePrivate, eligibility }, contested),
       total: packedFacts.length,
       facts_order: ranking ? 'relevance' : 'newest',
-      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
-      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
-      ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
+      ...(quoted.withheld ? { facts_degraded: { reason: 'saved_facts_withheld' } } : ranking?.degraded || contested.degraded ? { facts_degraded: { ...contested.degraded, ...ranking?.degraded } } : {}),
+      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}), ...(ranking?.belowFloor ? { facts_below_floor: ranking.belowFloor } : {}),
+      ...grouped?.fields, ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
       protocol_version: MEMORY_VERBS_VERSION,
@@ -666,7 +664,7 @@ const recall: Operation = {
       ...(delivery ? { delivery } : {}),
     };
     recordRecallOutcome(out);
-    return out;
+    return maxChars === null ? out : boundRecallChars(out, maxChars);
   },
 };
 
@@ -854,7 +852,7 @@ const context_pack: Operation = {
       // rendered line plus its rendered (since-filtered) thread lines.
       const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
       const cardCost = (c: (typeof cards)[number]) =>
-        lineCost(renderCardLine(c, walk.home)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
+        lineCost(renderCardLine(c, walk.home, ctx.remote !== false)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
       cards = cardPack.items;
       // #6724: a dropped card's facts go with it; entity facts pack before hot memory, and a fact in both is priced once.
@@ -871,7 +869,7 @@ const context_pack: Operation = {
       const mentionBudget = remaining - factPack.meta.used - lineCost('') - lineCost(NEWER_MENTIONS_HEADER);
       const withMentions = cards.filter((c) => c.newer_mentions);
       const mentionPack = mentionBudget > 0
-        ? packToBudget(withMentions, (c) => renderNewerMentionLines(c, walk.home).reduce((n, l) => n + lineCost(l), 0), mentionBudget)
+        ? packToBudget(withMentions, (c) => renderNewerMentionLines(c, walk.home, ctx.remote !== false).reduce((n, l) => n + lineCost(l), 0), mentionBudget)
         : dropAll(withMentions);
       const keptMentions = new Set(mentionPack.items);
       cards = cards.map((c) => (c.newer_mentions && !keptMentions.has(c) ? { ...c, newer_mentions: undefined } : c));
@@ -891,7 +889,7 @@ const context_pack: Operation = {
     // structured arrays report — the assembler's pre-budget rendering would
     // overrun the declared budget_tokens. budget_used reports that text.
     const recordLines = cards.flatMap(renderRecordLines);
-    const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts, undefined, walk.home, entityFacts) : res.text;
+    const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts, undefined, walk.home, entityFacts, ctx.remote !== false) : res.text;
     const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
     const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
@@ -1027,8 +1025,8 @@ const delta: Operation = {
     // for the trusted CLI/hook lane, gated on STRICT ctx.remote === false —
     // anything else (true, undefined via cast bypass) is remote. Remote callers
     // use their auth client id; an auth-LESS or blank-id remote (stdio MCP)
-    // gets the shared 'remote' sentinel — never collapsed into 'local'.
-    const clientId = ctx.remote === false ? null : ctx.auth?.clientId?.trim() || 'remote';
+    // gets the shared 'remote' sentinel — never collapsed into 'local'. GST-359: plus the person an attested or audience call serves.
+    const clientId = ctx.remote === false ? null : callerSessionKey(ctx.auth?.clientId?.trim() || 'remote');
     const includePrivate = p.include_private === true && ctx.remote === false;
     const budgetTokens =
       typeof p.budget_tokens === 'number' && Number.isFinite(p.budget_tokens) && p.budget_tokens > 0
@@ -1445,6 +1443,28 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
 }
 
 /**
+ * recall's page arm: keyword-only when the brain opted out of embedding or has no provider (`keywordOnly` names
+ * why), otherwise hybrid. GBRA-200: its degraded stages (an embed timeout, a failed arm, the keyword rank bound)
+ * ride _meta.retrieval.degraded like search's, so a partial recall is stamped instead of silent.
+ */
+async function recallPageRows(
+  ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
+  searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier }, rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'>,
+): Promise<{ rows: SearchResult[]; keywordOnly?: string }> {
+  const keywordOnly = await recallKeywordOnlyReason(ctx);
+  const stages: DegradedStageEntry[] = [];
+  const rows = keywordOnly
+    ? await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts, stages)
+    : await hybridSearchCached(ctx.engine, queryText, {
+      limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
+      onMeta: m => { stages.push(...(m.degraded ?? [])); },
+    });
+  if (stages.length) ctx.emitResponseMeta?.('retrieval', { degraded: stages });
+  return { rows, ...(keywordOnly ? { keywordOnly } : {}) };
+}
+
+/**
  * Keyless recall's page arm: direct keyword FTS, except that a planned
  * multi-relation question (planner on) goes through hybridSearch's keyless
  * path, which runs keyword + title + the relational chain (zero LLM).
@@ -1453,14 +1473,17 @@ async function keylessRecallRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
   searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
   rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = {},
+  stages: DegradedStageEntry[] = [],
 ): Promise<SearchResult[]> {
   if (await keylessChainQuestion(ctx, queryText)) {
     return hybridSearchCached(ctx.engine, queryText, {
       limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
       takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
+      onMeta: m => { stages.push(...(m.degraded ?? [])); },
     });
   }
-  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));
+  const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope,
+    onKeywordIncomplete: reason => { stages.push({ stage: 'keyword_candidates_incomplete', reason }); } }));
   // #3783 — direct FTS path: every row is a keyword hit by construction.
   markKeywordHits(rows);
   stampEvidenceSafe(rows);
