@@ -418,12 +418,13 @@ gbrain config set shared_skills.migration.enabled false
 ```
 
 The key is brain-level database config, so it applies to every machine that
-uses that database. From then on `gbrain apply-migrations` (including the
-`bun install` postinstall, `gbrain upgrade` and `gbrain post-upgrade`) skips
+uses that database. From then on `gbrain apply-migrations` (including
+`gbrain upgrade` and `gbrain post-upgrade`) skips
 v0.53.0 entirely: no inventory, no `shared_skills.migration.v1*` config
 writes, and the applied-migration re-check does not run. `gbrain
 apply-migrations --list` and `--dry-run` show it as `declined` with the key,
-`gbrain doctor` reports `minions_migration` ok with `declined: ['0.53.0']`,
+`gbrain doctor` reports `minions_migration` ok with `declined: ['0.53.0']`
+(`gbrain doctor --fast` cannot read the key and never lists v0.53.0 as not run),
 and `get_health.migrations.declined` lists it. An explicit `gbrain
 apply-migrations --migration 0.53.0` refuses with `migration_declined` (exit
 3) and the command that turns it back on instead of overriding the owner's

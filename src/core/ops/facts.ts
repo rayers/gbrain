@@ -171,7 +171,7 @@ const extract_facts: Operation = {
     // instruction would silently widen private-default extractions because
     // `remember` hard-defaults to 'world'.
     const visibilityPin = `visibility: "${visibility}"` +
-      (visibility === 'private' ? ' (remember defaults to world — omitting it would widen these facts)' : '');
+      (visibility === 'private' ? ' (remember defaults to world unless your credential is bound to a member — omitting it could widen these facts)' : '');
     if (r.skipped_reason === 'chat_unavailable') {
       return {
         inserted: 0, duplicate: 0, superseded: 0, fact_ids: [],
@@ -364,14 +364,10 @@ const recall: Operation = {
     )];
     const scalarSource = factSources.length === 1 ? factSources[0] : undefined;
 
-    // Visibility filter: remote callers see world-only unless their token
-    // grants elevated visibility (future-proofing; v0.31 ships world-only
-    // for remote, all for local CLI).
-    const visibility =
-      ctx.remote === false
-        ? undefined
-        : ['world'] as ('private' | 'world')[];
-    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    // Visibility filter: remote callers see world-only facts; the local CLI and (GST-2059) the brain owner see all.
+    const { resolveExcludePrivatePages, worldOnlyFacts } = await import('../search/private-visibility.ts');
+    const worldOnly = worldOnlyFacts(ctx.remote);
+    const visibility = worldOnly ? ['world'] as ('private' | 'world')[] : undefined;
     const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
@@ -435,7 +431,7 @@ const recall: Operation = {
 
     if (question !== null && !readsNoSource) {
       ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
-        scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+        scope: { sourceIds: factSources, worldOnly, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
       ({ rows, ambiguousEntity } = ranking);
       for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
     } else if (p.supersessions === true) {
@@ -743,7 +739,6 @@ const context_pack: Operation = {
     const { assembleContextPack, renderPack, isAfter, PACK_DEFAULT_MAX_ENTITIES, renderCardLine, renderThreadLine, renderFactLine, packHeaderCost,
       renderNewerMentionLines, ENTITY_FACTS_HEADER } = await import('../context/turn-context.ts');
     const { NEWER_MENTIONS_HEADER } = await import('../mentions/newer-mentions.ts');
-    const sourceId = ctx.sourceId ?? 'default';
     const rawSince = typeof p.since === 'string' && p.since.trim() ? p.since : undefined;
     if (rawSince !== undefined && !Number.isFinite(Date.parse(rawSince))) {
       throw verbError(
@@ -761,6 +756,8 @@ const context_pack: Operation = {
     // #6723: names resolve across the readable sources (home first) unless source_id pins one; entity_refs name their source.
     const { ambientMissNotice, entityRefs, entitySources } = await import('../verbs/entity-source.ts');
     const walk = await entitySources(ctx, p, 'context_pack');
+    const named = (await import('../access/scope-read.ts')).currentReadMode() !== undefined;
+    const sourceId = named ? walk.home : ctx.sourceId ?? 'default';
     const refs = (await entityRefs(ctx, p.entity_refs, PACK_DEFAULT_MAX_ENTITIES)).slice(0, PACK_DEFAULT_MAX_ENTITIES - names.length);
     const entities = [...names, ...refs.map((r) => r.name)];
     // Fail-closed: private only when EXPLICITLY requested AND the caller is
@@ -797,8 +794,8 @@ const context_pack: Operation = {
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
     const { loadCoreBlock } = await import('../core-memory.ts');
-    const allowed = ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
-    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, eligibility })
+    const allowed = named ? [sourceId] : ctx.auth?.allowedSources?.length ? ctx.auth.allowedSources : null;
+    const core = await loadCoreBlock(ctx.engine, { sessionSourceId: sourceId, allowedSources: allowed, excludePrivate: !includePrivate, forCaller: true, eligibility })
       .catch(() => null);
     const coreText = core?.text ?? '';
     const coreTokens = estimateTokens(coreText);

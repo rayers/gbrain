@@ -28,10 +28,13 @@ import {
 } from '../core/ingestion/types.ts';
 import type { ServeHttpContext } from './serve-http.ts';
 import { NO_SOURCES } from '../core/source-id.ts';
-import { noSourceGrantError } from '../core/ops/context.ts';
+import { noSourceGrantError, sharedWriteSourceMemberError } from '../core/ops/context.ts';
 import { renderAction } from '../core/agent-output.ts';
 import { assertWebhookWriterMayReplace } from '../core/minions/handlers/ingest-capture.ts';
+import { defaultSourceMemberWriter } from '../core/persistence/page-visibility.ts';
+import type { WriteAuthority } from '../core/persistence/model.ts';
 import { validateSlug } from '../core/utils.ts';
+import { RevisionBackfillPendingError } from '../core/page-state/types.ts';
 
 /**
  * v0.46: normalize the per-event GitHub webhook payload shape into
@@ -151,6 +154,9 @@ export function createWebhookLimiters() {
   return { ingestRateLimiter, githubWebhookLimiter };
 }
 
+/** #8799: item refreshes one github-kind source may have waiting before an item event is refused with 429. */
+const GITHUB_ITEM_MAX_WAITING = 50;
+
 /**
  * v0.46: issue/PR event handling for github-kind sources. The payload
  * names a single item (repo + number); we verify the per-source HMAC and
@@ -165,6 +171,7 @@ async function handleGitHubItemEvent(
   payload: Buffer,
   res: Response,
   eventName: string,
+  deliveryId: string | undefined,
 ): Promise<void> {
   const ref = extractGitHubItemRef(parsed);
   if (ref === null) {
@@ -218,7 +225,22 @@ async function handleGitHubItemEvent(
     return;
   }
 
+  // #8799: the key names the item and its intent, so a deletion never reuses an edit's refresh. The waiting cap is per
+  // source, so a cap hit can return another item's job: unless that job covers this event (the same item and intent, or an
+  // explicit source-wide sync for an edit), it is a refusal, never this event's 202. A busy source defers the job (sync handler).
+  // An event joins a refresh of its item that has not started; otherwise its delivery id keys a new one, so an event
+  // after the refresh began is never dropped and a GitHub redelivery (same delivery id) maps to its first job.
+  const deleted = eventName === 'issues' && parsed.action === 'deleted';
+  const idempotencyKey = `webhook:item:${source.id}:${ref.repo}:${ref.number}:${deleted ? 'delete' : 'refresh'}:${deliveryId || Math.floor(Date.now() / 30_000)}`;
   try {
+    const [waiting] = await engine.executeRaw<{ id: number }>(
+      `SELECT id FROM minion_jobs WHERE name = 'sync' AND status = 'waiting' AND data->>'sourceId' = $1 AND data->'github_item'->>'repo' = $2
+         AND data->'github_item'->>'number' = $3 AND COALESCE(data->'github_item'->>'deleted', 'false') = $4 ORDER BY id LIMIT 1`,
+      [source.id, ref.repo, String(ref.number), String(deleted)]);
+    if (waiting) {
+      res.status(202).json({ job_id: Number(waiting.id), source_id: source.id, item: ref });
+      return;
+    }
     const queue = new MinionQueue(engine);
     const job = await queue.add(
       'sync',
@@ -229,16 +251,27 @@ async function handleGitHubItemEvent(
           repo: ref.repo,
           number: ref.number,
           kind: ref.kind,
-          ...(eventName === 'issues' && parsed.action === 'deleted' ? { deleted: true } : {}),
+          ...(deleted ? { deleted: true } : {}),
         },
         embed_reason: 'webhook',
       },
       {
         priority: -10,
-        idempotency_key: `webhook:item:${source.id}:${ref.repo}:${ref.number}:${Math.floor(Date.now() / 30_000)}`,
-        maxWaiting: 1,
+        idempotency_key: idempotencyKey,
+        maxWaiting: GITHUB_ITEM_MAX_WAITING,
       },
     );
+    const coalesced = job.data as { github_item?: { repo?: unknown; number?: unknown; deleted?: unknown }; embed_reason?: unknown } | null;
+    const coalescedItem = coalesced?.github_item;
+    const covered = job.idempotency_key === idempotencyKey || (coalescedItem
+      ? coalescedItem.repo === ref.repo && coalescedItem.number === ref.number && (coalescedItem.deleted === true) === deleted
+      : !deleted && coalesced?.embed_reason !== 'autopilot_freshness');
+    if (!covered) {
+      res.setHeader('Retry-After', '30');
+      res.status(429).json({ error: 'webhook_backlog_full', source_id: source.id,
+        message: `${GITHUB_ITEM_MAX_WAITING} item refreshes are already waiting for this source; redeliver this event once they drain, or run gbrain sync --source ${source.id}.` });
+      return;
+    }
     res.status(202).json({ job_id: job.id, source_id: source.id, item: ref });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -297,6 +330,20 @@ function verifyWebhookSig(secret: unknown, sigHeader: string, payload: Buffer): 
   const computedHex = createHmac('sha256', keyed ? secret : THROWAWAY_WEBHOOK_KEY).update(payload).digest('hex');
   const matches = /^sha256=[0-9a-f]{64}$/.test(sigHeader) && safeHexEqual(sigHeader.slice('sha256='.length), computedHex);
   return matches && keyed;
+}
+
+/**
+ * GST-2051: a member-bound credential writing to default or a federated source would publish where every no-grant credential
+ * reads; the capture job cannot keep the page to the member, so POST /ingest refuses it (answering res) and put_page, which
+ * does, stays open.
+ */
+async function refusedDefaultSourceMember(engine: BrainEngine, authInfo: AuthInfo, res: Response): Promise<boolean> {
+  const sourceId = authInfo.sourceId ?? 'default';
+  if (!authInfo.principal || !await defaultSourceMemberWriter(engine, { remote: true, principal: authInfo.principal as WriteAuthority['principal'], sourceId })) return false;
+  const refusal = sharedWriteSourceMemberError('POST /ingest', authInfo, sourceId);
+  res.status(403).json({ error: refusal.code, code: refusal.code, message: refusal.message, suggestion: refusal.suggestion, docs: refusal.docs,
+    fix: renderAction(refusal.fix!, { transport: 'http', isCallable: () => false, preapproved: () => false }) });
+  return true;
 }
 
 /** POST /ingest (OAuth write scope) and POST /webhooks/github (per-source HMAC), in registration order. */
@@ -392,6 +439,7 @@ async function handleIngest(
       fix: renderAction(refusal.fix!, { transport: 'http', isCallable: () => false, preapproved: () => false }) });
     return;
   }
+  if (await refusedDefaultSourceMember(engine, authInfo, res)) return;
   if (authInfo.allowedOperations != null || authInfo.grantProjectionDegraded) {
     res.status(403).json({
       error: 'permission_denied',
@@ -543,10 +591,10 @@ async function handleIngest(
       return;
     }
     try {
-      await assertWebhookWriterMayReplace(engine, writer, writeSourceId, callerSlug);
+      await assertWebhookWriterMayReplace(engine, writer, writeSourceId, callerSlug, content);
     } catch (err) {
-      if (!(err instanceof OperationError)) throw err;
-      res.status(err.code === 'page_not_found' ? 404 : 403).json({ error: err.code, message: err.message });
+      if (!(err instanceof OperationError) && !(err instanceof RevisionBackfillPendingError)) throw err;
+      res.status(err.code === 'page_not_found' ? 404 : err.code === 'revision_backfill_pending' ? 409 : 403).json({ error: err.code, message: err.message });
       return;
     }
   }
@@ -737,7 +785,7 @@ function mountGitHubWebhook(app: Express, ctx: ServeHttpContext): void {
       // comment / review / label / assignee / milestone / check events
       // refresh exactly the item that changed.
       if (GH_ITEM_EVENTS.has(event)) {
-        await handleGitHubItemEvent(engine, parsed, sigHeader, payload, res, event);
+        await handleGitHubItemEvent(engine, parsed, sigHeader, payload, res, event, req.header('X-GitHub-Delivery'));
         return;
       }
 

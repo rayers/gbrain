@@ -337,6 +337,36 @@ describe('frontmatter install-hook (B13)', () => {
     expect(localHooksPath(tmp)).toBe('/dev/null');
   });
 
+  test('the hooks-off reason names the clone setting it checked and no cause it did not check', () => {
+    execFileSync('git', ['-C', tmp, 'config', 'core.hooksPath', '/dev/null']);
+    expect(hooksPathBlocker(tmp)).toBe("hooks are off in this clone's own config (core.hooksPath=/dev/null), and gbrain leaves them off");
+  });
+
+  test('inherited GIT_DIR, GIT_WORK_TREE or GIT_CONFIG* variables cannot change the hooks-off decision', async () => {
+    const plain = mkdtempSync(join(tmpdir(), 'fm-hook-plain-'));
+    try {
+      gitInit(plain);
+      await install(plain);
+      execFileSync('git', ['-C', tmp, 'config', 'core.hooksPath', '/dev/null']);
+      const plainConfig = join(plain, '.git', 'config'), offConfig = join(tmp, '.git', 'config');
+      const intoPlain = [{ GIT_DIR: join(plain, '.git') }, { GIT_DIR: join(plain, '.git'), GIT_WORK_TREE: plain }, { GIT_CONFIG: plainConfig },
+        { GIT_CONFIG_GLOBAL: plainConfig, GIT_CONFIG_SYSTEM: plainConfig }, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' },
+        { GIT_CONFIG_PARAMETERS: "'core.hookspath'='.githooks'" }];
+      for (const env of intoPlain) {
+        await withEnv(env, async () => {
+          expect(installHook(tmp, true)).toBe('skipped_hooks_off');
+          expect(inspectFrontmatterHook(tmp, 'source-a')).toBeNull();
+        });
+        expect(existsSync(join(tmp, '.githooks'))).toBe(false);
+        expect(localHooksPath(tmp)).toBe('/dev/null');
+      }
+      for (const env of [{ GIT_DIR: join(tmp, '.git') }, { GIT_DIR: join(tmp, '.git'), GIT_WORK_TREE: tmp }, { GIT_CONFIG: offConfig }])
+        await withEnv(env, async () => { expect(inspectFrontmatterHook(plain, 'source-a')).not.toBeNull(); });
+    } finally {
+      rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
   test('hooks off machine-wide (a global core.hooksPath=/dev/null) is not a hooks-off clone: the hook is written unwired with the usual advice', () => {
     const globalConfig = join(tmp, '..', `fm-global-${process.pid}.gitconfig`);
     writeFileSync(globalConfig, '[core]\n\thooksPath = /dev/null\n');
@@ -511,6 +541,23 @@ describe('frontmatter install-hook (B13)', () => {
       expect(blocked.stderr).toContain('importable but not canonical; run gbrain frontmatter validate note.md --fix (quoting only)');
       execFileSync('git', ['-C', tmp, 'add', 'note.md']);
       expect(hook().status).toBe(0);
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('#7793: with the real CLI, a valid staged page passes when git runs the hook with --literal-pathspecs (GIT_LITERAL_PATHSPECS=1)', async () => {
+    await install(tmp);
+    const bin = mkdtempSync(join(tmpdir(), 'fm-hook-literal-'));
+    writeFileSync(join(bin, 'gbrain'), `#!/bin/sh\nexec '${process.execPath}' '${join(import.meta.dir, '..', 'src', 'cli.ts')}' "$@"\n`, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}`, GBRAIN_HOME: join(bin, 'home'), DATABASE_URL: '', GBRAIN_DATABASE_URL: '', GBRAIN_SKIP_STARTUP_HOOKS: '1', GIT_LITERAL_PATHSPECS: '1' };
+    try {
+      writeFileSync(join(tmp, 'note.md'), '---\ntitle: "a: b"\ntype: note\n---\n\nbody\n');
+      execFileSync('git', ['-C', tmp, 'add', 'note.md']);
+      let run = { status: 0, stderr: '' };
+      try { execFileSync('sh', [join(tmp, '.githooks', 'pre-commit')], { cwd: tmp, env, stdio: 'pipe' }); }
+      catch (e) { run = { status: (e as { status: number }).status, stderr: String((e as { stderr: Buffer }).stderr) }; }
+      expect(run).toEqual({ status: 0, stderr: '' });
     } finally {
       rmSync(bin, { recursive: true, force: true });
     }

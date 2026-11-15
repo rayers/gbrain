@@ -5,7 +5,7 @@ import { fenceOperationError } from '../fence-repair/refusal.ts';
 import { withdrawnFact, withdrawalFenceBlocks } from './withdrawal-overlay.ts';
 import { ambiguousFenceClaims, discoverWithdrawalTargets, withdrawalDiscoveryFailure } from './withdrawal-discovery.ts';
 import { dropPurgedFenceRows } from './purge-overlay.ts';
-import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
+import { remoteProvenanceFloorSql } from '../search/private-visibility.ts';
 import { outcomeMarkerSql } from './audit-sources.ts';
 import { coverageActive, noteBelief, readLedgerSource, withBeliefBatch } from '../belief/ledger.ts';
 import { createPageVersion } from '../page-state/versions.ts';
@@ -56,7 +56,7 @@ export function reviewWithdrawOn(raw: string | null | undefined): boolean {
  * member-page fact (`memberPage`, positional $4; the caller checked it). Positional $3 is worldOnly.
  */
 function withdrawalAdmitSql(excludePrivate?: boolean): string {
-  return `AND ($3::boolean=false OR visibility='world' OR (visibility='private' AND source_markdown_slug=$4::text))${excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''}`;
+  return `AND ($3::boolean=false OR visibility='world' OR (visibility='private' AND source_markdown_slug=$4::text))${excludePrivate ? ` AND ${remoteProvenanceFloorSql('facts')}` : ''}`;
 }
 
 /**
@@ -254,15 +254,19 @@ export async function assertPreparedFactWithdrawals(engine: BrainEngine, sourceI
   }
 }
 
-/** Explicit remember is not an implicit restore operation for that entity. A purged claim counts as withdrawn for every writer. */
+/**
+ * Explicit remember is not an implicit restore operation for that entity. A purged claim counts as withdrawn for every writer.
+ * A null `visibility` matches a withdrawal or purge at any visibility: automatic writers never admit a claim forgotten at
+ * another visibility, so narrowing the default visibility cannot bring it back.
+ */
 export async function isFactWithdrawn(
-  engine: BrainEngine, sourceId: string, visibility: string, claim: string, entitySlug: string | null, memberPage: string | null = null,
+  engine: BrainEngine, sourceId: string, visibility: string | null, claim: string, entitySlug: string | null, memberPage: string | null = null,
 ): Promise<boolean> {
   // GST-359 D: `memberPage` (a claim saved on a member page) also matches that page's own withdrawals.
   const rows = await engine.executeRaw(`SELECT 1 FROM fact_withdrawals
-    WHERE source_id=$1 AND visibility=$2 AND fact_hash IN (gbrain_fact_fingerprint($3),gbrain_fact_fingerprint_v1($3))
+    WHERE source_id=$1 AND ($2::text IS NULL OR visibility=$2) AND fact_hash IN (gbrain_fact_fingerprint($3),gbrain_fact_fingerprint_v1($3))
       AND (subject = '*' OR subject = $4::text OR subject = $5::text)
-    UNION ALL SELECT 1 FROM fact_purges WHERE source_id=$1 AND visibility=$2 AND fact_hash=gbrain_fact_fingerprint($3)
+    UNION ALL SELECT 1 FROM fact_purges WHERE source_id=$1 AND ($2::text IS NULL OR visibility=$2) AND fact_hash=gbrain_fact_fingerprint($3)
       AND (subject = '*' OR subject = $4::text) LIMIT 1`, [sourceId,visibility,claim,entitySlug,memberPage]);
   return rows.length > 0;
 }

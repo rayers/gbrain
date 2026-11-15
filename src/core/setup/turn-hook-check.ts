@@ -23,9 +23,10 @@ import { CLAUDE_SETTINGS_FILE_RELPATH, GBRAIN_HOOK_MARKER_KEY, GBRAIN_SETUP_MARK
 import { hookLauncherInCommand, hookLauncherState, type HookLauncherState } from './hook-launcher.ts';
 import type { LauncherLane } from './launcher-lanes.ts';
 import { enabledPluginLanes } from '../bootstrap/plugin-lanes.ts';
-import { brainFirstTarget, openclawConfigPath, parseJson5ish } from './brain-first.ts';
+import { brainFirstTarget, openclawConfigPath, parseJson5ish, readBrainFirstLedger } from './brain-first.ts';
 import { inspectHermesTurnHook } from './hermes-turn-hook.ts';
 import { OPENCLAW_TURN_PLUGIN_ID, openclawTurnPluginDir } from './openclaw-turn-plugin.ts';
+import { isSkillResolverEntry } from './skill-resolver-lane.ts';
 import { isOtherGbrainEntry, isTurnRuleEntry, isTurnRuleHarness, removeTurnRuleHook, syncTurnRuleHook, type TurnHookOutcome, type TurnHookPaths } from './turn-hook.ts';
 
 export const TURN_HOOK_NATIVE_INSPECT: Record<string, string> = {
@@ -62,7 +63,7 @@ function claudeEntries(path: string): Array<Record<string, unknown>> {
 }
 
 const isGbrainPromptEntry = (e: Record<string, unknown>) =>
-  isTurnRuleEntry(e) || typeof e[GBRAIN_HOOK_MARKER_KEY] === 'string' || !!classifyHarnessHook(e, 'UserPromptSubmit', 'any');
+  !isSkillResolverEntry(e) && (isTurnRuleEntry(e) || typeof e[GBRAIN_HOOK_MARKER_KEY] === 'string' || !!classifyHarnessHook(e, 'UserPromptSubmit', 'any'));
 
 /** Files only, no process run. `projectDir`: a project-scope Claude Code install's directory; `managedDir`: Claude Code's managed-settings directory (default: the system one). */
 export function inspectTurnHook(harness: string, opts: { projectDir?: string; managedDir?: string } = {}): TurnHookState {
@@ -106,8 +107,9 @@ export function inspectTurnHook(harness: string, opts: { projectDir?: string; ma
   }
   if (harness === 'hermes') {
     const target = brainFirstTarget('hermes');
-    const home = 'error' in target ? '' : dirname(target.path);
-    const h = inspectHermesTurnHook(home);
+    const soul = 'error' in target ? '' : target.path;
+    const recorded = readBrainFirstLedger().find((e) => e.harness === harness && e.path === soul && e.status === 'installed');
+    const h = inspectHermesTurnHook(soul ? dirname(soul) : '', recorded?.access);
     if (h.state === 'absent') return { harness, state: 'missing', detail: `no gbrain pre_llm_call hook in ${h.path}`, native_inspect };
     if (h.state === 'unapproved') return { harness, state: 'untrusted', via: 'native', detail: `the gbrain pre_llm_call hook in ${h.path} is not in Hermes's shell-hooks-allowlist.json, so Hermes does not run it`, native_inspect };
     return { harness, state: 'wired', via: 'native', detail: `pre_llm_call hook in ${h.path}, approved`, native_inspect };
